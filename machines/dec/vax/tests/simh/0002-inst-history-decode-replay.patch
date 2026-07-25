@@ -1,0 +1,143 @@
+diff --git a/VAX/vax_cpu.c b/VAX/vax_cpu.c
+index 235bd79..9b61d38 100644
+--- a/VAX/vax_cpu.c
++++ b/VAX/vax_cpu.c
+@@ -287,6 +287,35 @@ FILE *hst_log;                                          /* history log file */
+ int32 hst_log_p;                                        /* history last log written pointer */
+ int32 step_out_nest_level = 0;                          /* step to call return - nest level */
+ 
++/* pcjs-vax decode-replay patch: log the data reads performed while resolving operand specifiers,
++   so that a JS decoder replayed against this trace has the EFFECTIVE ADDRESS of every read
++   checked, not merely the value the read produced.  Read() is a static inline in vax_mmu.h;
++   wrapping it here and #define'ing the name covers ReadOcta() and every specifier case without
++   touching 50 call sites or the MMU.  dec_rlogn < 0 disarms the log; it is armed only from the
++   start of the specifier loop, and the history record is taken before the instruction body runs,
++   so reads made by the body cannot contaminate it. */
++
++int32 dec_rlog[4*DEC_RLOG_MAX];
++int32 dec_rlogn = -1;
++uint32 dec_preg[16];
++
++static SIM_INLINE int32 Read_dlog (uint32 va, int32 lnt, int32 acc)
++{
++int32 v = Read (va, lnt, acc);
++
++if (dec_rlogn >= 0) {
++    if (dec_rlogn < DEC_RLOG_MAX) {
++        dec_rlog[dec_rlogn*4] = (int32)va;
++        dec_rlog[dec_rlogn*4+1] = lnt;
++        dec_rlog[dec_rlogn*4+2] = v;
++        dec_rlog[dec_rlogn*4+3] = ((acc >> TLB_V_WACC) != 0);  /* WA (modify) vs RA (read) */
++        }
++    dec_rlogn = dec_rlogn + 1;
++    }
++return v;
++}
++#define Read Read_dlog
++
+ const uint32 byte_mask[33] = { 0x00000000,
+  0x00000001, 0x00000003, 0x00000007, 0x0000000F,
+  0x0000001F, 0x0000003F, 0x0000007F, 0x000000FF,
+@@ -728,6 +757,9 @@ for ( ;; ) {
+ 
+     sim_interval = sim_interval - (1 + (extra_bytes>>5));/* count instr */
+     extra_bytes = 0;                                    /* digest string count */
++    for (i = 0; i < 16; i++)                            /* pcjs-vax: regs before decode */
++        dec_preg[i] = R[i];
++    dec_rlogn = -1;                                     /* pcjs-vax: disarm read log */
+     GET_ISTR (opc, L_BYTE);                             /* get opcode */
+     if (opc == 0xFD) {                                  /* 2 byte op? */
+         GET_ISTR (opc, L_BYTE);                         /* get second byte */
+@@ -759,6 +791,7 @@ for ( ;; ) {
+         }
+     else {
+         numspec = numspec & DR_NSPMASK;                 /* get # specifiers */
++        dec_rlogn = 0;                                  /* pcjs-vax: arm read log */
+ 
+ /* Specifier flows.  Operands are parsed and placed into queue opnd.
+ 
+@@ -1572,6 +1605,20 @@ for ( ;; ) {
+             h->opnd[i] = opnd[i];
+         for (i = 0; i < 16; i++)               /* R0-R15 (pcjs-vax trace-oracle patch) */
+             h->reg[i] = R[i];
++        for (i = 0; i < 16; i++)               /* R0-R15 before decode (pcjs-vax decode-replay) */
++            h->preg[i] = dec_preg[i];
++        h->rlogn = (dec_rlogn < 0) ? 0 : dec_rlogn;
++        for (i = 0; (i < h->rlogn) && (i < DEC_RLOG_MAX); i++) {
++            h->rlog[i*4] = dec_rlog[i*4];
++            h->rlog[i*4+1] = dec_rlog[i*4+1];
++            h->rlog[i*4+2] = dec_rlog[i*4+2];
++            h->rlog[i*4+3] = dec_rlog[i*4+3];
++            }
++        h->recqptr = recqptr;
++        for (i = 0; i < recqptr; i++)
++            h->recq[i] = recq[i];
++        h->nopnd = j;
++        h->brdisp = brdisp;
+         lim = PC - fault_PC;
+         if ((uint32) lim > INST_SIZE)
+             lim = INST_SIZE;
+@@ -1583,6 +1630,7 @@ for ( ;; ) {
+                 break;
+                 }
+             }
++        h->ilen = lim;                         /* pcjs-vax: bytes of opcode + specifiers decoded */
+         if (hst_switches & SWMASK('T'))
+             h->time = sim_gtime();
+         hst_p = hst_p + 1;
+@@ -3645,6 +3693,28 @@ for (k = 0; k < count; k++) {                           /* print specified */
+     fprintf (st, "REGS %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X\n",
+         h->reg[0], h->reg[1], h->reg[2], h->reg[3], h->reg[4], h->reg[5], h->reg[6], h->reg[7],
+         h->reg[8], h->reg[9], h->reg[10], h->reg[11], h->reg[12], h->reg[13], h->reg[14], h->reg[15]);
++    if (hst_switches & SWMASK('D')) {                   /* pcjs-vax decode-replay capture? */
++        fprintf (st, "PREG %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X\n",
++            h->preg[0], h->preg[1], h->preg[2], h->preg[3], h->preg[4], h->preg[5], h->preg[6], h->preg[7],
++            h->preg[8], h->preg[9], h->preg[10], h->preg[11], h->preg[12], h->preg[13], h->preg[14], h->preg[15]);
++        fprintf (st, "IBYT %d", h->ilen);
++        for (i = 0; (i < h->ilen) && (i < INST_SIZE); i++)
++            fprintf (st, " %02X", h->inst[i]);
++        fputc ('\n', st);
++        fprintf (st, "OPND %d", h->nopnd);
++        for (i = 0; (i < h->nopnd) && (i < OPND_SIZE); i++)
++            fprintf (st, " %08X", h->opnd[i]);
++        fputc ('\n', st);
++        fprintf (st, "RECQ %d", h->recqptr);
++        for (i = 0; i < h->recqptr; i++)
++            fprintf (st, " %08X", h->recq[i]);
++        fputc ('\n', st);
++        fprintf (st, "MEMR %d", h->rlogn);
++        for (i = 0; (i < h->rlogn) && (i < DEC_RLOG_MAX); i++)
++            fprintf (st, " %08X %d %08X %d", h->rlog[i*4], h->rlog[i*4+1], h->rlog[i*4+2], h->rlog[i*4+3]);
++        fputc ('\n', st);
++        fprintf (st, "BRDP %08X\n", h->brdisp);
++        }
+     }                                                   /* end for */
+ fflush (st);
+ return SCPE_OK;
+diff --git a/VAX/vax_defs.h b/VAX/vax_defs.h
+index 898cfc4..0a490e3 100644
+--- a/VAX/vax_defs.h
++++ b/VAX/vax_defs.h
+@@ -852,6 +852,7 @@ void cpu_idle (void);
+ 
+ #define OPND_SIZE       16
+ #define INST_SIZE       52
++#define DEC_RLOG_MAX    40              /* pcjs-vax: max decode-time data reads recorded per instruction */
+ 
+ typedef struct {
+     double              time;
+@@ -862,6 +863,14 @@ typedef struct {
+     uint32              opnd[OPND_SIZE];
+     uint32              res[6];
+     uint32              reg[16];            /* R0-R15 at instruction dispatch (pcjs-vax trace-oracle patch) */
++    uint32              preg[16];           /* R0-R15 BEFORE the opcode fetch (pcjs-vax decode-replay patch) */
++    int32               rlog[4*DEC_RLOG_MAX]; /* decode-time data reads: va, lnt, value, write-access */
++    int32               rlogn;              /* number of decode-time data reads (may exceed DEC_RLOG_MAX) */
++    int32               recq[6];            /* recovery queue snapshot */
++    int32               recqptr;
++    int32               nopnd;              /* resolved operand count */
++    int32               brdisp;             /* branch displacement, as fetched */
++    int32               ilen;               /* PC - fault_PC, bytes consumed by opcode + specifiers */
+     } InstHistory;
+ 
+ 
