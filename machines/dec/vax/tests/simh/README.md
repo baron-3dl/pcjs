@@ -10,6 +10,12 @@ to produce, and the privileged state an exception dispatch depends on — which
 lives entirely in simulator variables and appears in no existing log. This
 directory holds the patches that add them, and the script that builds them.
 
+The same problem recurs one milestone up: the device items after EHKAA (console
+ROM, timer, UART, Qbus adapter) need an oracle for every KA655 device register
+access and every delivered interrupt, and stock SIMH exposes none of it in
+machine-readable form either. Patch 0006 closes that gap; see "What 0006 adds"
+below.
+
 ```
 machines/dec/vax/tests/simh/build.sh          # -> $TMPDIR/pcjs-vax-simh/open-simh/BIN/microvax3900
 export SIMH_DECODE_BIN=$TMPDIR/pcjs-vax-simh/open-simh/BIN/microvax3900
@@ -264,6 +270,61 @@ configuration is internally deterministic (three consecutive runs: 2,356 / 2,356
 / 2,356). `excdiff.js` therefore asserts the vector and IPR **sets** as
 equalities and the event **count** as a floor.
 
+## What 0006 adds
+
+The device items after the EHKAA milestone (console ROM, timer, UART, Qbus adapter) need a
+per-access oracle for every KA655 device register read/write and every delivered interrupt. Three
+choke points cover all of it without touching a single device's own read/write body:
+
+| Addition | Purpose |
+|---|---|
+| `IPRR`/`IPRW` at `ReadIPR`/`WriteIPR` (`vax_sysdev.c`) | Every IPR-space access — console UART (`ICCS`, `RXCS`, `RXDB`, `TXCS`, `TXDB`) and `TODR` — regardless of which internal case handles it. |
+| `REGR`/`REGW` at `ReadReg`/`WriteReg` (`vax_sysdev.c`) | Every memory-mapped register-space access — `CQMAP`, `ROM`, `NVR`, `CMCTL`, `SSC` (including timers T0/T1), `KA` (`CACR`/`BDR`), `CQBIC`, `CQIPC`, `CDG` — dispatched through the single `regtable[]` lookup, so no per-device instrumentation is needed. |
+| `INTD` at the `IE_INT` call site in `sim_instr()`'s dispatch loop (`vax_cpu.c`) | The vector and IPL of every interrupt actually delivered, logged at the point of delivery rather than reconstructed from `EXCA` records (which also fire for traps). Extends 0005's `EXCTRACE` mechanism (same debug category, same `sim_debug(LOG_CPU_X, &cpu_dev, ...)` call) rather than inventing a parallel one. |
+
+New debug category `DEVTRACE` (`DBG_DEVT`, `sysd_dev`) gates `IPRR`/`IPRW`/`REGR`/`REGW`; `INTD`
+rides the existing `EXCTRACE` (`LOG_CPU_X`, `cpu_dev`) category 0005 added. Record format, all four
+fields hex except `INTD`'s IPL (decimal):
+
+| Line | Fields |
+|---|---|
+| `IPRR` / `IPRW` | `rg size val PC` — `rg` is the IPR number (`MT_ICCS`=24, `MT_TODR`=27, `MT_RXCS`=32, `MT_RXDB`=33, `MT_TXCS`=34, `MT_TXDB`=35, …), `size` is always `L_LONG` (IPRs have no other width) |
+| `REGR` / `REGW` | `pa size val PC` — `pa` is the physical address, `size` is the access length in bytes (B/W/L/Q) |
+| `INTD` | `vec ipl PC` — the SCB vector and IPL of the interrupt about to be dispatched via `intexc()` |
+
+Booting `ka655x.bin` to `>>>` under the patched simulator with `SET CPU DEBUG=EXCTRACE` and `SET
+SYSD DEBUG=DEVTRACE` produces (one representative run): `IPRR`=58,750, `IPRW`=336, `REGR`=7,085,341,
+`REGW`=1,275,226, `INTD`=16,385 — every required family nonzero (`ICCS` write=5, `TODR` read=35,387,
+`RXCS` read=22,500/write=4, `RXDB` read=2, `TXCS` read=847/write=4, `TXDB` read=1/write=243, SSC
+T0/T1 read=273,555/write=241, `CMCTL` read=1,794/write=5,500, `KA` `CACR` read=12/write=6, `KA`
+`BDR` read=18, `CQBIC` read=41,005/write=32,805). `RXDB`/`TODR`/`ICCS` are one-directional in this
+run because the ROM firmware genuinely only exercises them that way during a no-disk boot to the
+console prompt (`RXDB`/`TODR` read-only, `ICCS` write-only) — not a coverage hole in the patch, a
+property of what this particular boot path does; each family is still proven *reachable*.
+
+Two details are load-bearing:
+
+* **`ReadReg`/`WriteReg` is the single choke point for eight register-space families at once**
+  (`CQMAP`, `ROM`, `NVR`, `CMCTL`, `SSC`, `KA`, `CQBIC`, `CQIPC`, `CDG`) because every one of them is
+  reached through the same `regtable[]` dispatch loop. Hooking the eight individual `_rd`/`_wr`
+  functions instead (`cmctl_rd`, `ka_rd`, `cqbic_rd`, …) would have meant eight edits instead of
+  two, split across two files (`vax_sysdev.c` and `vax_io.c`), for the same coverage.
+* **`tti_dev`/`tto_dev` have zero `DEV_DEBUG` instrumentation, and none was added.** The console
+  UART's `TXCS`/`TXDB`/`RXCS`/`RXDB` registers are reached exclusively through `MTPR`/`MFPR` →
+  `op_mtpr`/`op_mfpr`'s `default:` case → `WriteIPR`/`ReadIPR`, which `IPRR`/`IPRW` already covers
+  completely. Adding a second, device-local trace would duplicate the same events under a different
+  name.
+* **0006's `WriteReg` hunk is not strictly additive-only — it drops two trailing spaces from an
+  existing context line.** The pristine line `p->write (pa, val, lnt);  ` (note the trailing
+  whitespace, inherited the same way 0003's did — see the CRLF hazard entry below) becomes
+  `p->write (pa, val, lnt);` with no trailing whitespace once the new trace line is inserted above
+  it. Keeping the trailing spaces would trip `git apply`'s whitespace check on a context line that
+  is unrelated to this patch's own additions, which done condition 5 (zero whitespace warnings)
+  does not allow; dropping them is the smaller deviation and is judged the correct tradeoff. A
+  rebase that regenerates this hunk from a fresh diff should expect this one line to show as
+  changed context, not pure addition, and should not "fix" it back to preserve the trailing
+  whitespace.
+
 ## Upstream-drift hazards, per patch
 
 What each patch hangs off of — check these first on a rebase; if any of them moved or changed
@@ -277,13 +338,15 @@ no longer mean what the prose above says.
 | 0003 | `vax_cpu.c`, `vax_mmu.c`, `vax_mmu.h` | `cpu_mod[]` MTAB table (adds `MMUOP`/`MMUTRACE`/`NOMMUTRACE` entries — order-sensitive only in that 0004 inserts its own entry immediately after MMUOP's); `cpu_get_vsw()` (adds the `-W` switch); new `cpu_show_mmuop()`/`cpu_set_mmutrace()` functions (call `Test()`/`Read()`/`Write()`/`op_mtpr()` and `save_env`/`setjmp` directly — these are the real fault/abort paths, a signature change there is high-risk); `vax_mmu.h`'s inline `Read`/`Write`/`Test` (each gets one `PCJS_MMU_T(...)` call inserted — these three functions are the highest-traffic hook point in the whole patch set, called from `vax_cpu.c`, `vax_cpu1.c`, `vax_cis.c`, `vax_octa.c`); `fill()`, `set_map_reg()`, `zap_tb()`, `zap_tb_ent()` in `vax_mmu.c` (one trace call each). |
 | 0004 | `vax_cpu.c` | `cpu_mod[]` MTAB table (inserts the `FPOP` entry right after 0003's `MMUOP` entry — **this is why 0004 fails to apply if 0003 is missing or reordered after it**); new `cpu_show_fpop()`, whose body is *copied verbatim* out of `sim_instr()`'s F/D/G-opcode dispatch `switch` between two marker comments — on a rebase, diff `sim_instr()`'s float-opcode cases against this function body directly, since that's the actual source of truth being duplicated; `op_*` routines in `vax_fpa.c` (called, not modified); `CC_IIZZ_FP`/`CC_IIZP_FP` macros and `WRITE_B`/`WRITE_W`/`WRITE_L`/`WRITE_Q` macros in `vax_defs.h`/top of `vax_cpu.c` (referenced, not modified — a macro signature change is the real hazard here). |
 | 0005 | `vax_cpu.c`, `vax_cpu1.c`, `vax_defs.h` | `cpu_deb[]` DEBTAB table (adds `EXCTRACE`); new `LOG_CPU_X` bit in `vax_defs.h` (must stay clear of the existing `LOG_CPU_FAULT_*` bits — currently `0x200`, one past `LOG_CPU_FAULT_EMUL`'s `0x100`); new `exc_trace_state()`; and five existing functions get entry/exit trace calls spliced in: `intexc()` (also hoists its SCB-read address into a local, `pcjs_scbpa`, logged and then used in place of the inline expression — the read itself is unchanged), `op_rei()`, `op_chm()`, `op_mtpr()`, `op_mfpr()`. A rebase that changes any of these five functions' control flow (early returns, additional fault paths) needs the corresponding `PCJS_TRACING` block re-sited, not just re-hunked. |
+| 0006 | `vax_cpu.c`, `vax_sysdev.c` | `sysd_debug[]` DEBTAB table (adds `DEVTRACE`, bit `0x0040`, one past `DBG_CNF`'s `0x0020` — must stay clear of `DBG_REGR`/`DBG_REGW`/`DBG_INT`/`DBG_SCHD`/`DBG_TODR`/`DBG_CNF`); `ReadIPR`'s single common `return val` (traces `IPRR`, changes nothing about which case sets `val`) and `WriteIPR`'s entry (traces `IPRW` before the switch, so it fires even for the `RSVD_OPND_FAULT` cases); `ReadReg`/`WriteReg`'s `regtable[]` dispatch loop in `vax_sysdev.c` (each gets one `val`/trace line inserted at its existing early `return`/`p->write(...)` call — this is the highest-leverage hook in the patch, since it's the *only* place all eight register-space families converge); the `IE_INT` call site inside `sim_instr()`'s dispatch loop in `vax_cpu.c` (reuses 0005's `LOG_CPU_X`/`cpu_dev`, adds no new bit). A rebase that changes `ReadReg`/`WriteReg`'s single-loop-with-early-return shape, or splits `regtable[]` into per-family dispatch, needs the trace call re-sited to wherever the new common exit is. |
 
-Provenance: all five patches are against Open SIMH at commit `a1f57fa3`. Keep them small and
-additive so they keep applying as upstream moves; net diff is two files +79 lines
-for 0002, three files +166/-4 for 0003, one file +356/-0 for 0004 and three files
-+71/-1 for 0005, with every copyright header untouched. No patch changes
-instruction semantics — the simulator's own EHKAA self-test, which `make ... vax`
-runs, passes unmodified with all five applied.
+Provenance: patches 0001-0005 are against Open SIMH at commit `a1f57fa3`; 0006 is generated against
+that same base with 0001-0005 already applied (its context lines reflect the post-0005 source, as
+`git apply`'s sequential model requires). Keep them small and additive so they keep applying as
+upstream moves; net diff is two files +79 lines for 0002, three files +166/-4 for 0003, one file
++356/-0 for 0004, three files +71/-1 for 0005, and two files +31/-4 for 0006, with every copyright
+header untouched. No patch changes instruction semantics — the simulator's own EHKAA self-test,
+which `make ... vax` runs, passes unmodified with all six applied.
 
 ### Two hazards fixed by `pcjsvax-fb1` — read before assuming either is still true
 
