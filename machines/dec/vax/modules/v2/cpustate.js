@@ -412,7 +412,10 @@ export default class CPUStateVAX extends Component {
      * onBusFault(addr, access)
      *
      * A physical reference to an address BusVAX.RESERVED reserves but does not decode (the
-     * KA655 I/O, register, SSC, NVR and Qbus-memory ranges -- see bus.js) -- pcjsvax-446.  This is
+     * KA655 I/O, register, NVR and Qbus-memory ranges -- see bus.js) -- pcjsvax-446 -- OR to an SSC
+     * sub-register pcjsvax-320's decode does not cover (the console UART mirror, the T0/T1 timers;
+     * see ssc.js) -- lands here identically, via the same bus.fault() -> onBusFault() path, whether
+     * the whole range is reserved or just one register within a partially-decoded one is.  This is
      * how the console ROM discovers hardware: probe an address, and if nothing answers, take a
      * machine check instead of ending the run.
      *

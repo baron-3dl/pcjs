@@ -38,6 +38,7 @@ import MESSAGE from "./message.js";
 import Component from "../../../../modules/v2/component.js";
 import State from "../../../../modules/v2/state.js";
 import { DEBUGGER, VAX } from "./defines.js";
+import { makeSscController } from "./ssc.js";
 
 /**
  * @class BusVAX
@@ -158,7 +159,7 @@ export default class BusVAX extends Component {
     /**
      * isReserved(addr)
      *
-     * The KA655 I/O, register, SSC, NVR and Qbus-memory ranges are RESERVED by this component but
+     * The KA655 I/O, register, NVR and Qbus-memory ranges are RESERVED by this component but
      * deliberately NOT decoded: no handlers, no storage, no aliasing.  Accesses to them fault as
      * non-existent memory until the device items populate them.  This exists so that a later item
      * can assert "nobody has quietly mapped RAM on top of the I/O space".
@@ -166,12 +167,22 @@ export default class BusVAX extends Component {
      * ROM_BASE is NOT in this list: pcjsvax-223 decodes it (see addRom()), so it is no longer
      * reserved-but-undecoded -- it is reserved-and-DECODED, like RAM.
      *
-     * SSC_BASE and NVR_BASE were MISSING from BusVAX.RESERVED until pcjsvax-446's veracity review
-     * caught the gap (standing rule 7: scope lives in code, not comments -- this comment already
-     * claimed "SSC, NVR" were covered while the array below did not list them).  Both sit past
-     * REG_BASE's span (REG_BASE+REG_LENGTH = 0x20100000; SSC_BASE = 0x20140000), so any code
-     * deriving "what this bus reserves" from the array alone silently missed them -- and
-     * pcjsvax-223 measured the ROM's FIRST absent-hardware probe as SSC+0x0.
+     * SSC_BASE is ALSO not in this list, as of pcjsvax-320 (see addSsc()/ssc.js): it decodes the
+     * SSC base register and installs a real controller over the whole [SSC_BASE, SSC_BASE +
+     * SSC_LENGTH) span, exactly the ROM_BASE precedent above.  That controller does NOT make every
+     * address in the span non-faulting -- most SSC sub-registers (the console UART mirror, the
+     * T0/T1 timers) are still undecoded and still fault, deliberately, per pcjsvax-320's scope; see
+     * ssc.js's file header for the full account of what is and is not covered and why the ones that
+     * still fault are not a silent gap. isReserved() only answers the coarse "does this component
+     * reserve the RANGE" question RAM-aliasing checks need, not per-register decode status.
+     *
+     * NVR_BASE was MISSING from BusVAX.RESERVED until pcjsvax-446's veracity review caught the gap
+     * (standing rule 7: scope lives in code, not comments -- this comment already claimed "SSC,
+     * NVR" were covered while the array below did not list them).  It sits past REG_BASE's span
+     * (REG_BASE+REG_LENGTH = 0x20100000; NVR_BASE = 0x20140400), so any code deriving "what this
+     * bus reserves" from the array alone silently missed it -- and pcjsvax-223 measured the ROM's
+     * FIRST absent-hardware probe as SSC+0x0, the sibling range NVR shares a physical memory block
+     * with (see ssc.js).
      *
      * @this {BusVAX}
      * @param {number} addr (physical)
@@ -393,6 +404,24 @@ export default class BusVAX extends Component {
                 ];
             }
         };
+    }
+
+    /**
+     * addSsc(ssc)
+     *
+     * Decodes VAX.PHYSMEM.SSC_BASE for the registers SSCVAX implements -- pcjsvax-320.  See
+     * ssc.js's file header for exactly which registers those are and why the rest are not; see
+     * makeSscController()'s doc comment for how everything this does NOT decode (undecoded SSC
+     * sub-registers, NVR, and the unused tail of the physical block SSC and NVR share) keeps
+     * faulting exactly as it did before this method existed, address-by-address rather than by
+     * block granularity.
+     *
+     * @this {BusVAX}
+     * @param {SSCVAX} ssc
+     */
+    addSsc(ssc)
+    {
+        this.addMemory(VAX.PHYSMEM.SSC_BASE >>> 0, VAX.PHYSMEM.SSC_LENGTH, MemoryVAX.TYPE.CONTROLLER, makeSscController(ssc));
     }
 
     /**
@@ -879,9 +908,10 @@ BusVAX.RESERVED = [
     [VAX.PHYSMEM.IOPAGE_BASE, VAX.PHYSMEM.IOPAGE_LENGTH],
     [VAX.PHYSMEM.REG_BASE,    VAX.PHYSMEM.REG_LENGTH],
     [VAX.PHYSMEM.CQM_BASE,    VAX.PHYSMEM.CQM_LENGTH],
-    [VAX.PHYSMEM.SSC_BASE,    VAX.PHYSMEM.SSC_LENGTH],   // added pcjsvax-446: was a gap (see isReserved())
     [VAX.PHYSMEM.NVR_BASE,    VAX.PHYSMEM.NVR_LENGTH]    // added pcjsvax-446: was a gap (see isReserved())
-    /* ROM_BASE removed by pcjsvax-223: it is decoded now (see addRom()), not merely reserved. */
+    /* ROM_BASE removed by pcjsvax-223: it is decoded now (see addRom()), not merely reserved.
+       SSC_BASE removed by pcjsvax-320: it is decoded now too (see addSsc()/ssc.js), not merely
+       reserved -- even though most of its sub-registers still fault; see isReserved()'s comment. */
 ];
 
 BusVAX.ERROR = {

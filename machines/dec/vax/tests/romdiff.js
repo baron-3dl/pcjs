@@ -9,7 +9,9 @@
  *
  * WHAT THIS IS
  * ------------
- * pcjsvax-223.  Three claims, each with its own phase below:
+ * pcjsvax-223 (TRACE, MIRROR, SELFCHECK) and pcjsvax-320 (the SSC-BASE-RANDOM addition to TRACE
+ * and SELFCHECK, and the boundary-accounting fix TRACE needed once its own advance exposed it).
+ * Four claims, each with its own phase below:
  *
  *   TRACE     ka655x.bin is loaded at BusVAX.addRom(), CPUStateVAX.boot() sets PC/PSL/the model
  *             magic byte exactly as vax_sysdev.c's cpu_boot() does, and the machine executes from
@@ -21,7 +23,16 @@
  *             what order.  Modeled on tests/cpudiff.js's EHKAA phase -- same trace format
  *             (tests/simhtrace.js), same oracle (tools/trace-differ/differ.py), same
  *             unavailable/CMPD/ZEROSPEC normalization, because it is the same kind of claim: a
- *             PROGRAM runs, not one instruction.
+ *             PROGRAM runs, not one instruction.  pcjsvax-320's own boundary-advance (past the SSC
+ *             base register's store) exposed a real bug in how many trace records were comparable
+ *             when the boundary lands on the INSTRUCTION AFTER one that now completes -- see
+ *             BoundaryAccounting.compute()'s doc comment.
+ *
+ *   SSC-BASE- pcjsvax-320: the TRACE phase's boot run only ever stores ONE value into the SSC base
+ *   RANDOM    register (0x20140000, which already satisfies its own mask), so verifySscBaseRandom()
+ *             drives many MORE values -- boundary-chosen and random -- through a real instruction
+ *             round trip on the live oracle, proving the SSCBASE_RW/SSCBASE_MBO mask itself, not
+ *             just whether the address is backed.  Enforces its own coverage floor.
  *
  *   MIRROR    The upper half of the ROM (VAX.PHYSMEM.ROM_BASE + ROM_SIZE .. +ROM_LENGTH) must read
  *             back exactly what the lower half holds, at several offsets including the boundary,
@@ -33,10 +44,11 @@
  *             A prior version of this check used the magic byte and was vacuous for exactly that
  *             reason (caught by an adversarial veracity review); see verifyMirrorJS()'s header.
  *
- *   SELFCHECK --selfcheck injects five deliberate defects into the SHIPPED code path (two distinct
+ *   SELFCHECK --selfcheck injects NINE deliberate defects into the SHIPPED code path (two distinct
  *             ROM-mirror failure modes -- reads garbage, and reads a stale load-time snapshot --
- *             plus CPUStateVAX.boot()'s magic byte / PSL, and the ROM's read-only enforcement) and
- *             fails if any one of them is not caught.
+ *             CPUStateVAX.boot()'s magic byte / PSL, the ROM's read-only enforcement, the SSC base
+ *             register's decode and its mask, BoundaryAccounting's off-by-one, and
+ *             BoundaryRequired's enforcement) and fails if any one of them is not caught.
  *
  * WHY THE SIMH SIDE USES A REAL `BOOT CPU`, BOUNDED BY A BREAKPOINT, NOT A HAND-BUILT DEPOSIT
  * ---------------------------------------------------------------------------------------------
@@ -59,6 +71,8 @@
  *                            build (same search cpudiff.js uses)
  *        --rom PATH         default $PCJS_VAX_REPO/open-simh/VAX/ka655x.bin
  *        --max-steps N       JS step ceiling before giving up on ever finding a boundary
+ *        --ssc-base-cases N  randomized SSC base register mask cases (default 40, floor 8)
+ *        --seed S            PRNG seed for --ssc-base-cases, printed on failure so it reproduces
  *        --selfcheck         prove the differential detects deliberate defects
  */
 
@@ -74,10 +88,16 @@ import { VAX } from "../modules/v2/defines.js";
 import CPUStateVAX, { VAXStop, ROM_MAGIC_BYTE } from "../modules/v2/cpustate.js";
 import SimhTrace, { nonStoringResultOpcodes } from "./simhtrace.js";
 import { OPCODES, DROM, DROM_STRIDE, DR } from "../modules/v2/drom.js";
+import SSCVAX from "../modules/v2/ssc.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const MEMSIZE = 0x01000000;                 // 16MB, same default every other differential uses
+
+/* Enforced floor for --ssc-base-cases (standing rule: coverage assertions FAIL the run and do not
+   scale down with case count).  4 fixed boundary values (0, all-ones, exactly SSCBASE_RW, exactly
+   SSCBASE_MBO) plus at least 4 genuinely random ones -- see verifySscBaseRandom(). */
+const SSC_BASE_CASES_FLOOR = 8;
 
 function hex(v, n = 8) { return (v >>> 0).toString(16).toUpperCase().padStart(n, "0"); }
 
@@ -142,7 +162,8 @@ function runSimh(bin, script, iniPath)
  *
  * RAM at 0 (the KA655's own system memory, which the ROM's power-up self-tests size and probe --
  * without it the very first instructions would fault on RAM before ever reaching the ROM's own
- * device probing) plus the ROM itself, decoded via BusVAX.addRom().
+ * device probing) plus the ROM itself, decoded via BusVAX.addRom(), plus the SSC base register,
+ * decoded via BusVAX.addSsc() -- pcjsvax-320, the item this file's own boundary report pointed at.
  *
  * @param {Uint8Array} romBytes
  * @returns {Object} {bus, cpu}
@@ -152,6 +173,7 @@ function makeMachine(romBytes)
     let bus = new BusVAX({busWidth: VAX.PAWIDTH, id: "bus"}, null, null);
     bus.addMemory(0, MEMSIZE, MemoryVAX.TYPE.RAM);
     bus.addRom(romBytes);
+    bus.addSsc(new SSCVAX());
     let cpu = new CPUStateVAX({id: "cpu"});
     cpu.setBus(bus);
     return {bus, cpu};
@@ -188,6 +210,67 @@ function nameAddress(addr)
     }
     return hex(addr);
 }
+
+/**
+ * BoundaryAccounting.compute(records, finalizedPartial)
+ *
+ * pcjsvax-320: how many of `records` (hst.count after runRomJS()'s hst.finish(cpu) call) are
+ * GENUINELY comparable against SIMH, and what is the boundary instruction's own 1-based ordinal.
+ * A plain object property (not a bare top-level function) so selfcheck() below can patch it the
+ * same way it patches every other shipped entry point -- see MUTATIONS' "boundary-off-by-one" for
+ * why this needed its own mutation rather than trusting the live romdiff run alone.
+ *
+ * `finalizedPartial` is measured directly by runRomJS() (did hst.finish(cpu) change hst.count?),
+ * not assumed: see runRomJS()'s doc comment for the two shapes a boundary can take and why
+ * conflating them was a real bug this item's own boundary-advance exposed.
+ *
+ * @param {number} records
+ * @param {boolean} finalizedPartial
+ * @returns {{comparableRecords: number, instrNum: number}}
+ */
+const BoundaryAccounting = {
+    compute(records, finalizedPartial) {
+        let comparableRecords = finalizedPartial ? records - 1 : records;
+        return {comparableRecords, instrNum: comparableRecords + 1};
+    }
+};
+
+/**
+ * BoundaryRequired.check(js, boundary)
+ *
+ * pcjsvax-320 VERACITY FINDING A -- a run that stops (js.stop truthy) but never produces a named
+ * boundary must FAIL, not exit clean.  Before this fix it did not: main()'s only stop-related
+ * check was `!js.stop`, so either of these regressions passed silently, having produced NO named
+ * stopping point at all -- exactly the artifact done condition 1 requires:
+ *
+ *   - js.firstFaultAddr === null: the stop happened for some OTHER reason than a bus fault (this
+ *     item's boundary-detection instrumentation never armed at all).
+ *   - js.firstFaultAddr is set, but probeSimhBackedAt() returned false: the first fault's address
+ *     is ALSO absent on the real oracle (both machines correctly agree nothing exists there) --
+ *     which is the CORRECT outcome for a genuinely-absent address, but is indistinguishable, with
+ *     no check at all, from a REGRESSION that computes a WRONG effective address that just happens
+ *     to land on a different, genuinely-absent one.
+ *
+ * A plain object property (not a bare function) so selfcheck() can patch it the same way it
+ * patches BoundaryAccounting.compute() above.
+ *
+ * @param {Object} js as returned by runRomJS()
+ * @param {?Object} boundary as computed in main(), or null
+ * @returns {?string} a problem string, or null if a boundary was produced (or the run never stopped)
+ */
+const BoundaryRequired = {
+    check(js, boundary) {
+        if (!js.stop || boundary) return null;
+        if (js.firstFaultAddr === null) {
+            return `the JS machine stopped (${js.stop.reason}) without ever recording a bus fault -- ` +
+                `no address to probe, so no boundary can be named; this item's whole point is to name one`;
+        }
+        return `the JS machine's first bus fault touched ${nameAddress(js.firstFaultAddr)}, which the real ` +
+            `oracle ALSO does not service (both machines agree nothing exists there) -- a regression computing ` +
+            `a WRONG effective address that happens to land on a genuinely absent one would exit clean here ` +
+            `otherwise; this item's whole point is to name a boundary, so a run that produces none is not a pass`;
+    }
+};
 
 /* ------------------------------------------------------------------------------------------- *
  * PHASE 0 -- determine sys_model BY EXECUTION, never by assumption                               *
@@ -274,11 +357,27 @@ function runRomJS(romBytes, opts, magicByte)
         if (!(e instanceof VAXStop)) throw e;
         stop = e;
     }
+    /*
+     * MEASURED (pcjsvax-320): hst.finish(cpu) is a NO-OP when hst.pending is already null
+     * (simhtrace.js:420, `if (!p) return;`) -- and pending is null whenever the instruction that
+     * faulted never reached hst.record()'s call point (cpustate.js's fnExecute calls record()
+     * AFTER specifier resolution, BEFORE the body).  pcjsvax-223's original boundary (a STORE
+     * faulting inside its own body) always left a record() already pending, so
+     * "force-finalize, then trim the last record" was always correct.  Once this item's decode
+     * lets that store SUCCEED, the boundary can now land on operand resolution of the NEXT
+     * instruction -- a fault BEFORE record() ever runs for it -- and hst.count is ALREADY the
+     * exact count of genuinely comparable instructions; trimming one more would silently drop the
+     * last one that actually completed (here: the MOVL that stores to SSC+0x0 itself) from the
+     * SIMH comparison. `finalizedPartial` distinguishes the two shapes by directly observing
+     * whether finish() changed hst.count, rather than assuming which shape occurred.
+     */
+    let countBeforeFinish = hst.count;
     hst.finish(cpu);
+    let finalizedPartial = hst.count > countBeforeFinish;
     let tracePath = path.join(opts.scratch, "romdiff-js.trace");
     fs.writeFileSync(tracePath, hst.text());
     return {
-        bus, cpu, tracePath, records: hst.count, steps, stop,
+        bus, cpu, tracePath, records: hst.count, steps, stop, finalizedPartial,
         unavailable: hst.unavailable,
         pc: cpu.regs[15] >>> 0, psl: cpu.psl >>> 0,
         firstFaultAddr, firstFaultAccess, firstFaultPC
@@ -328,6 +427,102 @@ function probeSimhBackedAt(simh, opts, addr, fWrite)
     let m = /^PC:\s*([0-9A-Fa-f]+)/m.exec(out);
     if (!m) throw new Error("romdiff: boundary probe produced no PC readback; SIMH said:\n" + out);
     return (parseInt(m[1], 16) >>> 0) !== R_HANDLER;
+}
+
+/** Same mulberry32 PRNG every VAX differential in this tree uses (busdiff.js, mchkdiff.js, ...),
+    duplicated rather than imported because none of them share a utility module -- see those files. */
+function mulberry32(a)
+{
+    return function() {
+        a |= 0; a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+/**
+ * verifySscBaseRandom(simh, opts, seed, n)
+ *
+ * pcjsvax-320's REAL-WORKLOAD phase (the boot trace above) stores exactly ONE value into
+ * SSCBASE -- 0x20140000 -- which already satisfies SSCBASE_RW/SSCBASE_MBO exactly (it IS a valid
+ * base address), so the AND/OR mask this file transcribes from vax_sysdev.c's ssc_wr() `case 0x00`
+ * is STRUCTURALLY UNTESTED by that run alone: a transcription bug in either mask (e.g. a swapped
+ * hex digit in SSCBASE_RW) that only misbehaves on OTHER bit patterns would pass the real-workload
+ * phase silently.  This is exactly the class of bug the project's standing rule about randomized
+ * phases exists to catch (see docs/design/vax-on-pcjs.md's "uniform random address pools" lesson,
+ * applied here to register VALUES rather than addresses).
+ *
+ * Driven through a REAL instruction round trip on the live oracle -- `MOVL S^#val,@#SSCBASE` then
+ * `MOVL @#SSCBASE,R0`, examined via R0 -- the same "only an actual instruction reproduces the real
+ * access path" reasoning probeSimhBackedAt() is built on (deposit/examine of a NAMED register like
+ * `sysd base` bypasses ssc_wr()'s masking entirely and was confirmed, by direct probe, to read back
+ * whatever was deposited UNMASKED -- exactly the false-negative this function exists to avoid).
+ * Compared against a bare `new SSCVAX()` instance's own writeReg()/readReg() -- not the whole bus --
+ * because the mask formula is what is under test, not the address decode (romdiff's PHASE 1 trace
+ * comparison already proves the address decode).
+ *
+ * Batched into ONE SIMH invocation (mchkdiff.js's runBatch() convention): each case is independent
+ * via `reset all`, so a fault or bad value in one case cannot contaminate another.
+ *
+ * @param {string} simh
+ * @param {Object} opts
+ * @param {number} seed
+ * @param {number} n
+ * @returns {Array.<string>} problems (empty if none)
+ */
+function verifySscBaseRandom(simh, opts, seed, n)
+{
+    let rnd = mulberry32(seed);
+    let opcMOVL = OPCODES.indexOf("MOVL");
+    if (opcMOVL < 0) throw new Error("romdiff.js: MOVL not found in drom.js OPCODES");
+    const CODE = 0x00104000;
+    const SSCBASE = VAX.PHYSMEM.SSC_BASE >>> 0;
+    const MARK = "SSCBASERND";
+
+    /* A few boundary-interesting values FIRST (all-zero, all-one, exactly SSCBASE_RW, exactly
+       SSCBASE_MBO), THEN n-4 uniform random longwords -- covers both the deliberately-chosen edges
+       and the general case, same shape as every other randomized phase in this tree. */
+    let vals = [0x00000000, 0xFFFFFFFF | 0, 0x1FFFFC00, 0x20000000 | 0];
+    for (let i = vals.length; i < n; i++) vals.push((rnd() * 0x100000000) >>> 0);
+
+    let lines = ["set cpu 16m", "set cpu simhalt"];
+    for (let i = 0; i < vals.length; i++) {
+        let v = vals[i] >>> 0;
+        lines.push(`echo ${MARK}${i}`, "reset all");
+        let instr = [
+            opcMOVL & 0xFF, 0x8F, v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF,
+                            0x9F, SSCBASE & 0xFF, (SSCBASE >>> 8) & 0xFF, (SSCBASE >>> 16) & 0xFF, (SSCBASE >>> 24) & 0xFF,
+            opcMOVL & 0xFF, 0x9F, SSCBASE & 0xFF, (SSCBASE >>> 8) & 0xFF, (SSCBASE >>> 16) & 0xFF, (SSCBASE >>> 24) & 0xFF,
+                            0x50                                              // R0, direct (MODE.GRN | 0)
+        ];
+        for (let k = 0; k < instr.length; k++) lines.push(`deposit -b ${hex(CODE + k)} ${instr[k].toString(16)}`);
+        lines.push(`deposit PSL 0`, `deposit PC ${hex(CODE)}`, "step 2", "examine -h R0");
+    }
+    lines.push("exit", "");
+    let out = runSimh(simh, lines.join("\n"), path.join(opts.scratch, "romdiff-sscbase-random.ini"));
+
+    let problems = [];
+    let marks = [...out.matchAll(new RegExp(MARK + "(\\d+)", "g"))].map((m) => +m[1]);
+    let r0s = [...out.matchAll(/^R0:\s*([0-9A-Fa-f]+)/gm)].map((m) => parseInt(m[1], 16) >>> 0);
+    if (marks.length !== vals.length || r0s.length !== vals.length) {
+        problems.push(`SSC-BASE-RANDOM: expected ${vals.length} cases, SIMH produced ${marks.length} ` +
+            `markers and ${r0s.length} R0 readbacks -- some case did not reach comparison; SIMH said:\n` +
+            out.slice(0, 2000));
+        return problems;
+    }
+    let ssc = new SSCVAX();
+    for (let i = 0; i < vals.length; i++) {
+        ssc.reset();
+        ssc.writeReg(0x00, vals[i] | 0);
+        let want = ssc.readReg(0x00) >>> 0;
+        let got = r0s[i] >>> 0;
+        if (got !== want) {
+            problems.push(`SSC-BASE-RANDOM: case ${i} val=0x${hex(vals[i])} -- SIMH readback=0x${hex(got)}, ` +
+                `SSCVAX readback=0x${hex(want)}`);
+        }
+    }
+    return problems;
 }
 
 /**
@@ -663,6 +858,47 @@ const MUTATIONS = {
         let orig = block.writeByte;
         block.writeByte = block.writeByteDirect;
         return () => { block.writeByte = orig; };
+    },
+    /* pcjsvax-320: the SSC base register is no longer decoded at all -- SSCVAX.writeReg() stops
+       recognizing REG_BASE, so a store to SSC+0x0 (this item's whole reason for existing) falls
+       through to a bus fault exactly as it did before this item. */
+    "ssc-base-not-decoded": (cpu, bus) => {
+        let orig = SSCVAX.prototype.writeReg;
+        SSCVAX.prototype.writeReg = function() { return false; };
+        return () => { SSCVAX.prototype.writeReg = orig; };
+    },
+    /* pcjsvax-320: the SSC base register is decoded, but WITHOUT vax_sysdev.c's SSCBASE_RW/
+       SSCBASE_MBO masking -- a store of a raw value would corrupt the must-be-one bits, which real
+       hardware never allows software to clear. */
+    "ssc-base-wrong-mask": (cpu, bus) => {
+        let orig = SSCVAX.prototype.writeReg;
+        SSCVAX.prototype.writeReg = function(rg, val) {
+            if (rg === 0x00) { this.base = val | 0; return true; }
+            return orig.call(this, rg, val);
+        };
+        return () => { SSCVAX.prototype.writeReg = orig; };
+    },
+    /* pcjsvax-320: BoundaryAccounting.compute() reverts to unconditionally trimming one record --
+       the bug this item's own boundary-advance exposed (see runRomJS()'s and main()'s doc
+       comments): correct only when the boundary instruction's fault happened inside its BODY
+       (a force-finalized partial record), wrong when it happened during specifier resolution of
+       the NEXT instruction (nothing was ever finalized, so js.records is already exact). */
+    "boundary-off-by-one": (cpu, bus) => {
+        let orig = BoundaryAccounting.compute;
+        BoundaryAccounting.compute = function(records) {
+            let comparableRecords = records - 1;
+            return {comparableRecords, instrNum: comparableRecords + 1};
+        };
+        return () => { BoundaryAccounting.compute = orig; };
+    },
+    /* pcjsvax-320 VERACITY FINDING A: BoundaryRequired.check() stops enforcing the invariant
+       entirely -- a stop with no named boundary (no fault recorded at all, OR the first fault's
+       address is ALSO absent on the real oracle) would exit clean again, exactly the regression
+       this fix closes. */
+    "boundary-required-not-enforced": (cpu, bus) => {
+        let orig = BoundaryRequired.check;
+        BoundaryRequired.check = () => null;
+        return () => { BoundaryRequired.check = orig; };
     }
 };
 
@@ -671,9 +907,10 @@ const MUTATIONS = {
  *
  * Every mutation is checked with a FAST, DETERMINISTIC, structural assertion rather than a second
  * full SIMH trace run -- see the file's test_decisions in the item's report for why: none of these
- * five is a subtle multi-instruction timing bug (that is what cpudiff.js's own --selfcheck already
- * proves this loop can catch); each is directly observable as a single readback, and re-invoking
- * SIMH five more times would cost real wall-clock time for no additional detection power.
+ * is a subtle multi-instruction timing bug (that is what cpudiff.js's own --selfcheck already
+ * proves this loop can catch); each is directly observable as a single readback or a single pure-
+ * function call, and re-invoking SIMH nine more times would cost real wall-clock time for no
+ * additional detection power.
  *
  * @param {Uint8Array} romBytes
  * @param {Object} opts
@@ -738,6 +975,52 @@ function selfcheck(romBytes, opts, magicByte)
                     bus.setByte(addr, (before ^ 0xFF) & 0xFF);
                     let after = bus.getByte(addr);
                     if (after !== before) { caught = true; how = `ROMBASE+0x100 changed from 0x${hex(before, 2)} to 0x${hex(after, 2)} via a NORMAL write`; }
+                } else if (name === "ssc-base-not-decoded") {
+                    let addr = VAX.PHYSMEM.SSC_BASE >>> 0;
+                    bus.setLong(addr, 0x12345678 | 0);
+                    if (bus.checkFault()) {
+                        caught = true;
+                        how = `a store to SSC_BASE (0x${hex(addr)}) faulted -- the base register is no longer decoded`;
+                    }
+                } else if (name === "ssc-base-wrong-mask") {
+                    let addr = VAX.PHYSMEM.SSC_BASE >>> 0;
+                    bus.setLong(addr, 0);
+                    let v = bus.getLong(addr) >>> 0;
+                    let want = 0x20000000;                  // SSCBASE_MBO -- must-be-one bits
+                    if (v !== want) {
+                        caught = true;
+                        how = `SSC_BASE readback after storing 0 is 0x${hex(v)}, expected 0x${hex(want)} (SSCBASE_MBO preserved)`;
+                    }
+                } else if (name === "boundary-off-by-one") {
+                    /*
+                     * A pure-function check, deliberately not touching bus/cpu at all: the exact
+                     * (records=2, finalizedPartial=false) input this item's own live romdiff run
+                     * produced (see runRomJS()'s doc comment) -- the correct answer is
+                     * {comparableRecords: 2, instrNum: 3} (both records genuinely completed, the
+                     * boundary is the THIRD instruction); the mutation above always subtracts one.
+                     */
+                    let got = BoundaryAccounting.compute(2, false);
+                    if (got.comparableRecords !== 2 || got.instrNum !== 3) {
+                        caught = true;
+                        how = `BoundaryAccounting.compute(2, false) = ${JSON.stringify(got)}, expected ` +
+                            `{comparableRecords: 2, instrNum: 3}`;
+                    }
+                } else if (name === "boundary-required-not-enforced") {
+                    /*
+                     * Pure-function check with synthetic `js` objects, mirroring the coordinator's
+                     * two live-injection shapes exactly: (1) a stop with NO fault ever recorded, and
+                     * (2) a stop whose first fault IS recorded but landed on an address the real
+                     * oracle also does not service (boundary === null either way).  The unmutated
+                     * function must flag BOTH as problems; the mutation always returns null.
+                     */
+                    let r1 = BoundaryRequired.check({stop: {reason: "synthetic"}, firstFaultAddr: null}, null);
+                    let r2 = BoundaryRequired.check({stop: {reason: "synthetic"}, firstFaultAddr: 0x20090000}, null);
+                    if (r1 === null || r2 === null) {
+                        caught = true;
+                        how = `BoundaryRequired.check() returned null (no problem) for a stop with no named ` +
+                            `boundary -- r1(no fault recorded)=${JSON.stringify(r1)}, ` +
+                            `r2(fault also absent on real oracle)=${JSON.stringify(r2)}`;
+                    }
                 }
             } finally {
                 undo();
@@ -841,18 +1124,38 @@ function main()
                 boundary = {addr: js.firstFaultAddr, fWrite, instrPC: js.firstFaultPC};
             }
         }
+        /* VERACITY FINDING A: a stop that never yields a named boundary is a FAILURE, not a quiet
+           pass -- see BoundaryRequired.check()'s doc comment. */
+        let boundaryProblem = BoundaryRequired.check(js, boundary);
+        if (boundaryProblem) problems.push(boundaryProblem);
         let breakAddr = boundary ? boundary.instrPC : js.pc;
         let simhTrace = captureSimhTrace(simh, opts, breakAddr);
         /*
-         * MEASURED (veracity re-dispatch): the boundary instruction's OWN record in js.tracePath
-         * is a FORCE-FINALIZED partial one -- runRomJS()'s unconditional `hst.finish(cpu)` call
-         * (which runs after the catch block, regardless of whether the last instruction's body
-         * actually completed) finalizes it even though the store aborted mid-instruction.  SIMH's
-         * capture, correctly bounded at that same instruction's start PC, never executes it at all
-         * (the breakpoint fires on FETCH). So the boundary case compares `js.records - 1` records
-         * -- everything genuinely completed before the boundary -- not `js.records`.
+         * MEASURED (veracity re-dispatch, pcjsvax-446): the boundary instruction's OWN record in
+         * js.tracePath is a FORCE-FINALIZED partial one WHEN its fault happened inside the
+         * instruction's BODY (runRomJS()'s unconditional `hst.finish(cpu)` call finalizes whatever
+         * hst.record() already started, even though the body itself aborted) -- SIMH's capture,
+         * correctly bounded at that same instruction's start PC, never executes it at all (the
+         * breakpoint fires on FETCH), so that case compares `js.records - 1` records: everything
+         * genuinely completed before the boundary, not `js.records`.
+         *
+         * MEASURED (pcjsvax-320): that is NOT the only shape a boundary can take, and assuming it
+         * unconditionally is what pcjsvax-320 exposed the first time a boundary landed on
+         * SPECIFIER RESOLUTION of the instruction AFTER one that used to be the boundary and now
+         * completes successfully -- a fault reached BEFORE hst.record() ever ran for it, per
+         * cpustate.js's fnExecute ordering (record() fires after specifier resolution, before the
+         * body).  hst.finish(cpu) is then a genuine no-op (simhtrace.js: `if (!p) return;`), so
+         * js.records is ALREADY the exact count of comparable instructions and trimming one more
+         * would silently drop the LAST one that actually completed -- here, the very MOVL storing
+         * to SSC+0x0 this item exists to decode -- out of the SIMH comparison entirely, the one
+         * case this item most needs graded.  `js.finalizedPartial` (measured directly, by whether
+         * hst.finish() changed hst.count -- not assumed from which kind of boundary this is)
+         * distinguishes the two shapes; `comparableRecords` and `boundaryInstrNum` below are the
+         * single computation both the trim and every "instruction #N" label use, so they cannot
+         * drift apart the way the pre-existing code's inlined `js.records`/`js.records - 1` did.
          */
-        let maxJsRecords = boundary ? js.records - 1 : -1;
+        let {comparableRecords, instrNum: boundaryInstrNum} = BoundaryAccounting.compute(js.records, js.finalizedPartial);
+        let maxJsRecords = boundary ? comparableRecords : -1;
         let cmp = compareTraces(js.tracePath, simhTrace, js.unavailable, opts, maxJsRecords);
         console.log(`  SIMH breakpoint        : ${hex(breakAddr)} ` +
             (boundary ? "(the boundary instruction's own PC -- SIMH reaches this identically)"
@@ -869,12 +1172,27 @@ function main()
                 `reached comparison`);
         }
         if (boundary) {
-            console.log(`\n  UNDECODED-HARDWARE BOUNDARY: instruction #${js.records} ` +
+            boundary.instrNum = boundaryInstrNum;
+            console.log(`\n  UNDECODED-HARDWARE BOUNDARY: instruction #${boundaryInstrNum} ` +
                 `(${boundary.fWrite ? "write" : "read"}) touched ${nameAddress(boundary.addr)}, which SIMH ` +
                 `services (ssc_rd/ssc_wr -- backed end-to-end, same category as CDG) but this bus does ` +
-                `not decode yet.  See pcjsvax-320 (decode the SSC block), which will move this boundary ` +
-                `forward.`);
+                `not decode yet.  See the next device item, which will move this boundary forward.`);
         }
+    }
+
+    /* ---- PHASE 1b: the SSC base register mask, RANDOMIZED against the real oracle ----
+       See verifySscBaseRandom()'s doc comment for why the trace above cannot exercise this on its
+       own: the ROM stores exactly ONE value (0x20140000), which already satisfies the mask, so a
+       transcription bug in SSCBASE_RW/SSCBASE_MBO would pass the real-workload phase silently. */
+    let sscCases = +getArg("--ssc-base-cases", 40);
+    if (sscCases < SSC_BASE_CASES_FLOOR) {
+        problems.push(`--ssc-base-cases ${sscCases} is below the enforced floor (${SSC_BASE_CASES_FLOOR}); ` +
+            `this run would under-cover the SSC base register's mask formula and must not be allowed to pass.`);
+    } else {
+        let sscProblems = verifySscBaseRandom(simh, opts, +getArg("--seed", 0xB16B00B5), sscCases);
+        console.log(`\nSSC BASE REGISTER MASK (randomized, ${sscCases} cases, real oracle): ` +
+            `${sscProblems.length ? "DIVERGED" : "MATCH"}`);
+        for (let p of sscProblems) problems.push(p);
     }
 
     /* ---- PHASE 2: the mirror ---- */
@@ -911,13 +1229,17 @@ function report(problems, js, boundary)
     if (boundary) {
         /* The NAMED boundary this item exists to report -- see main()'s doc comment above for why
            js.stop.detail (the cascading depth-bound guard's LAST fault code, not the first fault's
-           address) is not what gets named here.  1-based index js.records: it is the boundary
-           instruction's own FORCE-FINALIZED record (see compareTraces()'s call site), so it is
-           already the last of the js.records recorded -- not one past it. */
-        console.log(`\nSTOPPING POINT: instruction #${js.records} (0-based index ${js.records - 1}), ` +
+           address) is not what gets named here.  boundary.instrNum (main()'s boundaryInstrNum) is
+           NOT always js.records: it is js.records only when the boundary instruction's own fault
+           happened inside its BODY (a force-finalized partial record IS the last of js.records) --
+           when it instead happened during operand resolution of the instruction AFTER one that now
+           completes (this item's own new case), nothing was ever finalized for it and its true
+           ordinal is js.records + 1.  See main()'s comment at comparableRecords/boundaryInstrNum
+           for the measurement that tells the two apart. */
+        console.log(`\nSTOPPING POINT: instruction #${boundary.instrNum} (0-based index ${boundary.instrNum - 1}), ` +
             `PC=${hex(boundary.instrPC)}, attempted a ${boundary.fWrite ? "write to" : "read of"} ` +
             `${nameAddress(boundary.addr)} -- SIMH services this address; this bus does not decode it ` +
-            `yet (pcjsvax-320).`);
+            `yet.`);
     } else if (js && js.stop) {
         console.log(`\nSTOPPING POINT: instruction #${js.records} (0-based index ${js.records - 1}), ` +
             `PC=${hex(js.pc)}, touched ${nameAddress(js.stop.detail)} -- ${js.stop.reason}`);

@@ -43,24 +43,32 @@
  *
  * WHY EVERY "RESERVED" ADDRESS IS NOT A "MUST MACHINE-CHECK" ADDRESS ON REAL SIMH
  * ---------------------------------------------------------------------------------
- * BusVAX.RESERVED marks six ranges this bus reserves but does not decode.  Real SIMH, however,
- * DOES decode most of them (vax_sysdev.c's `regtable[]`: CQBIC, CMCTL, KA655 regs, CQMAP, SSC,
- * NVR) -- because SIMH implements the peripherals this project has not built yet, or (ROM) a
- * sibling item already has.  Measured directly (see calibrate() below, and its printed report,
- * and EXPECTED_CALIBRATION's committed counts):
+ * BusVAX.RESERVED marks FIVE ranges this bus reserves but does not decode (SIX until pcjsvax-320
+ * removed SSC_BASE -- see below).  Real SIMH, however, DOES decode most of them (vax_sysdev.c's
+ * `regtable[]`: CQBIC, CMCTL, KA655 regs, CQMAP, SSC, NVR) -- because SIMH implements the
+ * peripherals this project has not built yet, or (ROM, and now the SSC base register) a sibling
+ * item already has.  Measured directly (see calibrate() below, and its printed report, and
+ * EXPECTED_CALIBRATION's committed counts):
  *
  *   - CDG_BASE is backed END TO END (`cdg_rd`/`cdg_wr` span exactly VAX.PHYSMEM.CDG_LENGTH):
  *     every access SIMH does not machine-check.  100% expected divergence; reported, not graded.
  *   - REG_BASE is a MIX: several real sub-windows (CQBIC at +0, CMCTL at +0x100, KA655 regs at
  *     +0x4000, CQIPC at +0x1F40, CQMAP at +0x8000) are backed; the rest of its 512KB genuinely
  *     machine-checks on both sides THROUGH ReadReg()/WriteReg(), the mechanism this item models.
- *   - SSC_BASE and NVR_BASE (added to BusVAX.RESERVED by this re-dispatch -- see bus.js's
- *     isReserved(), standing rule 7) are ALSO backed end to end (`ssc_rd`/`ssc_wr`,
- *     `nvr_rd`/`nvr_wr`): the SSC's and NVR's OWN configuration registers are real devices in
- *     SIMH, addressed through the same ReadReg/WriteReg table as everything else here.  100%
- *     expected divergence, same as CDG -- but they must be IN the pool's candidate space (not a
- *     silent gap) for that fact to be checked and reported rather than assumed.  This is exactly
- *     the address pcjsvax-223 measured as the ROM's FIRST hardware probe (SSC+0x0).
+ *   - NVR_BASE (added to BusVAX.RESERVED by the pcjsvax-446 re-dispatch -- see bus.js's
+ *     isReserved(), standing rule 7) is ALSO backed end to end (`nvr_rd`/`nvr_wr`): NVR's OWN
+ *     storage is a real device in SIMH, addressed through the same ReadReg/WriteReg table as
+ *     everything else here.  100% expected divergence, same as CDG -- but it must be IN the pool's
+ *     candidate space (not a silent gap) for that fact to be checked and reported rather than
+ *     assumed.
+ *   - SSC_BASE is NO LONGER in BusVAX.RESERVED, and therefore no longer one of this file's RANGES
+ *     at all, as of pcjsvax-320: it decodes the SSC base register (see bus.js's addSsc(), ssc.js)
+ *     and installs a real controller over the whole SSC span, the same ROM_BASE precedent that
+ *     already excluded ROM from this list.  This is exactly the address pcjsvax-223 measured as
+ *     the ROM's FIRST hardware probe (SSC+0x0) and pcjsvax-320 measured as its SECOND (SSC+0x30,
+ *     OTP) -- the sub-registers pcjsvax-320 does NOT decode still fault exactly as before (see
+ *     ssc.js's file header), they are simply no longer reachable through THIS file's
+ *     RESERVED-range-derived pool, since they are not a whole reserved RANGE anymore.
  *   - IOPAGE_BASE and CQM_BASE are ADDR_IS_IO()/ADDR_IS_CQM() territory: a KA655 routes Qbus
  *     I/O-page and Qbus-memory references through vax_io.c's `ReadQb()`/`WriteQb()`, not
  *     vax_sysdev.c's ReadReg()/WriteReg().  An unbacked reference there calls `cq_merr()` (sets
@@ -276,8 +284,9 @@ function candidatesFor(base, len)
 }
 
 /** {name, base, len, addrs} for every BusVAX.RESERVED entry -- names are diagnostic labels only.
-    Order MUST track bus.js's BusVAX.RESERVED array (asserted at load time below). */
-const RANGE_NAMES = ["CDG", "IOPAGE", "REG", "CQM", "SSC", "NVR"];
+    Order MUST track bus.js's BusVAX.RESERVED array (asserted at load time below).  "SSC" was
+    removed by pcjsvax-320 (see the file header): SSC_BASE is no longer a whole reserved range. */
+const RANGE_NAMES = ["CDG", "IOPAGE", "REG", "CQM", "NVR"];
 if (RANGE_NAMES.length !== BusVAX.RESERVED.length) {
     throw new Error(`mchkdiff.js: RANGE_NAMES has ${RANGE_NAMES.length} entries, ` +
         `BusVAX.RESERVED has ${BusVAX.RESERVED.length} -- bus.js's reserved-range list changed ` +
@@ -564,8 +573,8 @@ const EXPECTED_CALIBRATION = {
     IOPAGE: {confirmed: {write: 0, read: 10}, backed: {write: 10, read: 0}},
     REG:    {confirmed: {write: 8, read: 8},  backed: {write: 2,  read: 2}},
     CQM:    {confirmed: {write: 0, read: 10}, backed: {write: 10, read: 0}},
-    SSC:    {confirmed: {write: 0, read: 0},  backed: {write: 10, read: 10}},
     NVR:    {confirmed: {write: 0, read: 0},  backed: {write: 10, read: 10}}
+    /* SSC removed by pcjsvax-320 -- see RANGE_NAMES and the file header. */
 };
 
 /**
