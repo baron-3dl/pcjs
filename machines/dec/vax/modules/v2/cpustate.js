@@ -46,10 +46,12 @@
  *   IPL arbitration.  All of that is exc.js's `stepInstruction()`, which was written to be exactly
  *   this loop's inner body and is CALLED, not reimplemented.
  * * Devices.  No Qbus, no console, no interval timer.  `VAXExc.deviceVector()` returns 0, so no
- *   hardware interrupt can be requested and none is dispatched.  A physical access outside RAM is
- *   a bus fault, which this file turns into a SIMULATOR STOP (see `onBusFault`) rather than
- *   guessing at a machine check -- SIMH's machine check is system-model code (vax_syslist.c) and
- *   exc.js's header states why it is not modelled.
+ *   hardware interrupt can be requested and none is dispatched.  A physical access outside RAM/ROM
+ *   is a bus fault; `onBusFault()` (pcjsvax-446) reproduces vax_sysdev.c's ReadReg()/WriteReg()
+ *   default case -- SSC bus-timeout bit, then SCB_MCHK through exc.js's existing SCB dispatch --
+ *   for exactly that one trigger.  It is not a full machine-check model: see onBusFault()'s and
+ *   exc.js's doc comments for what is and is not covered, and pcjsvax-d22 for the Qbus/CQBIC
+ *   (`ReadQb`/`cq_merr`/deferred `mem_err`) mechanism this deliberately does not reproduce.
  * * Packed decimal / CIS and H_floating ARITHMETIC.  But see EMULATED INSTRUCTIONS below: the
  *   *interface* by which a VAX without those options hands them to software lives in vax_cpu.c,
  *   i.e. here, and is implemented.
@@ -94,7 +96,9 @@ import { DISPATCH as INT_DISPATCH, CC_MASK } from "./cpu.js";
 import { CONTROL_OPCODES } from "./control.js";
 import { STRQ_OPCODES } from "./strq.js";
 import VAXFloat from "./fpa.js";
-import VAXExc, { VAXStop, EXC_OPCODES, SCB, PSL_FPD, PSL_TP, PSW_T, PSW_IV, PSW_FU, PSW_DV } from "./exc.js";
+import VAXExc, {
+    VAXStop, EXC_OPCODES, SCB, PSL_FPD, PSL_TP, PSW_T, PSW_IV, PSW_FU, PSW_DV, MCHK_READ, MCHK_WRITE
+} from "./exc.js";
 
 const L_BYTE = 1, L_WORD = 2, L_LONG = 4;
 const nSP = 14, nPC = 15;
@@ -407,19 +411,48 @@ export default class CPUStateVAX extends Component {
     /**
      * onBusFault(addr, access)
      *
-     * A physical reference outside any RAM/ROM block.  On real hardware, and in SIMH's KA655
-     * model, this becomes a machine check through system-model code (vax_syslist.c) that exc.js
-     * deliberately does not model.  Rather than invent one, stop the machine with a reason that
-     * names the address: a harness then reports "stopped at a non-existent memory reference",
-     * which is a true statement about this machine, instead of diverging silently from SIMH.
+     * A physical reference to an address BusVAX.RESERVED reserves but does not decode (the
+     * KA655 I/O, register, SSC, NVR and Qbus-memory ranges -- see bus.js) -- pcjsvax-446.  This is
+     * how the console ROM discovers hardware: probe an address, and if nothing answers, take a
+     * machine check instead of ending the run.
+     *
+     * TWO DIFFERENT SIMH MECHANISMS LAND HERE, and they must be told apart (veracity re-dispatch,
+     * pcjsvax-446):
+     *
+     *   - vax_sysdev.c's ReadReg()/WriteReg() `default:` case (:1031-1032, :1071-1072) -- reached
+     *     for CDG/REG-gap/SSC/NVR addresses -- sets the SSC bus-timeout bit AND raises SCB_MCHK.
+     *   - vax_io.c's ReadQb()/WriteQb() (reached instead for IOPAGE/CQM addresses, via
+     *     ADDR_IS_IO()/ADDR_IS_CQM(): a KA655 routes Qbus I/O-page and Qbus-memory references
+     *     through the CQBIC, not ReadReg/WriteReg) calls `cq_merr()` (a CQBIC DSER/MEAR error
+     *     register this item does not model -- see pcjsvax-d22) and, for READS ONLY, the SAME
+     *     MACH_CHECK() -- but it NEVER touches ssc_bto.  WRITES there don't even reach MACH_CHECK
+     *     synchronously: WriteQb's unbacked case sets a DEFERRED `mem_err` flag and returns
+     *     normally, which this item does not reproduce (see pcjsvax-d22); a write fault here is
+     *     therefore graded only through the READ half, never the write half, of those two ranges.
+     *
+     * Suppressing busTimeout() for an ADDR_IS_IO/ADDR_IS_CQM address is therefore correct, not
+     * incidental: setting ssc_bto there would be a genuine divergence from real SIMH (measured
+     * directly; tests/mchkdiff.js grades exactly this).
+     *
+     * `delta` (PC - fault_PC, "how far decode had consumed the faulting instruction") is captured
+     * HERE, before takeFault()'s common preamble resets PC back to fault_PC, and is smuggled to
+     * exc.js's SCB.MCHK case through the VAXFault's p2 slot -- see its doc comment for why it
+     * cannot be recomputed there.
      *
      * @this {CPUStateVAX}
      * @param {number} addr
-     * @param {number} access
+     * @param {number} access one of VAX.ACCESS.* -- VAX.ACCESS.WRITE for a write, otherwise a read
      */
     onBusFault(addr, access)
     {
-        throw new VAXStop(VAXStop.REASON.MCHK, addr >>> 0);
+        let a = addr >>> 0;
+        let fWrite = access === VAX.ACCESS.WRITE;
+        let fQbus =
+            (a >= VAX.PHYSMEM.IOPAGE_BASE && a < VAX.PHYSMEM.IOPAGE_BASE + VAX.PHYSMEM.IOPAGE_LENGTH) ||
+            (a >= VAX.PHYSMEM.CQM_BASE && a < VAX.PHYSMEM.CQM_BASE + VAX.PHYSMEM.CQM_LENGTH);
+        let p1 = fQbus ? (fWrite ? MCHK_WRITE : MCHK_READ) : this.exc.busTimeout(fWrite);
+        let delta = (this.regs[nPC] - this.exc.faultPC) | 0;
+        throw new VAXFault(-SCB.MCHK, p1, delta);
     }
 
     /* --------------------------------------------------------------------------------------- *
