@@ -744,12 +744,17 @@ function runDiff(simhBin, nOps, seed, mutation, fQuiet)
 /**
  * reportScopeGaps(simhBin)
  *
- * DISCLOSURE, not a comparison.  This item reserves the KA655 I/O / ROM / register / NVR / Qbus
- * ranges but deliberately does NOT decode them (that is the device items' work), so SIMH and this
- * bus DIVERGE there by design: SIMH's console happily reads the boot ROM and the NVR, we report
- * non-existent memory.  Those addresses are therefore excluded from the randomized address pool.
- * This function probes them on both sides and prints the divergence explicitly, so the gap is on
- * the record rather than hidden behind a green result.
+ * DISCLOSURE, not a comparison.  This item reserves the KA655 I/O / register / NVR / Qbus ranges
+ * but deliberately does NOT decode them (that is the device items' work), so SIMH and this bus
+ * DIVERGE there by design: SIMH's console happily reads the NVR and the cache diagnostic space, we
+ * report non-existent memory.  Those addresses are therefore excluded from the randomized address
+ * pool.  This function probes them on both sides and prints the divergence explicitly, so the gap
+ * is on the record rather than hidden behind a green result.
+ *
+ * ROM is the one row that no longer diverges: pcjsvax-223 decodes it (BusVAX.addRom()), so the
+ * probe bus here loads a zero-filled ROM image before probing -- matching SIMH's own un-loaded
+ * state exactly (rom_reset() calloc's the ROM array to zero; this script never issues `load -r`,
+ * so both sides are reading a fresh, unloaded ROM).  The other rows are untouched.
  *
  * @param {string} simhBin
  */
@@ -773,6 +778,7 @@ function reportScopeGaps(simhBin)
     let aResults = runSimh(simhBin, aLines.join("\n") + "\n", aCmds);
 
     let bus = makeBus("");
+    bus.addRom(new Uint8Array(VAX.PHYSMEM.ROM_SIZE));
     console.log("\nOut-of-scope ranges (reserved by bus.js, NOT decoded by this item):");
     for (let i = 0; i < aProbes.length; i++) {
         let js = scpExamine(bus, aProbes[i][1], 1);

@@ -158,10 +158,13 @@ export default class BusVAX extends Component {
     /**
      * isReserved(addr)
      *
-     * The KA655 I/O, ROM, register, SSC, NVR and Qbus-memory ranges are RESERVED by this component
-     * but deliberately NOT decoded: no handlers, no storage, no aliasing.  Accesses to them fault as
+     * The KA655 I/O, register, SSC, NVR and Qbus-memory ranges are RESERVED by this component but
+     * deliberately NOT decoded: no handlers, no storage, no aliasing.  Accesses to them fault as
      * non-existent memory until the device items populate them.  This exists so that a later item
      * can assert "nobody has quietly mapped RAM on top of the I/O space".
+     *
+     * ROM_BASE is NOT in this list: pcjsvax-223 decodes it (see addRom()), so it is no longer
+     * reserved-but-undecoded -- it is reserved-and-DECODED, like RAM.
      *
      * @this {BusVAX}
      * @param {number} addr (physical)
@@ -308,6 +311,81 @@ export default class BusVAX extends Component {
         }
 
         return this.reportError(BusVAX.ERROR.RANGE_INVALID, addr, size);
+    }
+
+    /**
+     * addRom(bytes)
+     *
+     * Decodes the KA655 boot ROM at VAX.PHYSMEM.ROM_BASE for its full mirrored span
+     * (VAX.PHYSMEM.ROM_LENGTH, twice ROM_SIZE).  vax_sysdev.c's regtable entry for ROMBASE covers
+     * `[ROMBASE, ROMBASE+2*ROMSIZE)` with a SINGLE read routine (`rom_rd`) that masks the offset
+     * with ROMAMASK (ROMSIZE-1, vax_sysdev.c:546-555), so the upper half is a TRUE ALIAS of the
+     * lower half -- one underlying array, not two copies -- which matters because the one thing
+     * ever written into it after this call (the boot-time model magic byte, see
+     * CPUStateVAX.boot()) must be visible through the mirror too, exactly as it is on hardware.
+     *
+     * The primary half is ordinary ROM-typed blocks: read-only to the executing machine (writes
+     * go to writeNone), writable only through the Direct accessors, which is how the ROM's own
+     * content and the boot-time magic byte get in without ever making the ROM writable to a
+     * running program.  The mirror half is this component's FIRST use of
+     * MemoryVAX.TYPE.CONTROLLER (memory.js:87-93, never previously instantiated anywhere in this
+     * tree): its controller resolves EACH mirror block's `getControllerBuffer(addr)` back to the
+     * PRIMARY block already sitting at `addr - ROM_SIZE` and hands back that block's own `adw`, so
+     * every mirror block -- addMemory() still creates one MemoryVAX per BLOCK_SIZE chunk, same as
+     * any other region -- reads exactly what its primary counterpart holds, live, with no copy.
+     * Proved, not assumed, by tests/romdiff.js, which checks the mirror against SIMH at several
+     * offsets including the boundary, both before and after the magic byte is written.
+     *
+     * @this {BusVAX}
+     * @param {Uint8Array} bytes exactly VAX.PHYSMEM.ROM_SIZE bytes long
+     */
+    addRom(bytes)
+    {
+        if (bytes.length != VAX.PHYSMEM.ROM_SIZE) {
+            throw new Error(`BusVAX.addRom: expected ${VAX.PHYSMEM.ROM_SIZE} bytes, got ${bytes.length}`);
+        }
+        let base = VAX.PHYSMEM.ROM_BASE >>> 0;
+        let size = VAX.PHYSMEM.ROM_SIZE;
+        this.addMemory(base, size, MemoryVAX.TYPE.ROM);
+        for (let i = 0; i < bytes.length; i++) {
+            let addr = (base + i) >>> 0;
+            this.aMemBlocks[addr >>> this.nBlockShift].writeByteDirect(addr & this.nBlockLimit, bytes[i], addr);
+        }
+        this.addMemory((base + size) >>> 0, size, MemoryVAX.TYPE.ROM, BusVAX.makeRomAliasController(this));
+    }
+
+    /**
+     * makeRomAliasController(bus)
+     *
+     * A MemoryVAX controller (memory.js's constructor: `getControllerBuffer(addr)` ->
+     * `[adw, offset]`, `getControllerAccess()` -> the 6-entry afn table) whose buffer, for a mirror
+     * block being constructed at physical `addr`, IS the primary block already sitting at
+     * `addr - ROM_SIZE`'s own `adw`, at offset 0.  Only the READ half of the afn table is supplied;
+     * leaving the write entries `undefined` means both `writeByte` (already blocked by
+     * `type == ROM`'s `fReadOnly`) and `writeByteDirect` (which normally bypasses `fReadOnly`, see
+     * memory.js's setWriteAccess()) fall through to `writeNone` for the mirror specifically -- the
+     * one and only write path into this ROM stays the primary half's Direct accessor, matching real
+     * hardware, where there is only one array to write.
+     *
+     * @param {BusVAX} bus
+     * @returns {Object}
+     */
+    static makeRomAliasController(bus)
+    {
+        return {
+            getControllerBuffer(addr) {
+                let primaryAddr = ((addr >>> 0) - VAX.PHYSMEM.ROM_SIZE) >>> 0;
+                let block = bus.aMemBlocks[primaryAddr >>> bus.nBlockShift];
+                return [block.adw, 0];
+            },
+            getControllerAccess() {
+                return [
+                    MemoryVAX.prototype.readByteMemory, undefined,
+                    MemoryVAX.prototype.readWordMemory, undefined,
+                    MemoryVAX.prototype.readLongMemory, undefined
+                ];
+            }
+        };
     }
 
     /**
@@ -792,9 +870,9 @@ BusVAX.BLOCK_SIZE = 0x2000;
 BusVAX.RESERVED = [
     [VAX.PHYSMEM.CDG_BASE,    VAX.PHYSMEM.CDG_LENGTH],
     [VAX.PHYSMEM.IOPAGE_BASE, VAX.PHYSMEM.IOPAGE_LENGTH],
-    [VAX.PHYSMEM.ROM_BASE,    VAX.PHYSMEM.ROM_LENGTH],
     [VAX.PHYSMEM.REG_BASE,    VAX.PHYSMEM.REG_LENGTH],
     [VAX.PHYSMEM.CQM_BASE,    VAX.PHYSMEM.CQM_LENGTH]
+    /* ROM_BASE removed by pcjsvax-223: it is decoded now (see addRom()), not merely reserved. */
 ];
 
 BusVAX.ERROR = {
