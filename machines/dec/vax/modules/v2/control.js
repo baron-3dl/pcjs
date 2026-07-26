@@ -109,13 +109,20 @@ function ccIIZP_W(cpu, r) { setCC(cpu, (r & WSIGN) ? (CC.N | (getCC(cpu) & CC.C)
 function ccIIZP_L(cpu, r) { setCC(cpu, (r & LSIGN) ? (CC.N | (getCC(cpu) & CC.C)) : (r == 0) ? (CC.Z | (getCC(cpu) & CC.C)) : (getCC(cpu) & CC.C)); }
 
 /*
- * V_ADD_x(cpu, r, s1, s2) / V_SUB_x(cpu, r, s1, s2) -- vax_defs.h:769-796.  Sets CC.V on overflow;
- * deliberately does NOT perform SIMH's deferred INTOV trap (see file header).
+ * V_ADD_x(cpu, r, s1, s2) / V_SUB_x(cpu, r, s1, s2) -- vax_defs.h:769-796.  Sets CC.V on overflow
+ * AND requests the deferred integer-overflow trap, because in SIMH `V_ADD_x` expands to `V_INTOV`,
+ * which expands to `cc = cc | CC_V; if (PSL & PSW_IV) SET_TRAP (TRAP_INTOV)` -- the two halves are
+ * one macro, not two decisions.  This file originally implemented only the CC half, correctly for
+ * its own scope (a single-instruction differential cannot observe a trap dispatched at the top of
+ * the NEXT instruction).  pcjsvax-c05 added the loop that dispatches it, so the request is now
+ * real; `trpirq` is the same variable cpu.js, fpa.js and strq.js write and exc.js drains.
  */
-function vAddL(cpu, r, s1, s2) { if (((~s1 ^ s2) & (s1 ^ r)) & LSIGN) setCC(cpu, getCC(cpu) | CC.V); }
-function vSubL(cpu, r, s1, s2) { if (((s1 ^ s2) & (~s1 ^ r)) & LSIGN) setCC(cpu, getCC(cpu) | CC.V); }
-function vAddB(cpu, r, s1, s2) { if (((~s1 ^ s2) & (s1 ^ r)) & BSIGN) setCC(cpu, getCC(cpu) | CC.V); }
-function vAddW(cpu, r, s1, s2) { if (((~s1 ^ s2) & (s1 ^ r)) & WSIGN) setCC(cpu, getCC(cpu) | CC.V); }
+const PSW_IV = 0x20, PSL_M_IPL = 0x1F, TRAP_INTOV = 1 << 5;
+function intov(cpu) { if (cpu.psl & PSW_IV) cpu.trpirq = (cpu.trpirq & PSL_M_IPL) | TRAP_INTOV; }
+function vAddL(cpu, r, s1, s2) { if (((~s1 ^ s2) & (s1 ^ r)) & LSIGN) { setCC(cpu, getCC(cpu) | CC.V); intov(cpu); } }
+function vSubL(cpu, r, s1, s2) { if (((s1 ^ s2) & (~s1 ^ r)) & LSIGN) { setCC(cpu, getCC(cpu) | CC.V); intov(cpu); } }
+function vAddB(cpu, r, s1, s2) { if (((~s1 ^ s2) & (s1 ^ r)) & BSIGN) { setCC(cpu, getCC(cpu) | CC.V); intov(cpu); } }
+function vAddW(cpu, r, s1, s2) { if (((~s1 ^ s2) & (s1 ^ r)) & WSIGN) { setCC(cpu, getCC(cpu) | CC.V); intov(cpu); } }
 
 /*
  * CC_CMP_x(cpu, s1, s2) -- vax_defs.h:813-827.  Used by CASEx to compare (selector-base) to limit.

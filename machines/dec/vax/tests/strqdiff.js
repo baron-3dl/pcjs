@@ -46,11 +46,13 @@
  * the randomized phase's job to cover, which it does" precedent intdiff.js's own header already
  * established for its own domain.
  *
- * A SECOND EHKAA guard, new to this file: any trace record whose PRE-state already has PSL<FPD>
- * set is a genuine mid-string-op RESUME.  decode.js's `decode(fFPD)` has the resume branch built,
- * but this file (like intdiff.js's own EHKAA phase) always calls `decode(false)`, which cannot
- * correctly replay a resume (it would re-resolve specifiers that were never re-fetched on real
- * hardware).  Skipped, counted, reported -- see strq.js's file header, "NO CPU LOOP OWNS fault_PC".
+ * A SECOND EHKAA guard: any trace record whose PRE-state already has PSL<FPD> set is a genuine
+ * mid-string-op RESUME.  decode.js's `decode(fFPD)` has the resume branch built, but this file
+ * (like intdiff.js's own EHKAA phase) always calls `decode(false)`, which cannot correctly replay
+ * a resume -- it would re-resolve specifiers that were never re-fetched on real hardware.
+ * Skipped, counted, reported.  The guard was ORIGINALLY there because strq.js had no `fault_PC` to
+ * resume against at all; that half is fixed (pcjsvax-c05) and the resume path is now graded
+ * end-to-end by tests/cpudiff.js.  See the guard's own comment for what is left.
  *
  *      node machines/dec/vax/tests/strqdiff.js [options]
  *        --simh PATH        patched microvax3900 (needs patches 0001+0002+0003; else $SIMH_INT_BIN,
@@ -1210,10 +1212,24 @@ function phaseEHKAA(opts)
         if (!EHKAA_MN.has(rec.mnemonic)) { if (rec.mnemonic) skippedNotWanted++; continue; }
         let next = allSeq[i + 1];
         if (next.pc !== (rec.pc + rec.ilen | 0)) { skippedTrap++; continue; }
-        /* A genuine mid-string-op resume: PSL<FPD> was already set entering this instruction.
-           decode(false) cannot correctly replay a resume (see strq.js's file header) -- skip,
-           counted, not silently dropped.  MOVC3/MOVC5 are the only EHKAA_MN opcodes that can ever
-           set FPD, but the check costs nothing to apply uniformly. */
+        /*
+         * A genuine mid-string-op resume: PSL<FPD> was already set entering this instruction.
+         *
+         * THIS GUARD'S ORIGINAL REASON IS GONE.  It was written because nothing in the codebase
+         * owned `fault_PC`, so strq.js's resume path could not compute `fault_PC + STR_GETDPC(R0)`
+         * and any resume it replayed would have been wrong.  pcjsvax-c05 added the CPU loop, both
+         * halves of the delta-PC are real, and tests/cpudiff.js drives the resume path against SIMH
+         * directly -- an interrupted MOVC5 with a mid-copy page fault, a handler that fixes the PTE
+         * and REIs, and the resumed instruction's register file compared.  Its `fpd-resume` case
+         * kind and its `fpd-resume-no-delta` --selfcheck mutation are that coverage.
+         *
+         * WHAT REMAINS IS A PROPERTY OF THIS HARNESS, NOT OF strq.js: this phase replays one
+         * instruction at a time through `decode(false)`, so it re-resolves specifiers that a real
+         * resume never re-fetches.  That is unfixable here and uninteresting now that the loop is
+         * graded elsewhere, so the guard stays -- but it is DEAD on the current capture
+         * (skippedFPDResume is 0: EHKAA takes no interrupt inside the MOVC3/MOVC5 instances this
+         * phase replays), and the count is printed so that stops being an assumption.
+         */
         if (rec.psl & PSL_FPD) { skippedFPDResume++; continue; }
 
         replay.load({preg: rec.preg, pc: rec.pc, ibyt: rec.ibyt, memr: rec.memr || []});

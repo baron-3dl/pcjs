@@ -8,21 +8,38 @@ DEC VAX
 -------
 
 A MicroVAX 3900 (KA655) machine for PCjs, ported from [Open SIMH](https://github.com/open-simh/simh)
-(MIT, © 1998-2019 Robert M Supnik).  Work in progress: at present this directory contains the
-physical memory and bus layer, instruction decode and operand resolution, memory management, the
-integer/logical/variable-length-bit-field, control-flow, string/queue/INDEX/PROBE and NOP slices of
-instruction execution, F/D/G floating point, and SCB exception/interrupt dispatch with the
-privileged registers.
+(MIT, © 1998-2019 Robert M Supnik).  It runs: the physical memory and bus layer, instruction decode
+and operand resolution, memory management, the integer/logical/variable-length-bit-field,
+control-flow, string/queue/INDEX/PROBE and NOP slices of instruction execution, F/D/G floating
+point, SCB exception/interrupt dispatch with the privileged registers, and — as of `pcjsvax-c05` —
+the CPU loop that wires them together.
 
 As of `pcjsvax-e49`, the **entire Base Instruction Group is implemented** — all 242 opcodes of
 `IG_BASE`/`IG_BSGFL`/`IG_BSDFL`. `tests/base_group_residual.js` is the re-runnable computation that
-proves it and fails on any drift; do not hand-enumerate.
+proves it and fails on any drift; `cpustate.js` makes the same claim a load-time invariant of the
+shipped dispatch table.  Do not hand-enumerate either.
 
-Still missing: devices, **the CPU loop** (`sim_instr()`'s fetch/dispatch/trap loop —
-`pcjsvax-c05`), and the **emulated-instruction exception** — see immediately below. Every
-differential in `tests/` currently drives `decode()` and each module's own
-`execute` directly, one instruction at a time, because nothing yet wires the five execution modules
-— `cpu.js`, `control.js`, `fpa.js`, `strq.js`, `exc.js` — into a single dispatcher.
+As of `pcjsvax-c05`, the machine **executes the DEC EHKAA hardware-core diagnostic end to end**:
+loaded at physical 0, started at `0x200`, 335,444 instructions to its documented PASS halt at
+`0x80018AD1`, with **zero divergence** from a real Open SIMH `microvax3900` on a per-instruction
+trace comparison (`tests/cpudiff.js`, below).  Do not read that as the EHKAA gate being claimed —
+the gate is milestone `pcjsvax-5cb` and `tools/ehkaa-gate/gate.py` is its claim mechanism.
+
+**Packed decimal / CIS is not implemented, and EHKAA does not need it to be.**  On a KA655 those
+opcodes have no hardware: SIMH's `op_cis()` routes every one of them to `cpu_emulate_exception()`,
+which pushes a frame and vectors through `SCB_EMULATE`/`SCB_EMULFPD`, and EHKAA supplies its own
+handler for that vector — it is *testing the emulation trap*, not the arithmetic.  The trap is a
+dispatch decision, so it lives in `cpustate.js`.
+
+`pcjsvax-bc3` was closed as *measured, not applicable*: forcing SIMH to execute CIS natively makes
+EHKAA stop reaching its PASS halt (`80007283` vs `80018AD1`). **Nor is native CIS needed to boot
+VMS** — VMS detects the missing opcodes and supplies its own emulator through this same trap. On
+this model the arithmetic may never be needed at all. See `tests/cis_group_scope.js`.
+
+Still missing: devices (no Qbus, no console, no interval timer — EHKAA takes no device interrupt,
+which is why it runs without them), packed-decimal/CIS arithmetic (not required by EHKAA *or* by a VMS boot — see above), and H_floating
+(`IG_EXTAC`, which `op_octa()` faults as a reserved instruction on this model — EHKAA's six
+`EMODH`/`POLYH` instances take that fault and handle it).
 
 ### Packed decimal / CIS is NOT missing — this machine must not implement it
 
@@ -258,6 +275,12 @@ The first-part-done guard is not optional — an instruction that has already ma
 visible progress is resumed, not restarted.  The PC is deliberately *not* in the recovery queue;
 the CPU restores it wholesale.
 
+That handler is `VAXExc.takeFault()` (`modules/v2/exc.js`), reached from `stepCPU()` and from
+`stepInstruction()`; `fault_PC` is maintained by the loop in `modules/v2/cpustate.js` and published
+as `cpu.faultPC`.  Both halves of the FPD resume it enables are live: `strq.js`'s restartable string
+instructions pack `PC - fault_PC` into `R0<31:24>` and resume at `fault_PC + STR_GETDPC(R0)`, and
+`tests/cpudiff.js` grades that against SIMH with a real mid-copy page fault.
+
 ### Testing
 
 Both layers are graded by randomized differential tests against a **real, executed**
@@ -449,18 +472,63 @@ timer-driven tests whose iteration count depends on host wall-clock time per sim
 therefore asserts the vector and IPR SETS as equalities and the event COUNT as a floor; see
 `tests/simh/README.md` for the measurement.
 
-Two computations carry no fixtures and no hand-maintained lists; they re-derive a scope from the
-same tables the code itself reads, and fail on drift:
+The CPU loop (`modules/v2/cpustate.js`) — one dispatch table across all five execution modules,
+`fault_PC` and the FPD resume path, the abort/unwind boundary, the emulate trap, and
+`stepCPU(nMinCycles)` over the PCjs `Component` lifecycle:
 
-    node machines/dec/vax/tests/base_group_residual.js --check-carveouts
-    node machines/dec/vax/tests/cis_group_scope.js --check
-    node machines/dec/vax/tests/cis_group_scope.js --selfcheck   # two mutations, both must be caught
+    machines/dec/vax/tests/simh/build.sh                 # patch 0001 is enough for this one
+    node machines/dec/vax/tests/cpudiff.js --selfcheck
+    node machines/dec/vax/tests/cpudiff.js
 
-`cis_group_scope.js` also runs EHKAA three times (~30s) and keeps a 145MB instruction history;
-`--keep DIR` caches it between runs.  Its `--selfcheck` mutations are the measurement path itself:
-one reconfigures SIMH to execute CIS natively (the computation must then report `executed`
-instances), one disables the `sim_debug` run-collapse expansion in its own parser (it must then
-report `unresolved` instances).  A surviving mutation means the computation proves nothing.
+Two phases, and they are blind to each other's failures — which is the point.
+
+**EHKAA, the real workload.**  The diagnostic is loaded and run on both machines, each emitting a
+SIMH-format instruction-history trace, and the two are compared by `tools/trace-differ/differ.py`
+in the `pcjs-vax` work repo — the Wave-0 grading tool, used here on a running machine for the first
+time.  Every instruction's PC, PSL, disassembly, resolved operand queue, result and full 16-register
+file is compared in order, and the FIRST divergence is reported with an index and a PC.  All
+**335,444** instructions match.  `tests/simhtrace.js` is the emitter: a port of `fprint_sym_m()`
+(the disassembler — a second, independent statement of which bytes the specifier decoder consumed)
+and `cpu_show_opnd()`.  Three record classes are normalized IDENTICALLY on both traces, counted and
+reported, because their SIMH text is an artifact of the oracle rather than a statement about the
+VAX: `CMPD`'s result tail (40 records — `vax_sys.c` gives it `RB_Q` but `vax_cpu.c` never assigns
+`r`/`rh`, so SIMH prints two stale C locals, one of them last written by `MULL2`), the operand text
+of opcodes that decode ZERO specifiers (96 records — SIMH records 2 instruction bytes and
+disassembles all 52, so the rest is the previous occupant of that history slot), and the result of
+an instruction whose STORE faulted (424 records — SIMH assigns `r` before the store, and reading the
+destination back cannot recover a value that was never written).  Nothing else is normalized: no
+register, PC, PSL or operand value is ever touched.
+
+**RANDOMIZED short programs, not single instructions.**  Nine case kinds, each aimed at a decision
+the loop owns and none of them reachable one instruction at a time: a straight run (the dispatch
+table's own grade), integer overflow with `PSW<IV>` armed, divide-by-zero (whose trap request is
+*unconditional*, unlike overflow), `PSW<T>`/`PSL<TP>` trace traps, `INDEX`'s subscript trap, the
+emulate trap's twelve-longword frame, `MTPR` to `SIRR` with the IPL both below and above the
+request, a real FPD resume, and long string instructions whose `extra_bytes >> 5` cycle charge moves
+where `step N` stops.  `step N` is itself the cycle-accounting grade: SCP's STEP counts
+`sim_interval` units.
+
+The run fails if any case kind falls below its floor, if fewer than 60% of cases changed any state,
+if any case does not reach comparison, or if EHKAA executes fewer than 320,000 instructions or
+dispatches fewer than 242 distinct opcodes (EHKAA executes every base-group opcode, so that floor is
+an equality in disguise).  `--cases` below 80 fails outright rather than scaling the floors down.
+`--selfcheck` injects **twelve** deliberate defects into the shipped code path — the dispatch table,
+`fault_PC`, the FPD unwind guard, both trap-request kinds, three separate properties of the emulate
+frame, the FPD delta-PC, and the cycle charge — and fails if the differential does not catch each.
+**Four survived their first run**, and the fixes were deterministic boundary walks, not a bigger
+run: `EMULATE_VARIANTS` (a CIS opcode with `PSL<FPD>` already set, the only way to reach the
+two-longword frame and `SCB_EMULFPD`), `FPD_VARIANTS` (a faulting `MOVC5` with `(Rn)+` specifiers,
+so the recovery queue is non-empty and the "do not unwind when FPD is set" guard is observable at
+all), `STR_CYCLES_LENGTHS` (31/32/33/64/200/400 bytes, striding the `>> 5` rounding boundary), and
+`ASTLVL = 4` — that last one not a mutation fix but a case-construction bug the mutations exposed:
+with `ASTLVL = 0` every `REI` requests an AST software interrupt on the way out, so the resumed
+instruction was re-interrupted before it resumed and the case quietly stopped testing anything while
+still matching SIMH exactly.
+
+`--dump-case N` prints one case's JS instruction trace beside SIMH's view of it, and
+`CPUDIFF_FAULTS=1` prints every exception a case dispatches with both parameters; a multi-instruction
+program that ends in the wrong state usually went wrong several instructions earlier, and a
+post-state diff cannot say where.
 
 The decode ROM in `modules/v2/drom.js` is **generated**, not transcribed, from Open SIMH's
 `vax_sys.c` and `vax_defs.h`:
