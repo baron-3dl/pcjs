@@ -1,8 +1,8 @@
 diff --git a/VAX/vax_cpu.c b/VAX/vax_cpu.c
-index 4cbce67..b4b406c 100644
+index 4cbce67..a9fe5f0 100644
 --- a/VAX/vax_cpu.c
 +++ b/VAX/vax_cpu.c
-@@ -739,8 +739,17 @@ for ( ;; ) {
+@@ -739,8 +739,31 @@ for ( ;; ) {
                  vec = SCB_IPLSOFT + (temp << 2);
                  SISR = SISR & ~(1u << temp);
                  }
@@ -14,13 +14,88 @@ index 4cbce67..b4b406c 100644
 +                                                              than a parallel mechanism -- EXCA/EXCB
 +                                                              already fire inside intexc() itself,
 +                                                              this adds the vector+IPL pair at the
-+                                                              point of delivery, before dispatch */
++                                                              point of delivery, before dispatch.
++                                                              CAVEAT (pcjsvax-62a): this observes only
++                                                              DELIVERED interrupts. SET_INT/CLR_INT
++                                                              (vaxmod_defs.h) are plain macros that
++                                                              set/clear int_req[] bits directly, with
++                                                              no call site to hook -- a REQUEST raised
++                                                              while PSL<IPL> or SISR masks it produces
++                                                              no INTD record and no other trace record
++                                                              either. It becomes visible only later, at
++                                                              the moment (if ever) it is actually taken
++                                                              here. Ruled acceptable by the pcjsvax-e17
++                                                              review on the condition that it be
++                                                              documented -- see tests/simh/README.md's
++                                                              "What 0006 adds" section and its
++                                                              upstream-drift hazard table entry. */
 +                    sim_debug (LOG_CPU_X, &cpu_dev, "INTD %08X %d %08X\n", vec, temp, PC);
                  cc = intexc (vec, cc, temp, IE_INT);
 +                }
              GET_CUR;                                    /* set cur mode */
              }
          else trpirq = 0;                                /* clear everything */
+diff --git a/VAX/vax_io.c b/VAX/vax_io.c
+index 2fdbbab..12274c4 100644
+--- a/VAX/vax_io.c
++++ b/VAX/vax_io.c
+@@ -53,6 +53,20 @@
+ 
+ #include "vax_defs.h"
+ 
++/* pcjs-vax differential support (patch 0006, extended by pcjsvax-62a). ReadIO/WriteIO/ReadIOU/
++   WriteIOU below are the single choke point for BOTH branches ADDR_IS_IO() covers -- Qbus I/O-page
++   register space (ADDR_IS_IOP, dispatched through iodispR[]/iodispW[] to rl/rq/rqb/rqc/rqd/ts/tq/
++   xq/xqb/dz/dpv, see vax_syslist.c) and the Qbus memory window (ADDR_IS_CQM, dispatched to
++   cqm_rd/cqm_wr) -- since both are reached via ReadQb/WriteQb from these four functions and no
++   other call site. Reuses 0006's DBG_DEVT category and sysd_dev handle so "SET SYSD DEBUG=DEVTRACE"
++   remains the single knob that arms every device-register trace family, IPR space, ReadReg/WriteReg
++   register space, and now Qbus I/O-page/CQM space alike. DBG_DEVT's value (0x0040) must stay in
++   sync with vax_sysdev.c's definition -- it cannot be #include'd from there because it is a private
++   #define in that file, not a header; a rebase that changes vax_sysdev.c's DBG_DEVT value must
++   update this one too. */
++extern DEVICE sysd_dev;
++#define DBG_DEVT 0x0040 /* pcjs-vax: device register access trace (IPR + register space + Qbus I/O) */
++
+ /* CQBIC system configuration register */
+ 
+ #define CQSCR_POK       0x00008000                      /* power ok RO1 */
+@@ -267,6 +281,8 @@ iod = ReadQb (pa);                                      /* wd from Qbus */
+ if (lnt < L_LONG)                                       /* bw? position */
+     iod = iod << ((pa & 2)? 16: 0);
+ else iod = (ReadQb (pa + 2) << 16) | iod;               /* lw, get 2nd wd */
++if (sim_deb)                                             /* pcjs-vax: Qbus I/O-page/CQM read trace */
++    sim_debug (DBG_DEVT, &sysd_dev, "QIOR %08X %08X %08X %08X\n", pa, lnt, iod, PC);
+ SET_IRQL;
+ return iod;
+ }
+@@ -309,6 +325,8 @@ iod = ReadQb (pa);                                      /* wd from Qbus */
+ if ((lnt + (pa & 1)) <= 2)                              /* byte or (word & even) */
+     iod = iod << ((pa & 2)? 16: 0);                     /* one op */
+ else iod = (ReadQb (pa + 2) << 16) | iod;               /* two ops, get 2nd wd */
++if (sim_deb)                                             /* pcjs-vax: Qbus I/O-page/CQM read trace */
++    sim_debug (DBG_DEVT, &sysd_dev, "QIOR %08X %08X %08X %08X\n", pa, lnt, iod, PC);
+ SET_IRQL;
+ return iod;
+ }
+@@ -325,6 +343,8 @@ return iod;
+ 
+ void WriteIO (uint32 pa, int32 val, int32 lnt)
+ {
++if (sim_deb)                                             /* pcjs-vax: Qbus I/O-page/CQM write trace */
++    sim_debug (DBG_DEVT, &sysd_dev, "QIOW %08X %08X %08X %08X\n", pa, lnt, val, PC);
+ if (lnt == L_BYTE)
+     WriteQb (pa, val, WRITEB);
+ else if (lnt == L_WORD)
+@@ -357,6 +377,8 @@ bo = 1, lnt = tribyte - write byte, word
+ 
+ void WriteIOU (uint32 pa, int32 val, int32 lnt)
+ {
++if (sim_deb)                                             /* pcjs-vax: Qbus I/O-page/CQM write trace */
++    sim_debug (DBG_DEVT, &sysd_dev, "QIOW %08X %08X %08X %08X\n", pa, lnt, val, PC);
+ switch (lnt) {
+ case L_BYTE:                                            /* byte */
+     WriteQb (pa, val & BMASK, WRITEB);
 diff --git a/VAX/vax_sysdev.c b/VAX/vax_sysdev.c
 index d9b9e6b..36acda3 100644
 --- a/VAX/vax_sysdev.c

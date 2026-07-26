@@ -325,6 +325,120 @@ Two details are load-bearing:
   changed context, not pure addition, and should not "fix" it back to preserve the trailing
   whitespace.
 
+### CAVEAT: masked interrupt requests are invisible to `INTD` (and to everything else)
+
+`INTD` (above) fires exactly once per interrupt **delivered** — the instant `sim_instr()`'s
+dispatch loop calls `intexc()` for it. It does **not** fire for an interrupt **requested**: `SET_INT`
+and `CLR_INT` (`vaxmod_defs.h:453-454`) are plain macros that OR/AND-clear a bit directly into
+`int_req[]`, with no function call and therefore no site this patch (or any patch) can hook. A
+request raised while `PSL<IPL>` or `SISR` masks it produces **no trace record of any kind** — not
+`INTD`, not anything else — until (if ever) it is later unmasked and actually taken. Verified by
+execution: with `PSL<IPL>=31` and `SISR` bit 4 set, four `STEP`s produce zero `INTD` records;
+dropping `IPL` to 0 delivers the same pending request immediately (`INTD 00000090 4 00001004`).
+
+This was reviewed (`pcjsvax-e17`) and ruled **acceptable** on the condition that it be documented —
+a device harness reading this trace must know that "no `INTD` for vector V" means "V has not been
+**delivered** yet," not "V has not been **requested**." A device model that raises an interrupt and
+then polls this trace for confirmation it was *seen* by the CPU needs a different signal (e.g. the
+CPU's own `PSL<IPL>` dropping below the device's level) — this trace was never going to give it one,
+by construction, and that construction is the same for every future device, not something 0006's or
+62a's design failed to reach.
+
+## What 0006 adds, extended by pcjsvax-62a: Qbus I/O-page and CQM-window traffic
+
+0006 (above) covers two of the three ways `vax_mmu.h`'s `ReadB`/`ReadW`/`ReadL`/`WriteB`/`WriteW`/
+`WriteL` can resolve a non-RAM physical access: `ADDR_IS_IO` false → the IPR/register-space branch
+(`ReadIPR`/`WriteIPR`, `ReadReg`/`WriteReg`). It never touched the **third** branch — `ADDR_IS_IO`
+true → `ReadIO`/`WriteIO`/`ReadIOU`/`WriteIOU` (`vax_io.c`) → `ReadQb`/`WriteQb` → either
+`cqm_rd`/`cqm_wr` (Qbus memory window, `ADDR_IS_CQM`, base `0x30000000`) or `iodispR[]`/`iodispW[]`
+(Qbus I/O page, `ADDR_IS_IOP`, base `0x20000000`, built by `build_dib_tab()` from every enabled
+device's `DIB` — `rl`, `rq`, `rqb`, `rqc`, `rqd`, `ts`, `tq`, `xq`, `xqb`, `dz`, `dpv`; see
+`vax_syslist.c:68-101`). `pcjsvax-e17`'s review measured this directly: `SHOW RL` reports the RL
+controller at `20001900-20001909`, a hand-built `MOVL @#20001900,R0` executed and returned
+`R0=00000080` — a real RL status value, the read genuinely worked — and the `DEVTRACE` log was
+**completely empty** for it. `pcjsvax-62a` closes that gap.
+
+| Addition | Purpose |
+|---|---|
+| `QIOR` at `ReadIO`/`ReadIOU` (`vax_io.c`), after the value is resolved, before return | Every Qbus I/O-page **and** Qbus-memory-window read, whichever branch `ReadQb` took internally. |
+| `QIOW` at `WriteIO`/`WriteIOU` (`vax_io.c`), at entry, before dispatch | The write-side equivalent — fires even if the dispatched write itself would be a no-op (unmapped I/O-page slot → `cq_merr`/`mem_err`), same rationale as `WriteIPR`'s pre-switch placement. |
+
+Same `DBG_DEVT` category and `sysd_dev` handle 0006 already uses — `SET SYSD DEBUG=DEVTRACE` remains
+the one knob that arms every family, IPR space through Qbus I/O page alike. `vax_io.c` cannot
+`#include` `DBG_DEVT`'s definition from `vax_sysdev.c` (it is a private `#define`, not a header
+symbol), so it is declared a second time there, with a comment tying the two together; a rebase that
+changes one must change the other. Record format matches `REGR`/`REGW` exactly:
+
+| Line | Fields |
+|---|---|
+| `QIOR` / `QIOW` | `pa size val PC` — `pa` is the physical address (`0x20000000`+ for I/O page, `0x30000000`+ for the Qbus memory window), `size` is the access length in bytes (B/W/L/Q), matching `lnt` as the caller of `ReadIO`/`WriteIO` supplied it |
+
+Booting `ka655x.bin` to `>>>` under the patched simulator (same `SET CPU DEBUG=EXCTRACE`, `SET SYSD
+DEBUG=DEVTRACE` as above) produces, in the I/O-page range, `QIOR`=16,385 / `QIOW`=1, and in the
+CQM range, `QIOR`=8,240 / `QIOW`=24,624 — every direction of both branches nonzero. **None of it is
+`rl`/`rq`/`ts`/`tq`/`xq`/`dz` traffic.** A no-disk, no-media boot to the console prompt never issues
+a single read or write to any of those controllers' own registers — measured directly (`SHOW RL`
+gives `20001900-20001909`, `SHOW RQ` gives `20001468-2000146B`, `SHOW TS` gives `20001550-20001553`,
+`SHOW TQ` gives `20001940-20001943`, `SHOW XQ` gives `20001920-2000192F`, `SHOW DZ` gives
+`20000040-2000005F`; every one of those ranges shows zero `QIOR`/`QIOW` events in a real boot). What
+the boot *does* exercise, every time, is the QBA's own doorbell register at `0x20001F40` (I/O page)
+and the Qbus memory window itself (CQM) — both reached through the **identical** `ReadIO`/`WriteIO`
+→ `ReadQb`/`WriteQb` code path as `rl`/`rq`/etc. would use if attached and probed, with no per-device
+special-casing anywhere in this patch. Requiring `rl`/`rq`/`ts`/`tq`/`xq`/`dz` themselves to show
+traffic in this oracle would be the same false-floor trap `ICCS`/`RXDB`/`TODR`'s one-directionality
+already warns against (see above), one level up: a whole family the ROM structurally never touches
+in this configuration, not one direction of a family it does. `devtrace-tally.py` therefore asserts
+two families, `QBIOP` (I/O page) and `QBCQM` (Qbus memory window) — one per branch named in the gap,
+not one per named device — both directions required for both, which is exactly what a real boot
+produces; see that script's module docstring for the full reasoning.
+
+Two details are load-bearing here too:
+
+* **`ReadIO`/`WriteIO`/`ReadIOU`/`WriteIOU` are the single choke point for BOTH remaining branches**
+  (I/O page and Qbus memory window) for the same reason `ReadReg`/`WriteReg` was the single choke
+  point for eight register-space families: `ReadQb`/`WriteQb` themselves branch on `ADDR_IS_CQM`
+  internally, so hooking one level up, before that branch, catches both without touching `cqm_rd`,
+  `cqm_wr`, or any of the eleven devices' own `_rd`/`_wr` functions.
+* **This extends patch 0006 rather than landing as a new 0007.** 0006's own stated purpose was "a
+  per-access oracle for every KA655 device register read/write" — this item closes an acknowledged
+  gap in that same claim (0006 covered two of the three `vax_mmu.h` branches, not all three), reuses
+  0006's `DBG_DEVT` category and `sysd_dev` handle rather than inventing a parallel mechanism, and
+  touches no file 0006 didn't already touch conceptually (it adds a third file, `vax_io.c`, to
+  0006's existing `vax_cpu.c`/`vax_sysdev.c`, but the *feature* — one debug category gating every
+  KA655 device-register access — is one thing, not two). A separate 0007 would fragment one feature
+  across two patch files for no benefit; `verify-patches.sh` derives the patch list from disk, not
+  from a hand-maintained count, so extending 0006 in place costs nothing there either.
+
+### A second veracity pass found a narrower gap: the boot-derived floors only prove the ALIGNED half
+
+The patch above hooks all four functions — `ReadIO`/`WriteIO` (aligned) and `ReadIOU`/`WriteIOU`
+(unaligned) — from the start. `devtrace-tally.py`'s QBIOP/QBCQM floors, however, are derived from a
+real `ka655x.bin` boot to `>>>`, and that boot's own Qbus traffic is entirely aligned — it never
+straddles a word or longword boundary. A mutation that silences only `ReadIOU`'s guard (or only
+`WriteIOU`'s), leaving `ReadIO`/`WriteIO` untouched, applies clean, builds clean, passes EHKAA, and
+produces QBIOP/QBCQM counts **byte-for-byte identical** to the unmutated binary — the boot-derived
+floors cannot see it, by construction, no matter how long the boot runs.
+
+`devtrace-tally.py` closes this with `unaligned_probe()`: after the boot-derived tally, it derives
+an I/O-page device's CSR address from the binary's own `SHOW RL` output (never hand-typed), deposits
+two hand-assembled `MOVL` instructions targeting one byte off that address (`MOVL @#<csr+1>,R0` and
+`MOVL R0,@#<csr+1>`), and steps them directly — no boot, no wall-clock dependency. A longword access
+one byte off alignment is exactly the "tribyte" case `ReadIOU`/`WriteIOU`'s own header comments
+describe; it produces a `QIOR`/`QIOW` record with `size=00000003`, a value `ReadIO`/`WriteIO` can
+never emit (their `lnt` is restricted to `L_BYTE`/`L_WORD`/`L_LONG`/`L_QUAD` = 1/2/4/8 by every call
+site). That makes a `size=00000003` record at the probed address unfakeable proof the unaligned path
+specifically fired. `verify-patches.sh --selfcheck` gained two more mutations (6 and 7) that silence
+`ReadIOU`'s and `WriteIOU`'s guards respectively and assert this probe — and only this probe — catches
+each one, by name (`UNALIGNED READ` / `UNALIGNED WRITE`).
+
+One development hazard worth recording here: driving the CPU directly via `DEPOSIT`/`STEP` (rather
+than `BOOT CPU`) on a freshly-started simulator process collides with SIMH's own one-time clock
+precalibration self-test (`sim_timer_precalibrate_execution_rate()`, wired in by `cpu_reset()`),
+which deposits **its own** throwaway code at physical `0x100`-`0x10D` and runs it on the *first*
+`GO`/`STEP`/`RUN` of any session — consuming the requested step count instead of the caller's own
+setup if not absorbed first. `unaligned_probe()` issues one throwaway `step 1` before touching
+anything else for exactly this reason; see its docstring.
+
 ## Upstream-drift hazards, per patch
 
 What each patch hangs off of — check these first on a rebase; if any of them moved or changed
@@ -338,13 +452,16 @@ no longer mean what the prose above says.
 | 0003 | `vax_cpu.c`, `vax_mmu.c`, `vax_mmu.h` | `cpu_mod[]` MTAB table (adds `MMUOP`/`MMUTRACE`/`NOMMUTRACE` entries — order-sensitive only in that 0004 inserts its own entry immediately after MMUOP's); `cpu_get_vsw()` (adds the `-W` switch); new `cpu_show_mmuop()`/`cpu_set_mmutrace()` functions (call `Test()`/`Read()`/`Write()`/`op_mtpr()` and `save_env`/`setjmp` directly — these are the real fault/abort paths, a signature change there is high-risk); `vax_mmu.h`'s inline `Read`/`Write`/`Test` (each gets one `PCJS_MMU_T(...)` call inserted — these three functions are the highest-traffic hook point in the whole patch set, called from `vax_cpu.c`, `vax_cpu1.c`, `vax_cis.c`, `vax_octa.c`); `fill()`, `set_map_reg()`, `zap_tb()`, `zap_tb_ent()` in `vax_mmu.c` (one trace call each). |
 | 0004 | `vax_cpu.c` | `cpu_mod[]` MTAB table (inserts the `FPOP` entry right after 0003's `MMUOP` entry — **this is why 0004 fails to apply if 0003 is missing or reordered after it**); new `cpu_show_fpop()`, whose body is *copied verbatim* out of `sim_instr()`'s F/D/G-opcode dispatch `switch` between two marker comments — on a rebase, diff `sim_instr()`'s float-opcode cases against this function body directly, since that's the actual source of truth being duplicated; `op_*` routines in `vax_fpa.c` (called, not modified); `CC_IIZZ_FP`/`CC_IIZP_FP` macros and `WRITE_B`/`WRITE_W`/`WRITE_L`/`WRITE_Q` macros in `vax_defs.h`/top of `vax_cpu.c` (referenced, not modified — a macro signature change is the real hazard here). |
 | 0005 | `vax_cpu.c`, `vax_cpu1.c`, `vax_defs.h` | `cpu_deb[]` DEBTAB table (adds `EXCTRACE`); new `LOG_CPU_X` bit in `vax_defs.h` (must stay clear of the existing `LOG_CPU_FAULT_*` bits — currently `0x200`, one past `LOG_CPU_FAULT_EMUL`'s `0x100`); new `exc_trace_state()`; and five existing functions get entry/exit trace calls spliced in: `intexc()` (also hoists its SCB-read address into a local, `pcjs_scbpa`, logged and then used in place of the inline expression — the read itself is unchanged), `op_rei()`, `op_chm()`, `op_mtpr()`, `op_mfpr()`. A rebase that changes any of these five functions' control flow (early returns, additional fault paths) needs the corresponding `PCJS_TRACING` block re-sited, not just re-hunked. |
-| 0006 | `vax_cpu.c`, `vax_sysdev.c` | `sysd_debug[]` DEBTAB table (adds `DEVTRACE`, bit `0x0040`, one past `DBG_CNF`'s `0x0020` — must stay clear of `DBG_REGR`/`DBG_REGW`/`DBG_INT`/`DBG_SCHD`/`DBG_TODR`/`DBG_CNF`); `ReadIPR`'s single common `return val` (traces `IPRR`, changes nothing about which case sets `val`) and `WriteIPR`'s entry (traces `IPRW` before the switch, so it fires even for the `RSVD_OPND_FAULT` cases); `ReadReg`/`WriteReg`'s `regtable[]` dispatch loop in `vax_sysdev.c` (each gets one `val`/trace line inserted at its existing early `return`/`p->write(...)` call — this is the highest-leverage hook in the patch, since it's the *only* place all eight register-space families converge); the `IE_INT` call site inside `sim_instr()`'s dispatch loop in `vax_cpu.c` (reuses 0005's `LOG_CPU_X`/`cpu_dev`, adds no new bit). A rebase that changes `ReadReg`/`WriteReg`'s single-loop-with-early-return shape, or splits `regtable[]` into per-family dispatch, needs the trace call re-sited to wherever the new common exit is. |
+| 0006 | `vax_cpu.c`, `vax_sysdev.c`, `vax_io.c` | `sysd_debug[]` DEBTAB table (adds `DEVTRACE`, bit `0x0040`, one past `DBG_CNF`'s `0x0020` — must stay clear of `DBG_REGR`/`DBG_REGW`/`DBG_INT`/`DBG_SCHD`/`DBG_TODR`/`DBG_CNF`); `ReadIPR`'s single common `return val` (traces `IPRR`, changes nothing about which case sets `val`) and `WriteIPR`'s entry (traces `IPRW` before the switch, so it fires even for the `RSVD_OPND_FAULT` cases); `ReadReg`/`WriteReg`'s `regtable[]` dispatch loop in `vax_sysdev.c` (each gets one `val`/trace line inserted at its existing early `return`/`p->write(...)` call — this is the highest-leverage hook in the patch, since it's the *only* place all eight register-space families converge); the `IE_INT` call site inside `sim_instr()`'s dispatch loop in `vax_cpu.c` (reuses 0005's `LOG_CPU_X`/`cpu_dev`, adds no new bit — its inline comment also carries the masked-interrupt-invisibility caveat, see above); **(pcjsvax-62a)** `ReadIO`/`ReadIOU`/`WriteIO`/`WriteIOU` in `vax_io.c` (each gets one `val`/trace line — `ReadIO`/`ReadIOU` after the value is resolved and before `return`, `WriteIO`/`WriteIOU` at entry before dispatch — reusing `DBG_DEVT`/`sysd_dev` via a second `extern DEVICE sysd_dev;` + `#define DBG_DEVT 0x0040` local to `vax_io.c`, since the original is a private `#define` in `vax_sysdev.c`, not a header symbol). A rebase that changes `ReadReg`/`WriteReg`'s single-loop-with-early-return shape, or splits `regtable[]` into per-family dispatch, needs the trace call re-sited to wherever the new common exit is; the same applies to `ReadIO`/`WriteIO`/`ReadIOU`/`WriteIOU` if a rebase changes their signatures (e.g. folds the aligned/unaligned pairs together) or if `vax_sysdev.c`'s `DBG_DEVT` value ever moves (the `vax_io.c` copy must move with it — nothing enforces the two definitions staying equal except this note). |
 
 Provenance: patches 0001-0005 are against Open SIMH at commit `a1f57fa3`; 0006 is generated against
 that same base with 0001-0005 already applied (its context lines reflect the post-0005 source, as
-`git apply`'s sequential model requires). Keep them small and additive so they keep applying as
+`git apply`'s sequential model requires); 0006 was extended in place by `pcjsvax-62a` against the
+same base plus 0001-0005 (not a fresh diff against later SIMH state), for the same sequential-model
+reason. Keep them small and additive so they keep applying as
 upstream moves; net diff is two files +79 lines for 0002, three files +166/-4 for 0003, one file
-+356/-0 for 0004, three files +71/-1 for 0005, and two files +31/-4 for 0006, with every copyright
++356/-0 for 0004, three files +71/-1 for 0005, and (as extended by pcjsvax-62a) three files +67/-4
+for 0006, with every copyright
 header untouched. No patch changes instruction semantics — the simulator's own EHKAA self-test,
 which `make ... vax` runs, passes unmodified with all six applied.
 
