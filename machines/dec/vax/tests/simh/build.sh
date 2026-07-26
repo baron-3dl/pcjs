@@ -65,11 +65,29 @@ for f in "$SRC" "$PATCH1" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5"; do
 done
 
 mkdir -p "$DEST"
-if [[ -d "$DEST/open-simh" ]]; then
+if [[ -L "$DEST/open-simh" ]]; then
+    echo "FATAL: $DEST/open-simh is a symlink (possibly left over from a build that hit the" >&2
+    echo "       cp -a/symlink hazard this script now guards against) -- refusing to build" >&2
+    echo "       through it. rm -rf \"$DEST\" and re-run." >&2
+    exit 1
+elif [[ -d "$DEST/open-simh" ]]; then
     echo "reusing existing checkout at $DEST/open-simh (delete it to start clean)"
 else
     echo "copying $SRC -> $DEST/open-simh"
-    cp -a "$SRC" "$DEST/open-simh"
+    # $SRC may itself be a symlink (a worktree's own open-simh is set up that way, pointing at
+    # the pristine vendor checkout it must never write through). "cp -a SRC DEST" on a symlink
+    # SOURCE copies the symlink itself, not the directory it points to -- "-a" implies "-d"
+    # (--no-dereference), so a naive "cp -a $SRC $DEST/open-simh" makes $DEST/open-simh a symlink
+    # BACK to the pristine checkout, and every subsequent "git apply"/"make" in this script then
+    # silently patches and builds the pristine tree instead of a disposable copy. The trailing
+    # "/." forces cp to resolve that top-level symlink and copy its CONTENTS; internal symlinks
+    # inside the tree (if any) are still preserved as symlinks, since "-a" is otherwise unchanged.
+    mkdir -p "$DEST/open-simh"
+    cp -a "$SRC/." "$DEST/open-simh"
+    if [[ -L "$DEST/open-simh" ]]; then
+        echo "FATAL: $DEST/open-simh is a symlink after copy -- refusing to build/apply through it." >&2
+        exit 1
+    fi
     cd "$DEST/open-simh"
     git checkout -- VAX/vax_cpu.c VAX/vax_defs.h VAX/vax_mmu.c VAX/vax_mmu.h 2>/dev/null || true
     git apply "$PATCH1"
