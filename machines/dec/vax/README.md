@@ -9,11 +9,19 @@ DEC VAX
 
 A MicroVAX 3900 (KA655) machine for PCjs, ported from [Open SIMH](https://github.com/open-simh/simh)
 (MIT, © 1998-2019 Robert M Supnik).  Work in progress: at present this directory contains the
-physical memory and bus layer, instruction decode and operand resolution, memory management, and
-the integer/logical/variable-length-bit-field and control-flow slices of instruction
-execution, and F/D/G floating point — still missing are SCB exception dispatch and
-privileged registers, packed-decimal/CIS, the string/queue instructions, devices, and
-the CPU loop that ties the instruction bodies together.
+physical memory and bus layer, instruction decode and operand resolution, memory management, the
+integer/logical/variable-length-bit-field, control-flow, string/queue/INDEX/PROBE, and NOP slices
+of instruction execution, and F/D/G floating point.  As of pcjsvax-515, the entire Base Instruction
+Group (`IG_BASE`/`IG_BSGFL`/`IG_BSDFL`, 242 opcodes — see `tests/base_group_residual.js`, the
+re-runnable computation of exactly what remains) is implemented except MTPR/MFPR, CHMK/CHME/CHMS/
+CHMU, and HALT/BPT/XFC/REI/LDPCTX/SVPCTX — all twelve need either the SCB exception-dispatch
+mechanism or the privileged IPR/process-context register file, neither of which any item owns yet
+(pcjsvax-e49's territory).  Still entirely missing: packed-decimal/CIS (`IG_PACKD`/`IG_EMONL` —
+genuinely out of scope for this CPU model, not merely unimplemented), devices, and the CPU loop
+that ties the instruction bodies together (`sim_instr()`'s fetch/dispatch/trap loop — every
+differential test in `tests/` currently drives `decode()` and each module's own `execute` function
+directly, one instruction at a time, because nothing wires the four execution modules — cpu.js,
+control.js, fpa.js, strq.js — into one dispatcher yet).
 
 ### Read this before writing any VAX code
 
@@ -225,7 +233,7 @@ down with it.
 
 Instruction execution (`modules/v2/cpu.js`) currently covers the Base Instruction Group's 107
 integer, logical, and variable-length-bit-field opcodes (control flow, floating point, and
-string/queue/CIS belong to sibling items):
+string/queue/INDEX/PROBE belong to sibling modules):
 
     node machines/dec/vax/tests/intdiff.js --selfcheck
     node machines/dec/vax/tests/intdiff.js --simh PATH --ehkaa PATH
@@ -248,16 +256,50 @@ overflow/divide-by-zero, which SIMH dispatches at the top of the *next* instruct
 therefore invisible to a single-instruction comparison either way) are out of scope; `cpu.js`'s
 file header states exactly why. `--selfcheck` mutates the shipped `HANDLERS` dispatch table itself.
 
-All four tests assert their own coverage and **fail** when it is not met — an undersized run does
-not quietly pass — and all four ship `--selfcheck`, which injects deliberate defects into the
+String, queue, INDEX, PROBE and NOP (`modules/v2/strq.js`) cover the rest of the residual
+`tests/base_group_residual.js` computes, minus the coordination carve-outs strq.js's file header
+documents (MTPR/MFPR, CHMK/CHME/CHMS/CHMU, and HALT/BPT/XFC/REI/LDPCTX/SVPCTX — all pcjsvax-e49's,
+needing SCB dispatch and/or the privileged IPR register file):
+
+    node machines/dec/vax/tests/strqdiff.js --selfcheck
+    node machines/dec/vax/tests/strqdiff.js --simh PATH --ehkaa PATH
+
+Four phases.  RANDOMIZED drives the same live-console `deposit`/`step 1`/`examine` discipline as
+`intdiff.js`, edge-weighted per opcode family — string lengths from zero through several KB with
+every alignment skew, every forward/backward/self/adjacent buffer overlap (the only way to prove
+MOVCn's direction choice is correct: a non-overlapping case can't distinguish "copied forward"
+from "copied backward"), queue headers in empty/busy/single/multi-entry states with every address
+drawn from the case's own safe allocations, and INDEX subscripts landing on both bounds, inside,
+and on both out-of-range sides.  MAXLEN is a small dedicated mini-batch proving the true
+architectural length ceiling (65,535 bytes, not just the randomized phase's multi-KB "large"
+bucket) for every string opcode.  PROBE gives PROBER/PROBEW **real** MMU protection state — the
+plain randomized phase runs with mapping off (virtual==physical, matching every sibling
+differential's convention), under which `mmu.test()` never fails, so a dedicated fixed six-page
+system-space table (open / kernel-only / read-only-all / invalid / a good-neighbor / bad-neighbor
+pair for the two-probe cross-page case) is poked into both sides via patch 0003's
+`SHOW CPU MMUOP=4` IPR poke (not a real MTPR execution) and driven across every (page, explicit
+mode operand, PSL previous-mode) combination. EHKAA replays the same trace `intdiff.js` uses, but
+restricted to NOP/INDEX/MOVC3/MOVC5 — the only opcodes in this file whose register-file-plus-PSL
+outcome does not depend on memory CONTENT the patch 0002 capture never logged (CMPCn/LOCC/SKPC/
+SCANC/SPANC's comparison result, the queue instructions' linked-list pointers, and PROBER/PROBEW's
+MMU state are all exactly that content); the other opcodes are exclusively the randomized/PROBE
+phases' job to cover, counted and reported by name, never silently dropped. `--selfcheck` mutates
+the shipped `HANDLERS` dispatch table itself, including a page-table-environment-aware PROBER
+mutation.
+
+All five tests assert their own coverage and **fail** when it is not met — an undersized run does
+not quietly pass — and all five ship `--selfcheck`, which injects deliberate defects into the
 shipped code path and fails if the differential does not catch each one.  `mmudiff.js`'s first
 mutation is the `>>` vs `>>>` page-table-index hazard described above.
 
 The simulator is located via `--simh PATH`, then `$SIMH_BIN` / `$SIMH_DECODE_BIN` /
 `$SIMH_MMU_BIN` / `$SIMH_INT_BIN`, then `../pcjs-vax/open-simh/BIN/microvax3900` (`busdiff.js`) or
-`$TMPDIR/pcjs-vax-simh/...` (`mmudiff.js` and `intdiff.js`, which need patch 0003 and patches
-0001+0002 respectively). If it cannot be found, the tests fail rather than falling back to
-self-comparison.
+`$TMPDIR/pcjs-vax-simh/...` (`mmudiff.js`, `intdiff.js` and `strqdiff.js`, which need patch 0003
+and patches 0001+0002 respectively — `strqdiff.js` needs both, for the PROBE and EHKAA phases).
+If it cannot be found, the tests fail rather than falling back to self-comparison.  `strqdiff.js`'s
+`--ehkaa` default honors `$PCJS_VAX_REPO` (unlike `intdiff.js`'s otherwise-identical default,
+which does not) — needed when running from a worktree, where the plain `../pcjs-vax`
+sibling-directory guess resolves to a nonexistent sibling worktree rather than the real work repo.
 
 Floating point:
 
