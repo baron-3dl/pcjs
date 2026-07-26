@@ -87,6 +87,24 @@
  * levels covered; a veracity pass caught the mismatch between what the message claimed and what it
  * checked.
  *
+ * SAME-LEVEL SIMULTANEOUS DEVICES (pcjsvax-f67) -- WHY THIS NEEDS A NEW PROBE, NOT JUST A NEW CASE
+ * --------------------------------------------------------------------------------------------------
+ * "multi_level" already raises two REAL devices at once and grades the order they drain in, but its
+ * two devices (TTI at 0x14, CLK at 0x16) are at DIFFERENT levels, so the resulting PSL<IPL> differs
+ * between "CLK went first" and "TTI went first" -- compareStep()'s ordinary PSL check catches an
+ * inverted level priority for free.  "same_level_simultaneous" below raises TTI (bit 8) and TTO
+ * (bit 9) at the SAME level (0x14) to grade deviceVector()'s WITHIN-level (bit) tiebreak instead.
+ * But because every fixed vector in this harness's `vectors` Set is pointed at the SAME shared
+ * handler page (see buildScript()), the delivered PC/PSL/frame are IDENTICAL no matter which of the
+ * two same-level devices actually fired -- an inverted (descending) bit tiebreak would be delivered
+ * to a DIFFERENT device but land on the SAME address, and nothing in regs/PSL/frame would notice.
+ * So this case alone carries an extra per-step probe, `probeDeviceInt`: after every step, both
+ * TTI's and TTO's own INT bit are read back (`examine <DEV> INT` on the SIMH side, `cpu.exc.intReq`
+ * directly on the JS side) and compared like any other field.  This is exactly the signal used to
+ * hand-verify the oracle result recorded in pcjsvax-f67: step 1 clears TTI's INT and leaves TTO's
+ * set; step 2 clears TTO's.  Existing cases pass `probeDeviceInt: undefined`, which is 0 extra
+ * values on both sides of runAll()'s parsing -- this does not change their comparisons at all.
+ *
  *      node machines/dec/vax/tests/hwintdiff.js [--simh PATH] [--selfcheck]
  */
 
@@ -287,6 +305,12 @@ function tmrReprogramSetupBytes(tmr, vecA, vecB)
  *           callback must read a value that changes AFTER installation -- something the generic
  *           loop's one-shot `addInterruptSource(lvl, bit, (cpu) => vec)` cannot express).  `prime`
  *           is still consulted for SCB population even when this is set.
+ * @property {?Array<{simhName:string, lvl:number, bit:number}>} probeDeviceInt  devices whose OWN
+ *           INT bit is read back after every step (SIMH: `examine <simhName> INT`; JS:
+ *           `cpu.exc.intReq[lvl-IPL_HMIN]` bit `bit`) and diffed like any other field.  Only needed
+ *           when two devices at the SAME level could resolve to indistinguishable regs/PSL/frame --
+ *           see "same_level_simultaneous" below.  Omitted (0 extra values either side) by every
+ *           other case.
  */
 
 const REAL_CASES = [
@@ -384,6 +408,29 @@ const REAL_CASES = [
         ],
         withdraw: [],
         steps: [{ipl: 0}, {ipl: 0}]
+    },
+
+    /* pcjsvax-f67: two REAL fixed-vector devices raised at the SAME hardware IPL SIMULTANEOUSLY --
+       both INT bits deposited before either measured step runs, unlike dynamic_tmr0_lo/dynamic_tmr1
+       above (same level, different bit, but SEQUENTIAL cases with a `reset all` between them, never
+       simultaneously pending).  TTI (bit 8) and TTO (bit 9) are both at IPL 0x14; deviceVector()'s
+       ascending-bit scan must resolve TTI first (lower bit), clear ONLY its bit, and leave TTO
+       pending for the second step.  See the file header's "SAME-LEVEL SIMULTANEOUS DEVICES" section
+       for why `probeDeviceInt` is required here for this to be a real assertion about ORDER rather
+       than merely "two dispatches happened somewhere". */
+    {
+        name: "same_level_simultaneous",
+        setupBytes: [], setupInstrs: 0,
+        prime: [
+            {lvl: 0x14, bit: 8, vec: SCB_TTI, simhName: "TTI"},
+            {lvl: 0x14, bit: 9, vec: SCB_TTO, simhName: "TTO"}
+        ],
+        withdraw: [],
+        steps: [{ipl: 0}, {ipl: 0}],
+        probeDeviceInt: [
+            {simhName: "TTI", lvl: 0x14, bit: 8},
+            {simhName: "TTO", lvl: 0x14, bit: 9}
+        ]
     }
 ];
 
@@ -446,6 +493,8 @@ function buildScript(cases)
             L.push("step 1");
             L.push(`examine -h ${probeNames().join(",")}`);
             for (let k = -8; k <= 0; k++) L.push(`examine -h ${hex((R_KSP + k * 4) | 0)}`);
+            /* Order matters: parsed positionally by runAll(), same order as runCaseJS()'s devInt map. */
+            for (let d of (c.probeDeviceInt || [])) L.push(`examine -h ${d.simhName} INT`);
         }
     }
     L.push("quit");
@@ -457,22 +506,25 @@ const VALUE_RE = /^(\S+):\s+([0-9A-Fa-f]+)/;
 /**
  * runAll(simh, cases, scratch)
  *
- * @returns {Map<string, Array<{regs:Int32Array, psl:number, frame:number[]}>>} keyed by case name,
- *          one array entry per measured step, in order
+ * @returns {Map<string, Array<{regs:Int32Array, psl:number, frame:number[], devInt:number[]}>>}
+ *          keyed by case name, one array entry per measured step, in order.  `devInt` is empty
+ *          unless the case sets `probeDeviceInt` (see the CaseSpec typedef).
  */
 function runAll(simh, cases, scratch)
 {
     let script = buildScript(cases);
     let out = runSimh(simh, script, path.join(scratch, "hwintdiff.ini"));
     if (process.env.HWINTDIFF_DUMP) fs.writeFileSync(process.env.HWINTDIFF_DUMP, out);
+    let extraByName = new Map(cases.map((c) => [c.name, (c.probeDeviceInt || []).length]));
     let lines = out.split("\n");
     let results = new Map();
-    let want = 17 + 9;                                     // 15 regs + PC + PSL, then 9 frame words
+    const BASE_WANT = 17 + 9;                              // 15 regs + PC + PSL, then 9 frame words
     let i = 0;
     while (i < lines.length) {
         let m = lines[i].match(new RegExp(CASE_MARK + "(\\S+)"));
         if (!m) { i++; continue; }
         let name = m[1];
+        let want = BASE_WANT + (extraByName.get(name) || 0);
         i++;
         let vals = [];
         while (i < lines.length && vals.length < want) {
@@ -486,9 +538,10 @@ function runAll(simh, cases, scratch)
         for (let r = 0; r < 15; r++) regs[r] = vals[r];
         regs[15] = vals[15];
         let psl = vals[16];
-        let frame = vals.slice(17);
+        let frame = vals.slice(17, BASE_WANT);
+        let devInt = vals.slice(BASE_WANT);
         if (!results.has(name)) results.set(name, []);
-        results.get(name).push({regs, psl, frame, reached: true});
+        results.get(name).push({regs, psl, frame, devInt, reached: true});
     }
     return results;
 }
@@ -520,7 +573,8 @@ function primeJS(cpu, c)
 /**
  * runCaseJS(m, c)
  *
- * @returns {Array<{regs:Int32Array, psl:number, frame:number[]}>} one entry per measured step
+ * @returns {Array<{regs:Int32Array, psl:number, frame:number[], devInt:number[]}>} one entry per
+ *          measured step
  */
 function runCaseJS(m, c)
 {
@@ -559,7 +613,11 @@ function runCaseJS(m, c)
         }
         let frame = [];
         for (let k = -8; k <= 0; k++) frame.push(bus.getLong((R_KSP + k * 4) | 0) | 0);
-        out.push({regs: Int32Array.from(cpu.regs), psl: cpu.psl, frame});
+        /* Same signal the SIMH side reads via `examine <DEV> INT` -- the device's own request bit,
+           read directly from the same intReq[] storage raiseInterrupt/clearInterrupt/deviceVector
+           mutate (see the file header's "SAME-LEVEL SIMULTANEOUS DEVICES" section). */
+        let devInt = (c.probeDeviceInt || []).map((d) => (cpu.exc.intReq[d.lvl - IPL_HMIN] >>> d.bit) & 1);
+        out.push({regs: Int32Array.from(cpu.regs), psl: cpu.psl, frame, devInt});
     }
     return out;
 }
@@ -576,6 +634,11 @@ function compareStep(name, stepIdx, js, sr)
     if ((js.psl | 0) !== (sr.psl | 0)) bad.push(`${tag}: PSL js=${hex(js.psl)} simh=${hex(sr.psl)}`);
     for (let k = 0; k < js.frame.length; k++) {
         if ((js.frame[k] | 0) !== (sr.frame[k] | 0)) bad.push(`${tag}: frame[${k}] js=${hex(js.frame[k])} simh=${hex(sr.frame[k])}`);
+    }
+    let jsDevInt = js.devInt || [];
+    let srDevInt = sr.devInt || [];
+    for (let k = 0; k < jsDevInt.length; k++) {
+        if ((jsDevInt[k] | 0) !== (srDevInt[k] | 0)) bad.push(`${tag}: devInt[${k}] js=${jsDevInt[k]} simh=${srDevInt[k]}`);
     }
     return bad;
 }
@@ -812,6 +875,68 @@ function selfcheck(simh, scratch)
             () => { VAXExc.prototype.deviceVector = origDV; });
     }
 
+    /* 7. pcjsvax-f67: the within-level ack tiebreak inverted -- descending bit order (highest bit
+          wins) instead of the real scan's ascending order (vax_io.c:443-455's `for (i = 0; ...;
+          i++)`).  "same_level_simultaneous" is exactly the case built to catch this: TTI (bit 8) and
+          TTO (bit 9) are both pending at IPL 0x14, so only the BIT scan order decides which fires
+          first.  Note this mutation is caught ONLY because compareStep() now also diffs
+          `probeDeviceInt` -- regs/PSL/frame alone are IDENTICAL either way, since both devices'
+          vectors point at the same shared handler page (see the file header). Without that probe
+          this mutation would be a silent miss, exactly the "vacuous case" failure mode this item
+          exists to close. */
+    {
+        let origDV = VAXExc.prototype.deviceVector;
+        checkAgainst("ack tiebreak inverted (descending bit order, not ascending)", ["same_level_simultaneous"],
+            () => {
+                VAXExc.prototype.deviceVector = function(cpu, lvl) {
+                    let l = lvl - IPL_HMIN;
+                    let req = this.intReq[l];
+                    let table = this.intVec[l];
+                    for (let i = 31; i >= 0 && req; i--) {                 // DESCENDING: wrong
+                        if ((req >>> i) & 1) {
+                            this.intReq[l] = this.intReq[l] & ~(1 << i);
+                            let v = table[i];
+                            if (v === undefined) return 0;
+                            let vec = (typeof v === "function") ? (v(cpu) | 0) : (v | 0);
+                            return vec & QB_VEC_MASK;
+                        }
+                    }
+                    return 0;
+                };
+            },
+            () => { VAXExc.prototype.deviceVector = origDV; });
+    }
+
+    /* 8. pcjsvax-f67: a single acknowledge clears EVERY pending bit at the level, not just the one
+          resolved -- a plausible "clear the level" typo for the correct "clear just this bit".
+          "same_level_simultaneous"'s SECOND step is exactly what this breaks: TTO is still pending
+          after step 1 dispatches TTI on real SIMH, but this mutation wipes TTO's bit out from under
+          it during step 1's acknowledge, so step 2 (still IPL 0) finds nothing pending and does not
+          dispatch at all -- caught by the ordinary PC/PSL/frame check, no probe needed for this one. */
+    {
+        let origDV = VAXExc.prototype.deviceVector;
+        checkAgainst("acknowledge clears ALL pending bits at the level, not just the resolved one",
+            ["same_level_simultaneous"],
+            () => {
+                VAXExc.prototype.deviceVector = function(cpu, lvl) {
+                    let l = lvl - IPL_HMIN;
+                    let req = this.intReq[l];
+                    let table = this.intVec[l];
+                    for (let i = 0; i < 32 && req; i++) {
+                        if ((req >>> i) & 1) {
+                            this.intReq[l] = 0;                            // BUG: wipes the whole level
+                            let v = table[i];
+                            if (v === undefined) return 0;
+                            let vec = (typeof v === "function") ? (v(cpu) | 0) : (v | 0);
+                            return vec & QB_VEC_MASK;
+                        }
+                    }
+                    return 0;
+                };
+            },
+            () => { VAXExc.prototype.deviceVector = origDV; });
+    }
+
     return results;
 }
 
@@ -845,6 +970,7 @@ function main()
     let sr = runAll(simh, REAL_CASES, scratch);
     let levelsSeen = new Set();
     let fixedSeen = false, dynamicSeen = false, evaporatedSeen = false, maskedUnmaskedSeen = false, multiLevelSeen = false;
+    let sameLevelSimultaneousSeen = false;
     let notReached = [];
     for (let c of REAL_CASES) {
         let jsSteps = runCaseJS(m, c);
@@ -872,6 +998,19 @@ function main()
         if (c.name === "evaporated" && !delivered[0]) evaporatedSeen = true;
         if (c.name === "masked_then_unmasked" && !delivered[0] && delivered[1]) maskedUnmaskedSeen = true;
         if (c.name === "multi_level" && delivered[0] && delivered[1]) multiLevelSeen = true;
+        /*
+         * pcjsvax-f67: "two deliveries" alone (like multiLevelSeen above) is not enough here -- both
+         * devices are at the SAME level, so it must also confirm ORDER: TTI's INT bit (devInt[0])
+         * cleared and TTO's (devInt[1]) still set after step 0 (TTI acknowledged first), then TTO's
+         * cleared after step 1.  This reads SIMH's OWN devInt result (ground truth), the same
+         * discipline `delivered` above already uses for the PC.
+         */
+        if (c.name === "same_level_simultaneous" && delivered[0] && delivered[1]) {
+            let d0 = simhSteps[0].devInt, d1 = simhSteps[1].devInt;
+            if (d0 && d1 && d0[0] === 0 && d0[1] === 1 && d1[0] === 0 && d1[1] === 0) {
+                sameLevelSimultaneousSeen = true;
+            }
+        }
         for (let i = 0; i < c.steps.length; i++) {
             for (let bad of compareStep(c.name, i, jsSteps[i] || {stop: "missing"}, simhSteps[i])) problems.push("REAL: " + bad);
         }
@@ -884,7 +1023,7 @@ function main()
     for (let l of synth.levelsSeen) levelsSeen.add(l);
 
     console.log(`  levels requested+delivered: ${[...levelsSeen].sort((a, b) => a - b).map((v) => hex(v, 2)).join(",")}`);
-    console.log(`  fixed=${fixedSeen} dynamic=${dynamicSeen} evaporated=${evaporatedSeen} maskedThenUnmasked=${maskedUnmaskedSeen} multiLevel=${multiLevelSeen}`);
+    console.log(`  fixed=${fixedSeen} dynamic=${dynamicSeen} evaporated=${evaporatedSeen} maskedThenUnmasked=${maskedUnmaskedSeen} multiLevel=${multiLevelSeen} sameLevelSimultaneous=${sameLevelSimultaneousSeen}`);
 
     for (let want of [0x14, 0x15, 0x16, 0x17]) {
         if (!levelsSeen.has(want)) problems.push(`COVERAGE: IPL ${hex(want, 2)} was never requested AND DELIVERED (an actual dispatch, not merely a compared case)`);
@@ -894,6 +1033,7 @@ function main()
     if (!evaporatedSeen) problems.push("COVERAGE: the evaporated-request path did not confirm non-delivery");
     if (!maskedUnmaskedSeen) problems.push("COVERAGE: the masked-then-unmasked path did not confirm mask-then-deliver");
     if (!multiLevelSeen) problems.push("COVERAGE: multiple-simultaneous-level case did not confirm two deliveries");
+    if (!sameLevelSimultaneousSeen) problems.push("COVERAGE: same-level simultaneous fixed-vector devices did not confirm the ascending-bit ORDER (TTI, then TTO)");
 
     if (problems.length) {
         console.error(`\nFAILED (${problems.length} problem(s)):`);
