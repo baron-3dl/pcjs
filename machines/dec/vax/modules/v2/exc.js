@@ -412,10 +412,13 @@ class VAXExc {
          * deliberate departure from a literal port: it fits the two machines' state at each
          * differential CASE boundary (tests/mchkdiff.js issues `deposit sysd bto 0` per case for
          * the same reason, on the SIMH side), not a claim that VAXExc.reset() == sysd_reset().
-         * Sticky accumulation across MULTIPLE faults and the W1C (write-one-to-clear) semantics of
-         * a real write to the BTO register are UNGRADED by this item -- mutation 1 of
-         * mchkdiff.js's --selfcheck still catches "ssc_bto never gets set" regardless, but nothing
-         * here proves the bit stays set correctly across a second, later fault.
+         * Sticky accumulation across a SECOND fault is now graded (mchkdiff.js's
+         * verifySecondFault(), added in this same re-dispatch): two independent faults back to
+         * back, the second reached via intexc()'s "already on the interrupt stack" branch -- a
+         * different code path than the first fault takes -- prove ssc_bto stays set and that the
+         * second fault's own frame is computed fresh, not stale from the first.  Still UNGRADED:
+         * the W1C (write-one-to-clear) semantics of a real PROGRAM write to the BTO register
+         * (nothing here ever writes it back) and accumulation across MORE than two faults.
          */
         this.sscBto = 0;
     }

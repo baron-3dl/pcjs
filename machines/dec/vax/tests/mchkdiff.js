@@ -120,6 +120,11 @@
  *   - Any machine-check trigger other than a bus fault (parity/ECC, etc.) -- none exist yet.
  *   - The Qbus/CQBIC `cq_merr`/DSER/MEAR/deferred-`mem_err` mechanism itself (pcjsvax-d22) --
  *     IOPAGE/CQM writes are excluded from grading for exactly this reason (see above).
+ *   - A real PROGRAM write to ssc_bto (the W1C -- write-one-to-clear -- semantics), and
+ *     accumulation across MORE than two faults.  verifySecondFault() (below) DOES grade the
+ *     ordinary case this item's own scope requires: ssc_bto stays set and the second fault's own
+ *     frame is computed fresh across two INDEPENDENT faults back to back (the second reached via
+ *     intexc()'s "already on the interrupt stack" branch, a different path than the first).
  *
  *      node machines/dec/vax/tests/mchkdiff.js [options]
  *        --simh PATH       microvax3900 (else $SIMH_BIN, else the scratch build)
@@ -700,6 +705,101 @@ function selfcheck(simh, scratch, opts)
 }
 
 /* ------------------------------------------------------------------------------------------- *
+ * Sticky ssc_bto across a SECOND, independent fault                                              *
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * verifySecondFault(simh, scratch, addr1, addr2)
+ *
+ * Closes the specific gap disclosed in this item's own test_decisions: every other case here
+ * proves ssc_bto gets SET once, but nothing proved it stays correctly set (and the SECOND fault's
+ * own frame is computed fresh, not accidentally reusing the first one's p1/p2/st1/st2) across a
+ * SECOND, independent fault in the same run.  Two probes back to back:
+ *
+ *   R_CODE's instruction faults on addr1 -> dispatches to R_HANDLER (a SEVERE exception, so this
+ *   ALWAYS lands on the interrupt stack, PSL<IS> set, SP = IS - FRAME_LEN).
+ *   R_HANDLER's OWN first instruction (deliberately another probe, not a NOP) faults on addr2 ->
+ *   dispatches AGAIN.  This time intexc() takes the "ALREADY on the interrupt stack" branch (SIMH:
+ *   `if (oldpsl & PSL_IS) { newpsl = PSL_IS; }`, no SP reload from IS, no `stk[]` save) -- a
+ *   DIFFERENT code path than the first dispatch exercised, so this is not a redundant re-check of
+ *   the same thing under a different name.
+ *
+ * Frame 1 sits at [IS-FRAME_LEN, IS-1] (untouched by the second dispatch, which pushes BELOW it);
+ * frame 2 sits at [IS-2*FRAME_LEN, IS-FRAME_LEN-1].  Both are graded, plus ssc_bto after both.
+ *
+ * @param {string} simh
+ * @param {string} scratch
+ * @param {number} addr1
+ * @param {number} addr2
+ * @returns {Array.<string>} failures (empty means the two sides agree)
+ */
+function verifySecondFault(simh, scratch, addr1, addr2)
+{
+    let instr1 = buildInstr(true, 4, addr1);      // MOVL #0,@#addr1 -- placed at R_CODE
+    let instr2 = buildInstr(true, 4, addr2);      // MOVL #0,@#addr2 -- placed at R_HANDLER itself
+    let sp1 = (R_IS - FRAME_LEN) >>> 0;
+    let sp2 = (R_IS - 2 * FRAME_LEN) >>> 0;
+
+    let lines = ["set cpu 16m", "set cpu simhalt", "reset all", "deposit sysd bto 0"];
+    for (let i = 0; i < FRAME_LEN; i += 4) lines.push(`deposit -l ${hex(sp2 + i)} 0`);   // zero BOTH frames
+    lines.push(`deposit SCBB ${hex(R_SCBB)}`, `deposit -l ${hex(R_SCBB + SCB.MCHK)} ${hex(R_HANDLER)}`);
+    lines.push(`deposit KSP ${hex(R_KSP)}`, `deposit IS ${hex(R_IS)}`);
+    for (let i = 0; i < instr1.length; i++) lines.push(`deposit -b ${hex(R_CODE + i)} ${instr1[i].toString(16)}`);
+    for (let i = 0; i < instr2.length; i++) lines.push(`deposit -b ${hex(R_HANDLER + i)} ${instr2[i].toString(16)}`);
+    lines.push(`deposit PSL 0`, `deposit PC ${hex(R_CODE)}`, "step 2");
+    lines.push(`examine -h PC,PSL`, `examine -h sysd bto`);
+    for (let i = 0; i < FRAME_LEN; i += 4) lines.push(`examine -h ${hex(sp1 + i)}`);
+    for (let i = 0; i < FRAME_LEN; i += 4) lines.push(`examine -h ${hex(sp2 + i)}`);
+    lines.push("exit", "");
+
+    let out = runSimh(simh, lines.join("\n"), path.join(scratch, "mchkdiff-secondfault.ini"));
+    let vals = [];
+    for (let line of out.split("\n")) {
+        let m = line.match(VALUE_RE);
+        if (m) vals.push(parseInt(m[2], 16) | 0);
+    }
+    let want = 2 + 1 + (FRAME_LEN / 4) * 2;
+    if (vals.length < want) {
+        throw new Error(`mchkdiff: second-fault probe produced ${vals.length}/${want} values; SIMH said:\n${out}`);
+    }
+    let sr = {
+        pc: vals[0], psl: vals[1], bto: vals[2],
+        frame1: vals.slice(3, 3 + FRAME_LEN / 4),
+        frame2: vals.slice(3 + FRAME_LEN / 4, 3 + FRAME_LEN / 2)
+    };
+
+    let m = makeMachine();
+    let {bus, cpu} = m;
+    cpu.reset();
+    for (let i = 0; i < FRAME_LEN; i += 4) bus.setLong(sp2 + i, 0);
+    cpu.exc.scbb = R_SCBB;
+    bus.setLong(R_SCBB + SCB.MCHK, R_HANDLER);
+    cpu.exc.stk[4] = R_IS;
+    for (let i = 0; i < instr1.length; i++) bus.setByte(R_CODE + i, instr1[i]);
+    for (let i = 0; i < instr2.length; i++) bus.setByte(R_HANDLER + i, instr2[i]);
+    cpu.psl = 0;
+    cpu.regs[15] = R_CODE;
+    try { cpu.stepCPU(2); } catch (e) { if (!(e instanceof VAXStop)) throw e; }
+    let js = {
+        pc: cpu.regs[15] | 0, psl: cpu.psl | 0, bto: cpu.exc.sscBto | 0,
+        frame1: [], frame2: []
+    };
+    for (let i = 0; i < FRAME_LEN; i += 4) js.frame1.push(bus.getLong(sp1 + i) | 0);
+    for (let i = 0; i < FRAME_LEN; i += 4) js.frame2.push(bus.getLong(sp2 + i) | 0);
+
+    let bad = [];
+    let tag = `second-fault addr1=0x${hex(addr1)} addr2=0x${hex(addr2)}`;
+    if ((js.pc | 0) !== (sr.pc | 0)) bad.push(`${tag}: PC js=${hex(js.pc)} simh=${hex(sr.pc)}`);
+    if ((js.psl | 0) !== (sr.psl | 0)) bad.push(`${tag}: PSL js=${hex(js.psl)} simh=${hex(sr.psl)}`);
+    if ((js.bto | 0) !== (sr.bto | 0)) bad.push(`${tag}: BTO js=${hex(js.bto)} simh=${hex(sr.bto)}`);
+    for (let i = 0; i < FRAME_LEN / 4; i++) {
+        if ((js.frame1[i] | 0) !== (sr.frame1[i] | 0)) bad.push(`${tag}: frame1[${i * 4}] js=${hex(js.frame1[i])} simh=${hex(sr.frame1[i])}`);
+        if ((js.frame2[i] | 0) !== (sr.frame2[i] | 0)) bad.push(`${tag}: frame2[${i * 4}] js=${hex(js.frame2[i])} simh=${hex(sr.frame2[i])}`);
+    }
+    return bad;
+}
+
+/* ------------------------------------------------------------------------------------------- *
  * The graded run: deterministic enumeration + randomized                                          *
  * ------------------------------------------------------------------------------------------- */
 
@@ -955,6 +1055,22 @@ function main()
         require(distinctPairs >= MIN_RANGE_DIR_PAIRS,
             `too few distinct (range,direction) pairs actually used for case generation ` +
             `(${distinctPairs} of a floor of ${MIN_RANGE_DIR_PAIRS}: ${RANGE_DIR_PAIRS_WITH_COVERAGE.join(", ")})`);
+
+        /*
+         * Sticky ssc_bto across a SECOND, independent fault -- see verifySecondFault()'s doc
+         * comment.  Two DISTINCT confirmed-write addresses, drawn from the pool rather than
+         * hand-picked, so this stays honest if candidatesFor()/calibrate() ever produce a
+         * different set.
+         */
+        let writeAddrs = [...new Set(pool.filter((p) => p.fWrite).map((p) => p.addr))];
+        if (writeAddrs.length < 2) {
+            errors.push(`COVERAGE: fewer than 2 distinct confirmed write addresses available for the ` +
+                `second-fault check (${writeAddrs.length})`);
+        } else {
+            let secondFaultBad = verifySecondFault(simh, scratch, writeAddrs[0], writeAddrs[1]);
+            console.log(`\nSecond-fault check (ssc_bto stays set, frames independent): ${secondFaultBad.length ? "FAILED" : "PASS"}`);
+            for (let f of secondFaultBad) errors.push(f);
+        }
 
         if (fSelfCheck) {
             console.log("\nSelf-check: the differential must FAIL when the mechanism is deliberately broken.");
