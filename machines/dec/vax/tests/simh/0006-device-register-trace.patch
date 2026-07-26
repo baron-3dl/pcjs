@@ -1,0 +1,93 @@
+diff --git a/VAX/vax_cpu.c b/VAX/vax_cpu.c
+index 4cbce67..b4b406c 100644
+--- a/VAX/vax_cpu.c
++++ b/VAX/vax_cpu.c
+@@ -739,8 +739,17 @@ for ( ;; ) {
+                 vec = SCB_IPLSOFT + (temp << 2);
+                 SISR = SISR & ~(1u << temp);
+                 }
+-            if (vec)                                    /* take intr */
++            if (vec) {                                  /* take intr */
++                if (sim_deb)                             /* pcjs-vax: delivered-interrupt trace
++                                                              (patch 0006), extends 0005's EXCTRACE
++                                                              hook at the IE_INT call site rather
++                                                              than a parallel mechanism -- EXCA/EXCB
++                                                              already fire inside intexc() itself,
++                                                              this adds the vector+IPL pair at the
++                                                              point of delivery, before dispatch */
++                    sim_debug (LOG_CPU_X, &cpu_dev, "INTD %08X %d %08X\n", vec, temp, PC);
+                 cc = intexc (vec, cc, temp, IE_INT);
++                }
+             GET_CUR;                                    /* set cur mode */
+             }
+         else trpirq = 0;                                /* clear everything */
+diff --git a/VAX/vax_sysdev.c b/VAX/vax_sysdev.c
+index d9b9e6b..36acda3 100644
+--- a/VAX/vax_sysdev.c
++++ b/VAX/vax_sysdev.c
+@@ -506,6 +506,12 @@ REG sysd_reg[] = {
+ #define DBG_SCHD 0x0008 /* Interval TMR Scheduling */
+ #define DBG_TODR 0x0010 /* TODR register access  */
+ #define DBG_CNF  0x0020 /* CNF register access  */
++/* pcjs-vax differential support (patch 0006). DBG_DEVT is a single machine-readable
++   trace covering every access that reaches ReadIPR/WriteIPR (console + timer IPR space)
++   or ReadReg/WriteReg (memory-mapped CQBIC/CMCTL/SSC/KA/CDG register space), so a device
++   harness has one oracle for all of it rather than reconstructing it from per-register
++   debug lines. Purely additive -- no instruction or register semantics change. */
++#define DBG_DEVT 0x0040 /* pcjs-vax: device register access trace (IPR + register space) */
+ 
+ DEBTAB sysd_debug[] = {
+   {"REGR", DBG_REGR,  "Interval TMR register read access"},
+@@ -514,6 +520,7 @@ DEBTAB sysd_debug[] = {
+   {"SCHD", DBG_SCHD,  "Interval TMR Scheduling"},
+   {"TODR", DBG_TODR,  "TODR register access"},
+   {"CNF",  DBG_CNF,   "CNF register access"},
++  {"DEVTRACE", DBG_DEVT, "pcjs-vax machine-readable device register access trace"},
+   {0}
+ };
+ 
+@@ -915,11 +922,15 @@ switch (rg) {
+         break;
+         }
+ 
++if (sim_deb)                                            /* pcjs-vax: IPR read trace */
++    sim_debug (DBG_DEVT, &sysd_dev, "IPRR %08X %08X %08X %08X\n", rg, L_LONG, val, PC);
+ return val;
+ }
+ 
+ void WriteIPR (int32 rg, int32 val)
+ {
++if (sim_deb)                                            /* pcjs-vax: IPR write trace */
++    sim_debug (DBG_DEVT, &sysd_dev, "IPRW %08X %08X %08X %08X\n", rg, L_LONG, val, PC);
+ switch (rg) {
+ 
+     case MT_ICCS:                                       /* ICCS */
+@@ -1023,10 +1034,15 @@ struct reglink regtable[] = {
+ int32 ReadReg (uint32 pa, int32 lnt)
+ {
+ struct reglink *p;
++int32 val;
+ 
+ for (p = &regtable[0]; p->low != 0; p++) {
+-    if ((pa >= p->low) && (pa < p->high) && p->read)
+-        return p->read (pa);
++    if ((pa >= p->low) && (pa < p->high) && p->read) {
++        val = p->read (pa);
++        if (sim_deb)                                    /* pcjs-vax: register-space read trace */
++            sim_debug (DBG_DEVT, &sysd_dev, "REGR %08X %08X %08X %08X\n", pa, lnt, val, PC);
++        return val;
++        }
+     }
+ ssc_bto = ssc_bto | SSCBTO_BTO | SSCBTO_RWT;
+ MACH_CHECK (MCHK_READ);
+@@ -1063,7 +1079,9 @@ struct reglink *p;
+ 
+ for (p = &regtable[0]; p->low != 0; p++) {
+     if ((pa >= p->low) && (pa < p->high) && p->write) {
+-        p->write (pa, val, lnt);  
++        if (sim_deb)                                    /* pcjs-vax: register-space write trace */
++            sim_debug (DBG_DEVT, &sysd_dev, "REGW %08X %08X %08X %08X\n", pa, lnt, val, PC);
++        p->write (pa, val, lnt);
+         return;
+         }
+     }
