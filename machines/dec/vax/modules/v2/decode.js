@@ -104,7 +104,16 @@ import { DROM, DROM_STRIDE, DR, IG, SPEC, MODE, RQ } from "./drom.js";
 const VAXFAULT = {
     RESIN:      -0x10,          // reserved or privileged instruction
     RESOP:      -0x18,          // reserved operand
-    RESAD:      -0x1C           // reserved addressing mode
+    RESAD:      -0x1C,          // reserved addressing mode
+    ACV:        -0x20,          // access control violation      (raised by mmu.js)
+    TNV:        -0x24,          // translation not valid         (raised by mmu.js)
+    /*
+     * NOT an SCB offset.  STOP_PPTE (vax_defs.h:61) is a SIMULATOR STOP: a process page table
+     * that does not live in system space is an impossible machine state, not a program fault, and
+     * SIMH halts rather than dispatching an exception.  Kept positive so a dispatcher that treats
+     * every negative code as a vector offset cannot mistake it for one.
+     */
+    PPTE:        6
 };
 
 /**
