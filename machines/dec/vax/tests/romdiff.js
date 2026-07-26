@@ -9,7 +9,9 @@
  *
  * WHAT THIS IS
  * ------------
- * pcjsvax-223.  Three claims, each with its own phase below:
+ * pcjsvax-223 (TRACE, MIRROR, SELFCHECK) and pcjsvax-320 (the SSC-BASE-RANDOM addition to TRACE
+ * and SELFCHECK, and the boundary-accounting fix TRACE needed once its own advance exposed it).
+ * Four claims, each with its own phase below:
  *
  *   TRACE     ka655x.bin is loaded at BusVAX.addRom(), CPUStateVAX.boot() sets PC/PSL/the model
  *             magic byte exactly as vax_sysdev.c's cpu_boot() does, and the machine executes from
@@ -21,7 +23,16 @@
  *             what order.  Modeled on tests/cpudiff.js's EHKAA phase -- same trace format
  *             (tests/simhtrace.js), same oracle (tools/trace-differ/differ.py), same
  *             unavailable/CMPD/ZEROSPEC normalization, because it is the same kind of claim: a
- *             PROGRAM runs, not one instruction.
+ *             PROGRAM runs, not one instruction.  pcjsvax-320's own boundary-advance (past the SSC
+ *             base register's store) exposed a real bug in how many trace records were comparable
+ *             when the boundary lands on the INSTRUCTION AFTER one that now completes -- see
+ *             BoundaryAccounting.compute()'s doc comment.
+ *
+ *   SSC-BASE- pcjsvax-320: the TRACE phase's boot run only ever stores ONE value into the SSC base
+ *   RANDOM    register (0x20140000, which already satisfies its own mask), so verifySscBaseRandom()
+ *             drives many MORE values -- boundary-chosen and random -- through a real instruction
+ *             round trip on the live oracle, proving the SSCBASE_RW/SSCBASE_MBO mask itself, not
+ *             just whether the address is backed.  Enforces its own coverage floor.
  *
  *   MIRROR    The upper half of the ROM (VAX.PHYSMEM.ROM_BASE + ROM_SIZE .. +ROM_LENGTH) must read
  *             back exactly what the lower half holds, at several offsets including the boundary,
@@ -33,10 +44,11 @@
  *             A prior version of this check used the magic byte and was vacuous for exactly that
  *             reason (caught by an adversarial veracity review); see verifyMirrorJS()'s header.
  *
- *   SELFCHECK --selfcheck injects five deliberate defects into the SHIPPED code path (two distinct
+ *   SELFCHECK --selfcheck injects eight deliberate defects into the SHIPPED code path (two distinct
  *             ROM-mirror failure modes -- reads garbage, and reads a stale load-time snapshot --
- *             plus CPUStateVAX.boot()'s magic byte / PSL, and the ROM's read-only enforcement) and
- *             fails if any one of them is not caught.
+ *             CPUStateVAX.boot()'s magic byte / PSL, the ROM's read-only enforcement, the SSC base
+ *             register's decode and its mask, and BoundaryAccounting's off-by-one) and fails if any
+ *             one of them is not caught.
  *
  * WHY THE SIMH SIDE USES A REAL `BOOT CPU`, BOUNDED BY A BREAKPOINT, NOT A HAND-BUILT DEPOSIT
  * ---------------------------------------------------------------------------------------------
