@@ -133,7 +133,8 @@ VAX.PHYSMEM = {
     IOPAGE_BASE:    0x20000000,                 // Qbus I/O page
     IOPAGE_LENGTH:  0x00002000,                 // 8KB
     ROM_BASE:       0x20040000,                 // KA655 boot/diagnostic ROM (appears twice)
-    ROM_LENGTH:     0x00040000,                 // ROMSIZE * 2 (128KB * 2)
+    ROM_LENGTH:     0x00040000,                 // ROMSIZE * 2 (128KB * 2) -- the full mirrored span
+    ROM_SIZE:       0x00020000,                 // ROMSIZE (vaxmod_defs.h:174) -- one copy, unmirrored
     REG_BASE:       0x20080000,                 // local register space (CQBIC, CMCTL, KA655 regs)
     REG_LENGTH:     0x00080000,
     SSC_BASE:       0x20140000,                 // system support chip
