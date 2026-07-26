@@ -325,7 +325,7 @@ index 809bb66..d9c5cb3 100644
      tbi = VA_GETTBI (vpn);
      xpte = (va & VA_S0)? stlb[tbi]: ptlb[tbi];          /* access tlb */
 -    if ((xpte.pte & acc) && (xpte.tag == vpn))          /* TB hit, acc ok? */ 
-+    if ((xpte.pte & acc) && (xpte.tag == vpn)) {        /* TB hit, acc ok? */ 
++    if ((xpte.pte & acc) && (xpte.tag == vpn)) {        /* TB hit, acc ok? */
 +        PCJS_MMU_T (("A %08X\n", (xpte.pte & TLB_PFN) | off));
          return (xpte.pte & TLB_PFN) | off;
 +        }

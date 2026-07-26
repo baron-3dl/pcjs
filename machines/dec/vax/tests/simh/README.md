@@ -22,6 +22,27 @@ export SIMH_EXC_BIN=$SIMH_DECODE_BIN
 node machines/dec/vax/tests/excdiff.js
 ```
 
+## Proving the patches still apply: verify-patches.sh
+
+`verify-patches.sh` is the oracle-health check (`pcjsvax-fb1`). Unlike `build.sh`, which
+deliberately reuses an existing `$DEST` for iteration speed, `verify-patches.sh` never reuses
+anything: it derives the patch list *programmatically* from the two directories that hold
+patches (one file in `pcjs-vax/patches/`, everything matching `*.patch` here, sorted), does a
+real `git clone` of the vendored `open-simh` into a brand-new temp directory, applies every patch
+in order, builds, and asserts SIMH's own EHKAA self-test reported PASS.
+
+```
+machines/dec/vax/tests/simh/verify-patches.sh              # fresh clone, apply, build, assert PASS
+machines/dec/vax/tests/simh/verify-patches.sh --selfcheck   # mutation suite: drop/reorder/corrupt a patch, prove each is caught
+```
+
+`--selfcheck` doesn't inspect anything — it removes a patch from the chain, reorders two adjacent
+patches, and corrupts a context line inside one, and asserts by execution that all three are
+rejected by `git apply` and that the rejection names the responsible patch. A future rebase that
+silently breaks a patch's applicability is exactly the failure this project cannot afford to
+discover only when a differential goes red for an unrelated reason — `git status` on the pristine
+vendor checkout should stay the only thing anyone needs to trust, everything else is re-derived.
+
 **`build.sh` REUSES an existing destination directory.** If you add a patch, or
 pull one, delete the destination first — otherwise the new patch is silently
 absent from the binary and the test that needs it fails with "this simulator
@@ -243,13 +264,55 @@ configuration is internally deterministic (three consecutive runs: 2,356 / 2,356
 / 2,356). `excdiff.js` therefore asserts the vector and IPR **sets** as
 equalities and the event **count** as a floor.
 
-## Provenance and rebasing
+## Upstream-drift hazards, per patch
 
-All five patches are against Open SIMH at commit `a1f57fa3`. Keep them small and
+What each patch hangs off of — check these first on a rebase; if any of them moved or changed
+signature, that patch's hunks likely still apply as *text* (small, additive hunks tend to) but may
+no longer mean what the prose above says.
+
+| Patch | Files | Hooks (exact functions/macros/structs) |
+|---|---|---|
+| 0001 | `vax_cpu.c`, `vax_defs.h` | `InstHistory` struct (adds `reg[16]`); the history-record capture inside `sim_instr()`'s main loop (`for (i = 0; i < j; i++) h->opnd[i] = ...` site); `cpu_show_hist_records()`'s per-record print loop. |
+| 0002 | `vax_cpu.c`, `vax_defs.h` | `Read()` — a `static SIM_INLINE` in `vax_mmu.h` — wrapped and `#define`d to `Read_dlog` at file scope in `vax_cpu.c`; the specifier-loop entry (`numspec = numspec & DR_NSPMASK`) where `dec_rlogn` is armed; the same history-record capture site 0001 touches (extends it with `preg`/`rlog`/`recq`/`nopnd`/`brdisp`/`ilen`); `InstHistory` struct again. |
+| 0003 | `vax_cpu.c`, `vax_mmu.c`, `vax_mmu.h` | `cpu_mod[]` MTAB table (adds `MMUOP`/`MMUTRACE`/`NOMMUTRACE` entries — order-sensitive only in that 0004 inserts its own entry immediately after MMUOP's); `cpu_get_vsw()` (adds the `-W` switch); new `cpu_show_mmuop()`/`cpu_set_mmutrace()` functions (call `Test()`/`Read()`/`Write()`/`op_mtpr()` and `save_env`/`setjmp` directly — these are the real fault/abort paths, a signature change there is high-risk); `vax_mmu.h`'s inline `Read`/`Write`/`Test` (each gets one `PCJS_MMU_T(...)` call inserted — these three functions are the highest-traffic hook point in the whole patch set, called from `vax_cpu.c`, `vax_cpu1.c`, `vax_cis.c`, `vax_octa.c`); `fill()`, `set_map_reg()`, `zap_tb()`, `zap_tb_ent()` in `vax_mmu.c` (one trace call each). |
+| 0004 | `vax_cpu.c` | `cpu_mod[]` MTAB table (inserts the `FPOP` entry right after 0003's `MMUOP` entry — **this is why 0004 fails to apply if 0003 is missing or reordered after it**); new `cpu_show_fpop()`, whose body is *copied verbatim* out of `sim_instr()`'s F/D/G-opcode dispatch `switch` between two marker comments — on a rebase, diff `sim_instr()`'s float-opcode cases against this function body directly, since that's the actual source of truth being duplicated; `op_*` routines in `vax_fpa.c` (called, not modified); `CC_IIZZ_FP`/`CC_IIZP_FP` macros and `WRITE_B`/`WRITE_W`/`WRITE_L`/`WRITE_Q` macros in `vax_defs.h`/top of `vax_cpu.c` (referenced, not modified — a macro signature change is the real hazard here). |
+| 0005 | `vax_cpu.c`, `vax_cpu1.c`, `vax_defs.h` | `cpu_deb[]` DEBTAB table (adds `EXCTRACE`); new `LOG_CPU_X` bit in `vax_defs.h` (must stay clear of the existing `LOG_CPU_FAULT_*` bits — currently `0x200`, one past `LOG_CPU_FAULT_EMUL`'s `0x100`); new `exc_trace_state()`; and five existing functions get entry/exit trace calls spliced in: `intexc()` (also hoists its SCB-read address into a local, `pcjs_scbpa`, logged and then used in place of the inline expression — the read itself is unchanged), `op_rei()`, `op_chm()`, `op_mtpr()`, `op_mfpr()`. A rebase that changes any of these five functions' control flow (early returns, additional fault paths) needs the corresponding `PCJS_TRACING` block re-sited, not just re-hunked. |
+
+Provenance: all five patches are against Open SIMH at commit `a1f57fa3`. Keep them small and
 additive so they keep applying as upstream moves; net diff is two files +79 lines
 for 0002, three files +166/-4 for 0003, one file +356/-0 for 0004 and three files
 +71/-1 for 0005, with every copyright header untouched. No patch changes
 instruction semantics — the simulator's own EHKAA self-test, which `make ... vax`
 runs, passes unmodified with all five applied.
+
+### Two hazards fixed by `pcjsvax-fb1` — read before assuming either is still true
+
+* **0003, not 0004, was the trailing-whitespace source.** `git apply`'s default whitespace check
+  flagged one line in 0003 (`vax_mmu.h`, the `Test()` case in the read-vs-fill inline) on every
+  application: the added line converts a single-statement `if` into a brace block, and it
+  inherited a trailing space that was *already present* on the original single-statement line in
+  upstream `vax_mmu.h` — i.e. the trailing space predates this patch set and isn't something 0003
+  introduced, it just carried it onto a `+` line where `git apply` now sees it. Fixed by dropping
+  the one inherited trailing space on 0003's added line; the hunk's surrounding context is
+  otherwise byte-identical, and a fresh clone + apply of all five (verified by
+  `verify-patches.sh`) is silent. If a rebase reintroduces a whitespace warning, check the new
+  hunk against the *current* upstream line first — it may be carrying forward a different
+  upstream artifact, not repeating this one.
+* **`build.sh`'s `cp -a "$SRC" "$DEST/open-simh"` corrupts the pristine vendor checkout if `$SRC`
+  (i.e. `$PCJS_VAX_REPO/open-simh`) is itself a symlink** — which it legitimately is in every
+  worktree set up per this project's own convention (a worktree's `open-simh` is a symlink to the
+  one pristine checkout, so it isn't cloned N times). `cp -a` implies `-d`/`--no-dereference`, so
+  copying a symlink SOURCE copies the symlink itself, not the directory it points to — `$DEST/open-simh`
+  silently becomes a second symlink back to the *same* pristine tree, and every `git apply`/`make`
+  that follows patches and builds the pristine checkout in place, with nothing about the run's
+  output indicating it. This bit an agent working `pcjsvax-fb1` directly (mid-task, mid-July 2026)
+  and was caught only because the pristine tree's `git status` was checked externally. Fixed: `build.sh`
+  now copies `"$SRC/."` (the trailing `/.` forces resolution through a top-level symlink while still
+  preserving any symlinks *inside* the tree) and asserts `$DEST/open-simh` is a real directory, not
+  a symlink, immediately after — in both the fresh-copy branch and the reuse branch, failing loudly
+  rather than silently building through the pristine tree. **Never `git apply` or build with a
+  working directory that resolves — via any symlink hop — into `pcjs-vax/open-simh`.** If you
+  aren't sure a path is safe, `realpath` it and compare against the pristine checkout's realpath
+  before doing anything destructive.
 
 Open SIMH is MIT, © 1998–2019 Robert M Supnik.
