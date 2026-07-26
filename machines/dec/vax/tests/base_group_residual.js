@@ -16,7 +16,7 @@
  * what a sibling module actually wired up.  This script is the single, re-runnable source of
  * truth for "what is left": it reads the SAME exported lists each execution module's dispatch
  * itself uses (cpu.js's IMPLEMENTED, control.js's CONTROL_OPCODES keys resolved through drom.js's
- * OPCODES, fpa.js's OPC keys, strq.js's IMPLEMENTED) and the SAME group classification decode.js
+ * OPCODES, fpa.js's OPC keys, strq.js's IMPLEMENTED, exc.js's IMPLEMENTED) and the SAME group classification decode.js
  * uses to decide whether this CPU implements an opcode at all, and prints the set difference.  No
  * hand-maintained mnemonic list lives here or anywhere else in this file.
  *
@@ -39,6 +39,7 @@ import { IMPLEMENTED as CPU_IMPLEMENTED } from "../modules/v2/cpu.js";
 import { CONTROL_OPCODES } from "../modules/v2/control.js";
 import { OPC as FPA_OPC } from "../modules/v2/fpa.js";
 import { IMPLEMENTED as STRQ_IMPLEMENTED } from "../modules/v2/strq.js";
+import { IMPLEMENTED as EXC_IMPLEMENTED } from "../modules/v2/exc.js";
 
 /*
  * The known, documented coordination carve-outs as of pcjsvax-515 -- see strq.js's file header
@@ -95,7 +96,8 @@ function main()
         ...CPU_IMPLEMENTED,
         ...controlImplemented(),
         ...Object.keys(FPA_OPC),
-        ...STRQ_IMPLEMENTED
+        ...STRQ_IMPLEMENTED,
+        ...EXC_IMPLEMENTED
     ]);
 
     let residual = [...base].filter(mn => !implemented.has(mn)).sort();
@@ -110,7 +112,7 @@ function main()
         }, null, 2));
     } else {
         console.log(`Base Instruction Group (IG_BASE|IG_BSGFL|IG_BSDFL): ${base.size} opcodes`);
-        console.log(`Implemented (cpu.js + control.js + fpa.js + strq.js): ${base.size - residual.length} opcodes`);
+        console.log(`Implemented (cpu.js + control.js + fpa.js + strq.js + exc.js): ${base.size - residual.length} opcodes`);
         console.log(`Residual (${residual.length}):`);
         for (let mn of residual) console.log(`    ${mn}`);
     }
