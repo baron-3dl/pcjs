@@ -98,11 +98,30 @@
  *   CMPM_VAX, so open-simh compiles the "Subset VAX" half of vax_cmode.c in which BadCmPSL()
  *   returns TRUE unconditionally and op_cmode() is a reserved-instruction fault.  badCmPSL() here
  *   is that same constant, which is why the REI PSL<CM> path always faults.
- * - DEVICE INTERRUPT VECTORS.  eval_int()'s hardware-interrupt scan and get_vector()'s device
- *   acknowledge are ported, but int_req[]/int_vec[] are owned by the Qbus/device item; `intReq`
- *   is present, always zero, and `deviceVector()` is the seam.  The memory-error and CRD-error
- *   interrupt levels (IPL 0x1D / 0x1A), which are CPU state rather than device state, ARE
- *   implemented and are graded.
+ * - ANY ACTUAL DEVICE.  `addInterruptSource()`/`raiseInterrupt()`/`clearInterrupt()` are the seam
+ *   (vax_io.c:115-117's int_vec[]/int_ack[]/int_req[], and the SET_INT/CLR_INT macros that mutate
+ *   the last of those) -- the console, the interval timer, the SSC T0/T1 timers and every other
+ *   Qbus device install themselves through it and are owned by their own items, not this one.
+ *   `deviceVector(cpu, lvl)` is get_vector()'s device-acknowledge scan (vax_io.c:443-455): find the
+ *   lowest-numbered set request bit at this level, clear it (edge-triggered, exactly like the
+ *   memory/CRD-error levels below), and resolve its vector -- a constant for a FIXED-vector device,
+ *   or a function(cpu) called AT ACKNOWLEDGE TIME for a DYNAMIC one (the SSC timers, whose vector
+ *   is whatever the ROM last programmed into TIVEC0/1).  Both shapes have to work: a fixed-vector-
+ *   only seam fails the SSC-timer item the moment it lands.  QB_VEC_MASK is applied to the result
+ *   exactly as SIMH's get_vector() applies it to every hardware vector regardless of device.
+ *   `int_vec_set[]` (the OR'd into `vec`, then folded into the mask, on that same line) is NOT
+ *   modelled here, and that is a real gap for a FUTURE device, not a nonexistent one: vaxmod_defs.h
+ *   defines VEC_SET 0x201, and pdp11_io_lib.c's build_vector_tab() populates int_vec_set[l][bit] =
+ *   0x201 for every DEV_QBUS/DEV_UBUS autoconfigured device -- RQ, RL, TS, TQ, XQ, DZ, LP, VH, CR,
+ *   TD, DUP -- whose delivered vector is therefore `(vec | 0x201) & 0x3FD`, not `vec & QB_VEC_MASK`.
+ *   It IS zero for every device this item's downstream items actually install (TTI, TTO, CSI, CSO,
+ *   CLK, TMR0, TMR1) -- confirmed by hwintdiff.js's fixed-vector cases delivering 0xF8/0xFC/0xF0/
+ *   0xF4/0xC0 unmodified -- so the generic QB_VEC_MASK-only mask above is correct for all three
+ *   downstream items as scoped today.  Whoever lands the first autoconfigured Qbus disk/serial/net
+ *   device will need to extend addInterruptSource()'s installed table with a per-bit int_vec_set
+ *   value and fold it into deviceVector()'s masking the way get_vector() does -- do that then, not
+ *   here.  The memory-error and CRD-error interrupt levels (IPL 0x1D / 0x1A), which are CPU state
+ *   rather than device state, ARE implemented and are graded, and are untouched by this.
  * - The CIS/octaword emulation traps (SCB_EMULATE / SCB_EMULFPD).
  */
 
@@ -181,6 +200,12 @@ const IPL_HLTPIN = 0x1F, IPL_MEMERR = 0x1D, IPL_CRDERR = 0x1A;
 const IPL_HMAX = 0x17, IPL_HMIN = 0x14, IPL_HLVL = IPL_HMAX - IPL_HMIN + 1;
 const IPL_SMAX = 0xF;
 const VEC_QBUS = 1;
+
+/* get_vector()'s generic hardware-vector mask (vax_io.c:112), applied to EVERY device's resolved
+   vector regardless of whether it is fixed or dynamic -- this is why a dynamic vector masked to
+   TMR_VEC_MASK (0x3FC) at the point the ROM writes it can still be truncated again here: the two
+   masks are different widths and the SECOND one is the one that reaches PSL/the SCB dispatch. */
+const QB_VEC_MASK = 0x1FC;
 
 /* intexc()'s `ei` argument, vax_defs.h:407-409. */
 const IE = {SVE: -1, EXC: 0, INT: 1};
@@ -319,6 +344,15 @@ class VAXExc {
         this.crdErr = 0;
         this.hltPin = 0;
         this.intReq = new Int32Array(IPL_HLVL);
+        /*
+         * intVec[lvl - IPL_HMIN][bit] -- a constant SCB offset, or a function(cpu) returning one at
+         * acknowledge time -- installed by addInterruptSource().  Mirrors SIMH's int_vec[]/int_ack[]
+         * (vax_io.c:116-117), which persist for the life of a running system (set once when a
+         * device attaches, not torn down by a CPU RESET); NOT cleared by reset() below for the same
+         * reason intReq[] itself IS cleared there -- a device's identity is not CPU state.
+         */
+        this.intVec = [];
+        for (let i = 0; i < IPL_HLVL; i++) this.intVec.push([]);
         this.iprDevice = null;
         /*
          * fault_PC (vax_cpu.c:258): the PC of the instruction currently being executed, captured
@@ -354,6 +388,45 @@ class VAXExc {
      * @param {Object} dev
      */
     setIPRDevice(dev) { this.iprDevice = dev; }
+
+    /**
+     * addInterruptSource(lvl, bit, vec)
+     *
+     * Installs a hardware interrupt source at a given Qbus IPL and request bit -- MIRRORS
+     * setIPRDevice()'s installer pattern above, one call per device, made once when the device
+     * attaches (vax_io.c's per-DIB int_vec[]/int_ack[] setup, not modelled as a DIB here since
+     * there is no device/autoconfig layer yet -- see the file header).  A caller that needs several
+     * request bits (a multi-line device) calls this once per bit.
+     *
+     * `vec` is EITHER a constant SCB offset (a FIXED-vector device: the console, the interval
+     * timer) OR a function(cpu) returning one when deviceVector() ACKNOWLEDGES it (a DYNAMIC-vector
+     * device: the SSC timers T0/T1, whose vector is whatever value the ROM last wrote into
+     * TIVEC0/1).  deviceVector() below applies QB_VEC_MASK to the result either way, exactly as
+     * SIMH's get_vector() does, so a caller does not need to pre-mask a dynamic vector itself.
+     *
+     * @this {VAXExc}
+     * @param {number} lvl hardware IPL, IPL_HMIN..IPL_HMAX
+     * @param {number} bit request bit within that level's word, 0..31
+     * @param {number|function(Object):number} vec
+     */
+    addInterruptSource(lvl, bit, vec) { this.intVec[lvl - IPL_HMIN][bit] = vec; }
+
+    /**
+     * raiseInterrupt(lvl, bit) / clearInterrupt(lvl, bit)
+     *
+     * SET_INT(dev)/CLR_INT(dev) (vaxmod_defs.h) -- a device asserts or withdraws its own request
+     * bit.  This is NOT arbitration: evalInt() (below) decides whether, and when, a raised request
+     * becomes the interrupt actually taken, and a request withdrawn before that happens (clearInterrupt
+     * called before the level is ever evaluated as the winner) simply never gets there -- there is
+     * nothing here that "cancels a dispatch in flight", because dispatch only happens inside
+     * deviceVector()'s scan, which clears the bit itself at the same moment it resolves the vector.
+     *
+     * @this {VAXExc}
+     * @param {number} lvl
+     * @param {number} bit
+     */
+    raiseInterrupt(lvl, bit) { this.intReq[lvl - IPL_HMIN] = this.intReq[lvl - IPL_HMIN] | (1 << bit); }
+    clearInterrupt(lvl, bit) { this.intReq[lvl - IPL_HMIN] = this.intReq[lvl - IPL_HMIN] & ~(1 << bit); }
 
     /* --------------------------------------------------------------------------------------- *
      * IPL arbitration                                                                           *
@@ -423,17 +496,40 @@ class VAXExc {
     /**
      * deviceVector(cpu, lvl)
      *
-     * get_vector()'s device-acknowledge scan (vax_io.c:443-455).  int_req[]/int_vec[]/int_ack[]
-     * belong to the Qbus and device item; until it lands there are no hardware interrupt sources,
-     * `intReq` is always zero, and this returns 0 -- which the caller treats exactly as SIMH does
-     * (`if (vec)`: a zero vector means the request evaporated and nothing is dispatched).
+     * get_vector()'s device-acknowledge scan (vax_io.c:443-455): "return vector for highest
+     * priority hardware interrupt at IPL lvl".  "Highest priority" WITHIN a level is NOT re-
+     * arbitrated here -- SIMH scans request bits from 0 upward and takes the FIRST (lowest-numbered)
+     * one set (`for (i = 0; int_req[l] && (i < 32); i++)`), so bit position, not anything about the
+     * device, is the tiebreaker.  The winning bit is CLEARED as part of resolving it -- an
+     * edge-triggered acknowledge, exactly like getVector()'s memory/CRD-error handling above -- so a
+     * request that is not re-raised by its device does not re-deliver on the next arbitration.
+     *
+     * A request bit with no installed source (raised without a matching addInterruptSource() call)
+     * evaporates exactly like an empty level: returns 0, which the caller's `if (vec)` (dispatch()
+     * at cpustate.js and stepInstruction() above) treats as "nothing to dispatch" -- matching SIMH's
+     * `vec = int_vec[l][i]` reading a zero-initialized table entry.
      *
      * @this {VAXExc}
      * @param {Object} cpu
      * @param {number} lvl
-     * @returns {number}
+     * @returns {number} SCB offset, or 0 if the request evaporated / had no installed vector
      */
-    deviceVector(cpu, lvl) { return 0; }
+    deviceVector(cpu, lvl)
+    {
+        let l = lvl - IPL_HMIN;
+        let req = this.intReq[l];
+        let table = this.intVec[l];
+        for (let i = 0; i < 32 && req; i++) {
+            if ((req >>> i) & 1) {
+                this.intReq[l] = this.intReq[l] & ~(1 << i);
+                let v = table[i];
+                if (v === undefined) return 0;
+                let vec = (typeof v === "function") ? (v(cpu) | 0) : (v | 0);
+                return vec & QB_VEC_MASK;
+            }
+        }
+        return 0;
+    }
 
     /**
      * getVector(cpu, lvl)
@@ -1335,7 +1431,7 @@ export {
     CC_N, CC_Z, CC_V, CC_C, CC_MASK,
     KERN, EXEC, SUPV, USER,
     SISR_MASK, SISR_2, AST_MAX,
-    IPL_HLTPIN, IPL_MEMERR, IPL_CRDERR, IPL_HMAX, IPL_HMIN, IPL_SMAX,
+    IPL_HLTPIN, IPL_MEMERR, IPL_CRDERR, IPL_HMAX, IPL_HMIN, IPL_HLVL, IPL_SMAX, QB_VEC_MASK,
     TIR_TRAP, TIR_V_TRAP, TIR_M_TRAP, TRAP_INTOV, TRAP_DIVZRO,
     CVAX_SID, CVAX_UREV, BR_MASK, ccIIZZ_L
 };
