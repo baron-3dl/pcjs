@@ -49,6 +49,15 @@
  *                   calls addInterruptSource()/raiseInterrupt() directly, exactly playing the part
  *                   real vax_sysdev.c code just played on the other side.  The DISPATCH that follows
  *                   is still graded against SIMH's real, event-queue-free interrupt delivery.
+ *                   ALL THREE dynamic_* cases install `vec` as a FUNCTION (`p.dynamic: true`, see
+ *                   primeJS()) -- a first version of this file installed a plain number here even
+ *                   though SIMH's side was genuinely dynamic, which left deviceVector()'s
+ *                   `typeof v === "function"` branch dead code under this differential (a veracity
+ *                   pass caught it via instrumentation: 0 function-valued installs across a fully
+ *                   passing run).  "dynamic_tmr0_reprogrammed" goes further: it reprograms TIVEC0 a
+ *                   SECOND time (0x110 -> 0x1D0) after the interrupt is already raised but before
+ *                   the CPU acknowledges it, so only a callback genuinely re-invoked AT ACKNOWLEDGE
+ *                   TIME (not memoized when installed) can deliver the value real SIMH delivers.
  *
  * MEASURED FACT: IPL 0x15 AND 0x17 HAVE NO DEVICE ON THIS MACHINE
  * ----------------------------------------------------------------
@@ -70,7 +79,13 @@
  * Every one of: all 4 hardware IPLs (0x14-0x17) requested AND delivered, the evaporated-request
  * path, and the masked-then-unmasked path, is tracked in a Set/counter and the run FAILS if any is
  * missing -- the floors do not shrink with a smaller case list because the case list here is a fixed,
- * enumerated matrix, not a sample; nothing here scales with a --cases flag.
+ * enumerated matrix, not a sample; nothing here scales with a --cases flag.  "Delivered" means an
+ * ACTUAL DISPATCH was observed -- main()'s per-step check reads the post-step PC out of SIMH's own
+ * result (not cpu.js's) and only credits a level/flag when that PC landed inside the handler page.
+ * An earlier version credited a level merely because its case reached a comparison, which let a run
+ * reduced to just "evaporated" (which dispatches NOTHING) plus one real device still report all four
+ * levels covered; a veracity pass caught the mismatch between what the message claimed and what it
+ * checked.
  *
  *      node machines/dec/vax/tests/hwintdiff.js [--simh PATH] [--selfcheck]
  */
@@ -221,6 +236,30 @@ function tmrSetupBytes(tmr, vecValue)
     return bytes;
 }
 
+/**
+ * tmrReprogramSetupBytes(tmr, vecA, vecB)
+ *
+ * Like tmrSetupBytes(), but with a FOURTH real MOVL after the interrupt is already raised: a plain
+ * write to T#VEC (no XFR/IE/SGL -- ssc_wr's `case 0x43/0x47` is a bare `tmr_tivr[i] = val &
+ * TMR_VEC_MASK`, no SET_INT side effect) that reprograms the vector to vecB BEFORE the CPU ever
+ * acknowledges the already-pending request.  Real hardware/SIMH necessarily delivers vecB, because
+ * tmr0_inta()/tmr1_inta() read tmr_tivr[i] AT ACKNOWLEDGE TIME, not whatever it was when SET_INT
+ * fired -- exactly the "resolved at acknowledge, not at request" behavior this seam's callback
+ * shape exists to support.  See the "reprogrammed" case and its matching selfcheck mutation.
+ *
+ * @param {number} tmr 0 or 1
+ * @param {number} vecA the vector in TIVEC0/1 when the request is raised (must NOT be delivered)
+ * @param {number} vecB the vector in TIVEC0/1 when the request is acknowledged (must BE delivered)
+ * @returns {number[]} instruction bytes
+ */
+function tmrReprogramSetupBytes(tmr, vecA, vecB)
+{
+    let bytes = tmrSetupBytes(tmr, vecA);
+    let vec = tmr ? SSC_RG.T1VEC : SSC_RG.T0VEC;
+    emitMOVLimmToAbs(bytes, vecB | 0, sscAddr(vec));          // reprogram TIVEC -- no SET_INT, no re-raise
+    return bytes;
+}
+
 /* ------------------------------------------------------------------------------------------- *
  * Case matrix.  Each case is EITHER "real" (graded against live SIMH) or "synthetic" (0x15/0x17, *
  * graded against an independently computed expectation -- see phaseSynthetic()).                  *
@@ -232,13 +271,22 @@ function tmrSetupBytes(tmr, vecValue)
  * @property {number[]} setupBytes   real MOVL bytes to execute before the measured step(s) (may be
  *                                   empty)
  * @property {number} setupInstrs    how many `step`s the setup bytes are (0 if setupBytes is empty)
- * @property {Array<{lvl:number, bit:number, vec:number, simhName:?string}>} prime  sources to raise
- *           BEFORE the first measured step (simhName null for a dynamic/synthetic source with no
- *           depositable INT flag -- those are raised via setupBytes/real execution instead)
+ * @property {Array<{lvl:number, bit:number, vec:number, simhName:?string, dynamic:?boolean}>} prime
+ *           sources to raise BEFORE the first measured step (simhName null for a dynamic/synthetic
+ *           source with no depositable INT flag -- those are raised via setupBytes/real execution
+ *           instead).  `dynamic: true` installs `vec` as a FUNCTION (`(cpu) => vec`), exactly the
+ *           shape a real dynamic-vector device uses -- see primeJS().  `vec` itself is still used,
+ *           regardless of `dynamic`, to pre-populate the SCB slot the DELIVERED vector will land on
+ *           (see the `vectors` Set construction in buildScript()/runCaseJS()).
  * @property {Array<{lvl:number, bit:number, simhName:string}>} withdraw  sources to withdraw again
  *           before the first measured step (the evaporated-request case)
  * @property {Array<{ipl:number}>} steps  one measured `step 1` per entry, in order; `ipl` is
  *           deposited into PSL<IPL> immediately before that step
+ * @property {?function(Object):void} customPrimeJS  when present, REPLACES the generic prime/
+ *           withdraw loop entirely for the JS side (used by "dynamic_tmr0_reprogrammed", whose
+ *           callback must read a value that changes AFTER installation -- something the generic
+ *           loop's one-shot `addInterruptSource(lvl, bit, (cpu) => vec)` cannot express).  `prime`
+ *           is still consulted for SCB population even when this is set.
  */
 
 const REAL_CASES = [
@@ -251,11 +299,15 @@ const REAL_CASES = [
         steps: [{ipl: 0}]
     })),
 
-    /* Dynamic vector, timer 0, vector fully inside QB_VEC_MASK (no truncation). */
+    /* Dynamic vector, timer 0, vector fully inside QB_VEC_MASK (no truncation).  `dynamic: true`
+       installs this as `(cpu) => 0x100`, a genuine function-valued vec -- NOT a numeric constant --
+       so this case actually exercises deviceVector()'s `typeof v === "function"` branch, which a
+       veracity pass found was otherwise dead code under this differential (every prime here was
+       installing a plain number, even for the timers, which are dynamic ONLY on the SIMH side). */
     {
         name: "dynamic_tmr0_lo",
         setupBytes: tmrSetupBytes(0, 0x100), setupInstrs: 3,
-        prime: [{lvl: 0x14, bit: 15, vec: 0x100, simhName: null}],
+        prime: [{lvl: 0x14, bit: 15, vec: 0x100, simhName: null, dynamic: true}],
         withdraw: [],
         steps: [{ipl: 0}]
     },
@@ -264,7 +316,7 @@ const REAL_CASES = [
     {
         name: "dynamic_tmr0_truncated",
         setupBytes: tmrSetupBytes(0, 0x2A8), setupInstrs: 3,
-        prime: [{lvl: 0x14, bit: 15, vec: 0x2A8, simhName: null}],
+        prime: [{lvl: 0x14, bit: 15, vec: 0x2A8, simhName: null, dynamic: true}],
         withdraw: [],
         steps: [{ipl: 0}]
     },
@@ -273,9 +325,28 @@ const REAL_CASES = [
     {
         name: "dynamic_tmr1",
         setupBytes: tmrSetupBytes(1, 0x180), setupInstrs: 3,
-        prime: [{lvl: 0x14, bit: 16, vec: 0x180, simhName: null}],
+        prime: [{lvl: 0x14, bit: 16, vec: 0x180, simhName: null, dynamic: true}],
         withdraw: [],
         steps: [{ipl: 0}]
+    },
+    /* Dynamic vector, REPROGRAMMED between raise and acknowledge: the ROM writes TIVEC0=0x110
+       (arming the interrupt), then OVERWRITES it to 0x1D0 before the CPU ever looks -- real SIMH
+       necessarily delivers 0x1D0 (tmr0_inta() reads tmr_tivr[0] fresh at acknowledge time).  This
+       is the case, plus its matching selfcheck mutation below, that actually proves "resolved at
+       acknowledge time" is enforced rather than merely asserted in a comment: a callback memoized
+       at addInterruptSource() time would deliver the ARMED value (0x110), not the reprogrammed one. */
+    {
+        name: "dynamic_tmr0_reprogrammed",
+        setupBytes: tmrReprogramSetupBytes(0, 0x110, 0x1D0), setupInstrs: 4,
+        prime: [{lvl: 0x14, bit: 15, vec: 0x1D0, simhName: null, dynamic: true}],   // vec: the DELIVERED value, for SCB population
+        withdraw: [],
+        steps: [{ipl: 0}],
+        customPrimeJS: (cpu) => {
+            let box = {value: 0x110};                             // what TIVEC0 holds when armed
+            cpu.exc.addInterruptSource(0x14, 15, (c) => box.value); // installed BEFORE the reprogram
+            cpu.exc.raiseInterrupt(0x14, 15);
+            box.value = 0x1D0;                                     // the ROM reprograms it, pre-acknowledge
+        }
     },
 
     /* Evaporated request: TTO raised, then withdrawn, before the CPU ever looks -- nothing should
@@ -426,12 +497,21 @@ function runAll(simh, cases, scratch)
  * JS side                                                                                          *
  * ------------------------------------------------------------------------------------------- */
 
-/** Prime the JS test double exactly as the SIMH script's `deposit <DEV> INT 1` / real MOVL setup
-    did -- the installer + mutator this item added, called the way a real device would call them. */
+/**
+ * primeJS(cpu, c)
+ *
+ * Prime the JS test double exactly as the SIMH script's `deposit <DEV> INT 1` / real MOVL setup
+ * did -- the installer + mutator this item added, called the way a real device would call them.
+ * `p.dynamic` installs `vec` as a FUNCTION (`(cpu) => vec`), not a bare number, so this file
+ * actually exercises deviceVector()'s dynamic-vector branch rather than merely being able to.
+ * `c.customPrimeJS`, when present, replaces this entirely (see the CaseSpec typedef).
+ */
 function primeJS(cpu, c)
 {
+    if (c.customPrimeJS) { c.customPrimeJS(cpu); return; }
     for (let p of c.prime) {
-        cpu.exc.addInterruptSource(p.lvl, p.bit, p.vec);
+        let vec = p.vec;
+        cpu.exc.addInterruptSource(p.lvl, p.bit, p.dynamic ? ((cpuArg) => vec) : vec);
         cpu.exc.raiseInterrupt(p.lvl, p.bit);
     }
     for (let w of c.withdraw) cpu.exc.clearInterrupt(w.lvl, w.bit);
@@ -529,7 +609,7 @@ function phaseSynthetic()
         cpu.psl = 0;
         cpu.regs[15] = R_CODE;
 
-        cpu.exc.addInterruptSource(s.lvl, s.bit, s.vec);
+        cpu.exc.addInterruptSource(s.lvl, s.bit, (cpuArg) => s.vec);   // function-valued too -- see primeJS()
         cpu.exc.raiseInterrupt(s.lvl, s.bit);
 
         let oldpc = cpu.regs[15], oldpsl = cpu.psl, oldsp = cpu.regs[14];
@@ -547,7 +627,10 @@ function phaseSynthetic()
         let expFrameLo = oldpc;               // at expSP (old PC)
         let expFrameHi = oldpsl;              // at expSP+4 (old PSL)
 
-        levelsSeen.add(s.lvl);
+        /* Same honesty rule as the REAL phase (see main()): only credit the level if a dispatch
+           actually landed in the handler page, not merely because the case ran. */
+        let deliveredHere = (cpu.regs[15] >>> 0) >= R_HANDLER && (cpu.regs[15] >>> 0) < (R_HANDLER + 16);
+        if (deliveredHere) levelsSeen.add(s.lvl);
         let tag = s.name;
         if ((cpu.regs[15] | 0) !== (expNewPC | 0)) failures.push(`${tag}: PC js=${hex(cpu.regs[15])} expected=${hex(expNewPC)}`);
         if ((cpu.psl | 0) !== (expNewPSL | 0)) failures.push(`${tag}: PSL js=${hex(cpu.psl)} expected=${hex(expNewPSL)}`);
@@ -681,6 +764,54 @@ function selfcheck(simh, scratch)
             () => { VAXExc.prototype.evalInt = origEval; });
     }
 
+    /* 5. A dynamic vector resolved (memoized) at INSTALL time instead of at ACKNOWLEDGE time.
+          "dynamic_tmr0_reprogrammed" is built exactly so these two moments give different answers:
+          the ROM arms TIVEC0=0x110, then reprograms it to 0x1D0 before the CPU ever looks, and real
+          SIMH necessarily delivers 0x1D0 (tmr0_inta() reads tmr_tivr[0] fresh at acknowledge).  This
+          mutation calls a function-valued vec IMMEDIATELY inside addInterruptSource() and stores the
+          result instead of the function -- so it captures 0x110 (the value at the moment the device
+          "attached", which is exactly when a real device's DIB would call this) and never sees the
+          reprogram.  Without this, "resolved at acknowledge time" was asserted only in a docblock:
+          every prime in this file used to install a plain number, so deviceVector()'s
+          `typeof v === "function"` branch was never actually exercised (see the file header). */
+    {
+        let origAdd = VAXExc.prototype.addInterruptSource;
+        checkAgainst("dynamic vector memoized at install time, not resolved at acknowledge",
+            ["dynamic_tmr0_reprogrammed"],
+            () => {
+                VAXExc.prototype.addInterruptSource = function(lvl, bit, vec) {
+                    let resolved = (typeof vec === "function") ? (vec(this.cpu) | 0) : vec;
+                    origAdd.call(this, lvl, bit, resolved);
+                };
+            },
+            () => { VAXExc.prototype.addInterruptSource = origAdd; });
+    }
+
+    /* 6. QB_VEC_MASK not applied to the resolved vector.  Graded live already by
+          "dynamic_tmr0_truncated" (0x2A8 must arrive as 0x0A8) -- this makes that protection a
+          NAMED, asserted mutation rather than an incidental side effect of one case passing. */
+    {
+        let origDV = VAXExc.prototype.deviceVector;
+        checkAgainst("QB_VEC_MASK not applied to the resolved vector", ["dynamic_tmr0_truncated"],
+            () => {
+                VAXExc.prototype.deviceVector = function(cpu, lvl) {
+                    let l = lvl - IPL_HMIN;
+                    let req = this.intReq[l];
+                    let table = this.intVec[l];
+                    for (let i = 0; i < 32 && req; i++) {
+                        if ((req >>> i) & 1) {
+                            this.intReq[l] = this.intReq[l] & ~(1 << i);
+                            let v = table[i];
+                            if (v === undefined) return 0;
+                            return (typeof v === "function") ? (v(cpu) | 0) : (v | 0);   // mask omitted
+                        }
+                    }
+                    return 0;
+                };
+            },
+            () => { VAXExc.prototype.deviceVector = origDV; });
+    }
+
     return results;
 }
 
@@ -722,12 +853,25 @@ function main()
             notReached.push(`${c.name}: SIMH produced ${simhSteps.length}/${c.steps.length} step(s)`);
             continue;
         }
-        for (let p of c.prime) levelsSeen.add(p.lvl);
-        if (c.name.startsWith("fixed_")) fixedSeen = true;
-        if (c.name.startsWith("dynamic_")) dynamicSeen = true;
-        if (c.name === "evaporated") evaporatedSeen = true;
-        if (c.name === "masked_then_unmasked") maskedUnmaskedSeen = true;
-        if (c.name === "multi_level") multiLevelSeen = true;
+        /*
+         * "levels REQUESTED AND DELIVERED" has to mean an actual dispatch was observed, not merely
+         * that the case reached a comparison -- levelsSeen.add() used to run unconditionally here,
+         * so a run reduced to just "evaporated" (which dispatches NOTHING) plus one real device
+         * still reported all four levels covered.  deliveredThisStep() reads SIMH's OWN result (the
+         * ground truth, independent of whether cpu.js happened to agree) and is true only when that
+         * step's post-step PC landed inside the handler page -- i.e. a dispatch actually happened.
+         */
+        let delivered = simhSteps.map((s) => {
+            let pc = s.regs[15] >>> 0;
+            return pc >= R_HANDLER && pc < (R_HANDLER + 16);
+        });
+        let anyDelivered = delivered.some((d) => d);
+        if (anyDelivered) for (let p of c.prime) levelsSeen.add(p.lvl);
+        if (c.name.startsWith("fixed_") && delivered[0]) fixedSeen = true;
+        if (c.name.startsWith("dynamic_") && delivered[0]) dynamicSeen = true;
+        if (c.name === "evaporated" && !delivered[0]) evaporatedSeen = true;
+        if (c.name === "masked_then_unmasked" && !delivered[0] && delivered[1]) maskedUnmaskedSeen = true;
+        if (c.name === "multi_level" && delivered[0] && delivered[1]) multiLevelSeen = true;
         for (let i = 0; i < c.steps.length; i++) {
             for (let bad of compareStep(c.name, i, jsSteps[i] || {stop: "missing"}, simhSteps[i])) problems.push("REAL: " + bad);
         }
@@ -743,13 +887,13 @@ function main()
     console.log(`  fixed=${fixedSeen} dynamic=${dynamicSeen} evaporated=${evaporatedSeen} maskedThenUnmasked=${maskedUnmaskedSeen} multiLevel=${multiLevelSeen}`);
 
     for (let want of [0x14, 0x15, 0x16, 0x17]) {
-        if (!levelsSeen.has(want)) problems.push(`COVERAGE: IPL ${hex(want, 2)} was never requested AND delivered`);
+        if (!levelsSeen.has(want)) problems.push(`COVERAGE: IPL ${hex(want, 2)} was never requested AND DELIVERED (an actual dispatch, not merely a compared case)`);
     }
-    if (!fixedSeen) problems.push("COVERAGE: no fixed-vector device case reached comparison");
-    if (!dynamicSeen) problems.push("COVERAGE: no dynamic-vector device case reached comparison");
-    if (!evaporatedSeen) problems.push("COVERAGE: the evaporated-request path was not taken");
-    if (!maskedUnmaskedSeen) problems.push("COVERAGE: the masked-then-unmasked path was not taken");
-    if (!multiLevelSeen) problems.push("COVERAGE: no multiple-simultaneous-level case reached comparison");
+    if (!fixedSeen) problems.push("COVERAGE: no fixed-vector device case actually delivered a dispatch");
+    if (!dynamicSeen) problems.push("COVERAGE: no dynamic-vector device case actually delivered a dispatch");
+    if (!evaporatedSeen) problems.push("COVERAGE: the evaporated-request path did not confirm non-delivery");
+    if (!maskedUnmaskedSeen) problems.push("COVERAGE: the masked-then-unmasked path did not confirm mask-then-deliver");
+    if (!multiLevelSeen) problems.push("COVERAGE: multiple-simultaneous-level case did not confirm two deliveries");
 
     if (problems.length) {
         console.error(`\nFAILED (${problems.length} problem(s)):`);

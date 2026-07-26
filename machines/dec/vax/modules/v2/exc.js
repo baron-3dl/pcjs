@@ -108,11 +108,20 @@
  *   or a function(cpu) called AT ACKNOWLEDGE TIME for a DYNAMIC one (the SSC timers, whose vector
  *   is whatever the ROM last programmed into TIVEC0/1).  Both shapes have to work: a fixed-vector-
  *   only seam fails the SSC-timer item the moment it lands.  QB_VEC_MASK is applied to the result
- *   exactly as SIMH's get_vector() applies it to every hardware vector regardless of device; the
- *   `int_vec_set[]` half of that same line (a per-bit OR used by variable-vector devices this
- *   machine has none of yet) is not modelled -- add it here, not in a device, if a future device
- *   needs it.  The memory-error and CRD-error interrupt levels (IPL 0x1D / 0x1A), which are CPU
- *   state rather than device state, ARE implemented and are graded, and are untouched by this.
+ *   exactly as SIMH's get_vector() applies it to every hardware vector regardless of device.
+ *   `int_vec_set[]` (the OR'd into `vec`, then folded into the mask, on that same line) is NOT
+ *   modelled here, and that is a real gap for a FUTURE device, not a nonexistent one: vaxmod_defs.h
+ *   defines VEC_SET 0x201, and pdp11_io_lib.c's build_vector_tab() populates int_vec_set[l][bit] =
+ *   0x201 for every DEV_QBUS/DEV_UBUS autoconfigured device -- RQ, RL, TS, TQ, XQ, DZ, LP, VH, CR,
+ *   TD, DUP -- whose delivered vector is therefore `(vec | 0x201) & 0x3FD`, not `vec & QB_VEC_MASK`.
+ *   It IS zero for every device this item's downstream items actually install (TTI, TTO, CSI, CSO,
+ *   CLK, TMR0, TMR1) -- confirmed by hwintdiff.js's fixed-vector cases delivering 0xF8/0xFC/0xF0/
+ *   0xF4/0xC0 unmodified -- so the generic QB_VEC_MASK-only mask above is correct for all three
+ *   downstream items as scoped today.  Whoever lands the first autoconfigured Qbus disk/serial/net
+ *   device will need to extend addInterruptSource()'s installed table with a per-bit int_vec_set
+ *   value and fold it into deviceVector()'s masking the way get_vector() does -- do that then, not
+ *   here.  The memory-error and CRD-error interrupt levels (IPL 0x1D / 0x1A), which are CPU state
+ *   rather than device state, ARE implemented and are graded, and are untouched by this.
  * - The CIS/octaword emulation traps (SCB_EMULATE / SCB_EMULFPD).
  */
 
