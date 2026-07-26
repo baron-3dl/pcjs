@@ -17,6 +17,27 @@ This script is the thing that has to catch that: it is invoked from verify-patch
 (every normal run) and from --selfcheck's mutation 4/4 (which constructs exactly that mutation and
 asserts THIS SCRIPT reports it, by name, as a failure).
 
+pcjsvax-62a (2026-07-26) extended patch 0006 with two more families, QIOR/QIOW, at ReadIO/WriteIO/
+ReadIOU/WriteIOU in vax_io.c -- the choke point vax_mmu.h's ReadB/W/L/WriteB/W/L branch to for the
+THIRD way a physical access can go (ADDR_IS_IO, neither RAM nor the ReadReg/WriteReg register-space
+"else" branch 0006 already covered): Qbus I/O-page space (ADDR_IS_IOP, 0x20000000, dispatched
+through iodispR[]/iodispW[] to rl/rq/rqb/rqc/rqd/ts/tq/xq/xqb/dz/dpv -- see vax_syslist.c) and Qbus
+memory-window space (ADDR_IS_CQM, 0x30000000, dispatched to cqm_rd/cqm_wr). Both are reached via
+ReadQb/WriteQb from the same four functions, so one hook per direction covers both branches, same
+as 0006's original ReadReg/WriteReg design. The two new families below are named QBIOP and QBCQM,
+one per branch -- NOT one per named Qbus device (rl/rq/ts/tq/xq/dz/...): a no-disk, no-media boot
+to >>> genuinely never touches those controllers' own registers at all (measured: RL 20001900-1909,
+RQ 20001468-146B, TS 20001550-1553, TQ 20001940-1943, XQ 20001920-192F and DZ 20000040-005F all show
+ZERO reads and ZERO writes in a real boot with nothing attached), so a per-device floor would be a
+FALSE floor -- exactly the "a direction the ROM never exercises" trap this file's own docstring
+already warns against, one level up (a whole family the ROM never exercises, not just one
+direction). What the no-disk boot DOES exercise, every time, is the QBA's own doorbell register
+(0x20001F40, inside the IOP range, structurally identical dispatch path to rl/rq/etc. -- same
+iodispR[]/iodispW[] table, same ReadIO/WriteIO hook, no per-device special-casing exists anywhere
+in this patch) and the CQM Qbus-memory window (heavy traffic from the console's own memory-mapping
+setup). Both are measured nonzero in BOTH directions on a real boot (see README.md "What 0006
+adds"), which is what QBIOP/QBCQM's floors below require.
+
 Two independent things are derived, not remembered, and for two different reasons:
 
   - The physical-address / IPR-number VALUES that identify each family are parsed out of the
@@ -186,7 +207,7 @@ def boot_and_capture(simh_bin, runlimit, timeout):
 # ---------------------------------------------------------------------------------------------
 # Tally the log.
 # ---------------------------------------------------------------------------------------------
-_RECORD_TYPES = ("IPRR", "IPRW", "REGR", "REGW")
+_RECORD_TYPES = ("IPRR", "IPRW", "REGR", "REGW", "QIOR", "QIOW")
 
 
 def tally_log(logpath):
@@ -264,6 +285,16 @@ def main():
     CMCTLSIZE = resolve(need("CMCTLSIZE", mod_h), mod_h, cache)
     SSCBASE = resolve(need("SSCBASE", mod_h), mod_h, cache)
 
+    # pcjsvax-62a: the two Qbus branches ADDR_IS_IO() covers -- IOPAGEBASE/IOPAGESIZE (ADDR_IS_IOP,
+    # the I/O-page dispatched through iodispR[]/iodispW[] to rl/rq/ts/tq/xq/dz/... and the QBA's own
+    # doorbell register) and CQMBASE/CQMSIZE (ADDR_IS_CQM, the Qbus memory window dispatched to
+    # cqm_rd/cqm_wr). Both #define'd in vaxmod_defs.h, resolved the same way as every other base/size
+    # pair above -- never hand-typed.
+    IOPAGEBASE = resolve(need("IOPAGEBASE", mod_h), mod_h, cache)
+    IOPAGESIZE = resolve(need("IOPAGESIZE", mod_h), mod_h, cache)
+    CQMBASE = resolve(need("CQMBASE", mod_h), mod_h, cache)
+    CQMSIZE = resolve(need("CQMSIZE", mod_h), mod_h, cache)
+
     t0_min, t1_max = ssc_timer_offset_range(vax_sysdev_c)
     SSC_TMR_LO = SSCBASE + t0_min * 4
     SSC_TMR_HI = SSCBASE + (t1_max + 1) * 4
@@ -278,6 +309,7 @@ def main():
         os.unlink(logpath)
 
     iprr, iprw, regr, regw = counts["IPRR"], counts["IPRW"], counts["REGR"], counts["REGW"]
+    qior, qiow = counts["QIOR"], counts["QIOW"]
 
     # (name, read-count, write-count, require-read, require-write) -- required directions are
     # the measured behaviour of a real boot-to->>> run (see README.md "What 0006 adds"), not a
@@ -297,6 +329,15 @@ def main():
                        sum_in_range(regw, KABASE, KABASE + KASIZE), True, True),
         ("CQBIC",     sum_in_range(regr, CQBICBASE, CQBICBASE + CQBICSIZE),
                        sum_in_range(regw, CQBICBASE, CQBICBASE + CQBICSIZE), True, True),
+        # pcjsvax-62a: the two Qbus branches, not one entry per named disk/tape/net/mux device --
+        # see this file's module docstring for why a per-device floor here would be a false floor
+        # for any no-disk, no-media boot (rl/rq/ts/tq/xq/dz all measure ZERO in both directions).
+        # QBIOP is proven nonzero by the QBA's own doorbell register at a fixed IOP address, which
+        # goes through the exact same iodispR[]/iodispW[] dispatch every other IOP device does.
+        ("QBIOP",     sum_in_range(qior, IOPAGEBASE, IOPAGEBASE + IOPAGESIZE),
+                       sum_in_range(qiow, IOPAGEBASE, IOPAGEBASE + IOPAGESIZE), True, True),
+        ("QBCQM",     sum_in_range(qior, CQMBASE, CQMBASE + CQMSIZE),
+                       sum_in_range(qiow, CQMBASE, CQMBASE + CQMSIZE), True, True),
     ]
 
     violations = []

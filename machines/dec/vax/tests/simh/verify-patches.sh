@@ -48,10 +48,19 @@
 #                  0006 specifically -- being the LAST patch in the chain, 0006 has no downstream
 #                  patch whose context would break if it were silently dropped or neutered, so
 #                  nothing about patch-apply mechanics alone can ever catch it.
+#   5. SILENCE-QIO -- pcjsvax-62a's WriteIO trace guard neutered the same way (`if (sim_deb)` ->
+#                  `if (0 && sim_deb)` on the QIOW call in ReadIO/WriteIO's WriteIO, not ReadIO).
+#                  Applies clean, builds clean, EHKAA PASSes -- and devtrace-tally.py must FAIL, by
+#                  name, on QBIOP WRITE and QBCQM WRITE. WriteIO is the single choke point both the
+#                  Qbus I/O-page branch and the Qbus memory-window (CQM) branch share for writes
+#                  (same as 0006's ReadReg/WriteReg being the single choke point for eight
+#                  register-space families at once), so neutering this one guard silently kills
+#                  both new families' write side at once -- measured, not assumed: see
+#                  devtrace-tally.py's module docstring for the QBIOP/QBCQM design rationale.
 # Each case is independently asserted; the run fails (non-zero exit) if ANY case is silently
 # tolerated (patch applies when it shouldn't, or the failure isn't attributed to the mutated
 # patch). This assertion does not get cheaper as the mutation count grows -- it is a fixed set of
-# four known failure modes, each checked in full, every run.
+# five known failure modes, each checked in full, every run.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -174,7 +183,7 @@ run_selfcheck() {
         exit 1
     fi
 
-    echo "=== mutation 1/4: DROP (remove $(basename "${PATCHES[$victim_idx]}") from the chain) ==="
+    echo "=== mutation 1/5: DROP (remove $(basename "${PATCHES[$victim_idx]}") from the chain) ==="
     local -a dropped=()
     for i in "${!PATCHES[@]}"; do
         [[ $i -eq $victim_idx ]] && continue
@@ -193,7 +202,7 @@ run_selfcheck() {
     fi
     echo
 
-    echo "=== mutation 2/4: REORDER (swap $(basename "${PATCHES[$victim_idx]}") and the patch after it) ==="
+    echo "=== mutation 2/5: REORDER (swap $(basename "${PATCHES[$victim_idx]}") and the patch after it) ==="
     local -a reordered=("${PATCHES[@]}")
     if [[ $((victim_idx + 1)) -lt "${#PATCHES[@]}" ]]; then
         local tmp="${reordered[$victim_idx]}"
@@ -208,7 +217,7 @@ run_selfcheck() {
     fi
     echo
 
-    echo "=== mutation 3/4: CORRUPT (perturb a context line inside $(basename "${PATCHES[$victim_idx]}")) ==="
+    echo "=== mutation 3/5: CORRUPT (perturb a context line inside $(basename "${PATCHES[$victim_idx]}")) ==="
     mkdir -p "$scratch/corrupt-patches"
     local corrupted="$scratch/corrupt-patches/$(basename "${PATCHES[$victim_idx]}")"
     # Flip one character in a context line (a line starting with a single space) so the patch's
@@ -244,7 +253,7 @@ run_selfcheck() {
     fi
     echo
 
-    echo "=== mutation 4/4: SILENCE (neuter 0006's WriteReg trace guard -- applies clean, builds"
+    echo "=== mutation 4/5: SILENCE (neuter 0006's WriteReg trace guard -- applies clean, builds"
     echo "    clean, EHKAA PASSes; must be caught by devtrace-tally.py, not by patch mechanics) ==="
     local victim6_idx=-1
     for i in "${!PATCHES[@]}"; do
@@ -326,11 +335,88 @@ PYEOF
     fi
     echo
 
-    if [[ $failures -ne 0 ]]; then
-        echo "SELFCHECK FAILED: $failures/4 mutation(s) were not caught (coverage hole)." >&2
+    echo "=== mutation 5/5: SILENCE-QIO (neuter pcjsvax-62a's WriteIO trace guard -- applies clean,"
+    echo "    builds clean, EHKAA PASSes; must be caught by devtrace-tally.py, not by patch mechanics) ==="
+    mkdir -p "$scratch/silence-qio-patches"
+    local silenced_qio="$scratch/silence-qio-patches/$(basename "${PATCHES[$victim6_idx]}")"
+    # Neuter exactly the WriteIO trace guard (the write-side choke point both new Qbus-I/O-page and
+    # CQM families share) -- a side channel with no bearing on instruction semantics, so nothing
+    # upstream of devtrace-tally.py can see this mutation at all.
+    python3 - "${PATCHES[$victim6_idx]}" "$silenced_qio" <<'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "r", newline="") as f:
+    content = f.read()
+old2 = '+if (sim_deb)                                             /* pcjs-vax: Qbus I/O-page/CQM write trace */'
+n = content.count(old2)
+if n != 2:
+    sys.exit("FATAL(selfcheck): expected exactly two QIOW trace guard lines (WriteIO + WriteIOU), found %d" % n)
+new2 = '+if (0 && sim_deb)                                        /* pcjs-vax: Qbus I/O-page/CQM write trace */'
+# Neuter only the FIRST occurrence (WriteIO, the aligned-write choke point) -- WriteIOU's stays
+# live, proving the mutation targets exactly one function, not a blanket string replace.
+idx = content.find(old2)
+content = content[:idx] + new2 + content[idx + len(old2):]
+with open(dst, "w", newline="") as f:
+    f.write(content)
+PYEOF
+    if cmp -s "${PATCHES[$victim6_idx]}" "$silenced_qio"; then
+        echo "FATAL(selfcheck): silence-qio step was a no-op." >&2
         exit 1
     fi
-    echo "SELFCHECK PASSED: all 4/4 mutations caught and correctly attributed."
+
+    local -a silenced_qio_list=()
+    for i in "${!PATCHES[@]}"; do
+        if [[ $i -eq $victim6_idx ]]; then
+            silenced_qio_list+=("$silenced_qio")
+        else
+            silenced_qio_list+=("${PATCHES[$i]}")
+        fi
+    done
+
+    if ! apply_chain "$scratch/silence-qio" "${silenced_qio_list[@]}" 2>"$scratch/silence-qio-apply.err"; then
+        echo "FATAL(selfcheck): the silenced-qio 0006 variant did not even APPLY cleanly -- the point" >&2
+        echo "                  of this mutation is that it must reach BUILD+RUN to be tested." >&2
+        cat "$scratch/silence-qio-apply.err" >&2
+        exit 1
+    fi
+    echo "silenced-qio variant applied cleanly (expected -- the mutation is semantic, not textual)"
+
+    local silence_qio_buildlog="$scratch/silence-qio-build.log"
+    if ! (cd "$scratch/silence-qio" && make NOASYNCH=1 NONETWORK=1 NOVIDEO=1 -j"$(nproc 2>/dev/null || echo 4)" vax) >"$silence_qio_buildlog" 2>&1; then
+        echo "FATAL(selfcheck): silenced-qio variant failed to build -- cannot test the tally against it." >&2
+        tail -60 "$silence_qio_buildlog" >&2
+        exit 1
+    fi
+    if ! grep -q 'PASSED - MicroVAX 3900 Hardware Core Instruction test EHKAA' "$silence_qio_buildlog"; then
+        echo "FATAL(selfcheck): silenced-qio variant did not report EHKAA PASS -- cannot test the tally against it." >&2
+        exit 1
+    fi
+    echo "silenced-qio variant applies, builds, and passes EHKAA -- exactly as demonstrated: this"
+    echo "mutation is invisible to every OTHER gate in this pipeline."
+
+    local tally_qio_out="$scratch/silence-qio-tally.out"
+    if python3 "$HERE/devtrace-tally.py" --simh "$scratch/silence-qio/BIN/microvax3900" --src "$scratch/silence-qio" >"$tally_qio_out" 2>&1; then
+        echo "COVERAGE HOLE: devtrace-tally.py PASSED against the silenced-qio (WriteIO-neutered) variant. Not caught." >&2
+        cat "$tally_qio_out" >&2
+        failures=$((failures + 1))
+    else
+        if grep -q "QBIOP WRITE" "$tally_qio_out" && grep -q "QBCQM WRITE" "$tally_qio_out"; then
+            echo "caught: devtrace-tally.py FAILED against the silenced-qio variant and named exactly"
+            echo "        the two families the mutation kills (QBIOP/QBCQM WRITE). Good."
+        else
+            echo "caught: devtrace-tally.py FAILED, but did not name both expected families" >&2
+            echo "        (see $tally_qio_out). Reporting fail-open on attribution." >&2
+            cat "$tally_qio_out" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+    echo
+
+    if [[ $failures -ne 0 ]]; then
+        echo "SELFCHECK FAILED: $failures/5 mutation(s) were not caught (coverage hole)." >&2
+        exit 1
+    fi
+    echo "SELFCHECK PASSED: all 5/5 mutations caught and correctly attributed."
     rm -rf "$scratch"
 }
 

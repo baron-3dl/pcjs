@@ -25,11 +25,15 @@
 #         is simulator-internal and appears in NO existing log, so without this the EHKAA
 #         exception sequence cannot be graded at all.
 #   0006  (here) adds the DEVTRACE debug category (IPRR/IPRW at ReadIPR/WriteIPR, REGR/REGW at
-#         ReadReg/WriteReg) and extends 0005's EXCTRACE with an INTD record at the IE_INT call
+#         ReadReg/WriteReg, and -- as extended by pcjsvax-62a -- QIOR/QIOW at ReadIO/WriteIO/
+#         ReadIOU/WriteIOU) and extends 0005's EXCTRACE with an INTD record at the IE_INT call
 #         site in sim_instr()'s dispatch loop -- one machine-readable line per KA655 device
-#         register access (console UART, TODR, SSC timers, CMCTL, KA, CQBIC/CQMAP/CQIPC/CDG) and
-#         per delivered interrupt (vector + IPL), which is the oracle the device-emulation items
-#         after the EHKAA milestone grade against.
+#         register access (console UART, TODR, SSC timers, CMCTL, KA, CQBIC/CQMAP/CQIPC/CDG,
+#         Qbus I/O-page and Qbus-memory-window traffic) and per delivered interrupt (vector + IPL),
+#         which is the oracle the device-emulation items after the EHKAA milestone grade against.
+#         NOTE: INTD only observes DELIVERED interrupts -- SET_INT/CLR_INT are macros with no call
+#         site to hook, so a masked interrupt REQUEST produces no trace record at all until (if
+#         ever) it is later delivered. See tests/simh/README.md's "CAVEAT" section.
 #
 # None changes any instruction semantics; the simulator's own EHKAA self-test still passes,
 # which the build runs automatically.
