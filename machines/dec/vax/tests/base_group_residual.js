@@ -20,13 +20,17 @@
  * uses to decide whether this CPU implements an opcode at all, and prints the set difference.  No
  * hand-maintained mnemonic list lives here or anywhere else in this file.
  *
- * As of pcjsvax-515, the residual is exactly the 12 opcodes documented in strq.js's file header
- * as coordination carve-outs -- MTPR/MFPR (pcjsvax-e49) and CHMK/CHME/CHMS/CHMU/BPT/XFC/REI/
- * LDPCTX/SVPCTX/HALT (all need SCB exception dispatch and/or the privileged IPR register file,
- * also pcjsvax-e49's).  `--check-carveouts` asserts the residual is EXACTLY that set and exits
- * non-zero on any drift (an opcode silently added or removed from the carve-out list without
- * updating both this script and strq.js's header is exactly the kind of drift this script exists
- * to catch).
+ * As of pcjsvax-515 the residual was exactly the 12 opcodes documented in strq.js's file header as
+ * coordination carve-outs -- MTPR/MFPR and CHMK/CHME/CHMS/CHMU/BPT/XFC/REI/LDPCTX/SVPCTX/HALT, all
+ * of which needed SCB exception dispatch and/or the privileged IPR register file.  pcjsvax-e49
+ * delivered both, exc.js wired up all twelve, and **the residual is now empty**: the Base
+ * Instruction Group is 242/242.
+ *
+ * `--check-carveouts` asserts the residual is EXACTLY `KNOWN_CARVEOUTS` and exits non-zero on any
+ * drift in either direction -- an opcode that stops being implemented, or one that starts being
+ * implemented without this list being updated.  Both directions have now fired for real: the list
+ * went stale the moment exc.js closed the twelve, and this script failed until it was emptied.
+ * That is the script working, not the script being wrong; leave the check armed.
  *
  * Usage:
  *     node machines/dec/vax/tests/base_group_residual.js
@@ -42,15 +46,16 @@ import { IMPLEMENTED as STRQ_IMPLEMENTED } from "../modules/v2/strq.js";
 import { IMPLEMENTED as EXC_IMPLEMENTED } from "../modules/v2/exc.js";
 
 /*
- * The known, documented coordination carve-outs as of pcjsvax-515 -- see strq.js's file header
- * for the full reasoning behind each.  Not a hand-maintained "done" list; used only to assert the
- * computed residual hasn't silently grown or shrunk.
+ * The known, documented coordination carve-outs.  EMPTY as of pcjsvax-e49, which delivered the SCB
+ * exception dispatch and the privileged IPR register file the last twelve were waiting on (MTPR/
+ * MFPR, CHMK/CHME/CHMS/CHMU, BPT/XFC/REI/LDPCTX/SVPCTX/HALT -- see exc.js).  Not a hand-maintained
+ * "done" list; used only to assert the computed residual hasn't silently grown or shrunk.
+ *
+ * Note what is NOT here and must never be added: packed-decimal/CIS.  Those opcodes are IG_PACKD/
+ * IG_EMONL, not Base Group, so they never enter this residual at all -- and per
+ * tests/cis_group_scope.js this machine must not implement them.
  */
-const KNOWN_CARVEOUTS = new Set([
-    "MTPR", "MFPR",                                    // pcjsvax-e49: IPR register file
-    "CHMK", "CHME", "CHMS", "CHMU",                     // pcjsvax-e49: SCB exception dispatch
-    "BPT", "XFC", "REI", "LDPCTX", "SVPCTX", "HALT"     // pcjsvax-e49: SCB dispatch and/or IPRs
-]);
+const KNOWN_CARVEOUTS = new Set([]);
 
 const DROM_STRIDE = 7;
 
@@ -125,8 +130,10 @@ function main()
             if (unexpected.length) console.error(`UNEXPECTED residual opcodes (not a known carve-out): ${unexpected.join(", ")}`);
             if (missing.length) console.error(`MISSING carve-outs (documented but not actually residual): ${missing.join(", ")}`);
             process.exitCode = 1;
-        } else {
+        } else if (KNOWN_CARVEOUTS.size) {
             console.log(`--check-carveouts: residual matches the ${KNOWN_CARVEOUTS.size} documented carve-outs exactly.`);
+        } else {
+            console.log("--check-carveouts: residual is empty, as documented -- the Base Instruction Group is complete.");
         }
     }
 
