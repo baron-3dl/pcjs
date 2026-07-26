@@ -97,6 +97,8 @@
  * /writeWord()/writeLong() to do the two-lookup stitch above (or reproduce Read()/Write()'s wl/wh
  * split exactly, including which side's fault wins if one of the two longwords is undecoded -- not
  * measured here) rather than inherit this file's now-corrected claim that no register ever needs it.
+ *
+ * TRACKED AS pcjsvax-855 -- read that item before decoding any SSC register adjacent to another.
  */
 
 import { VAX } from "./defines.js";
