@@ -11,9 +11,17 @@
 # they silently stop applying -- or silently stop being ALL applied, see the KNOWN TRAP below --
 # the oracle rots and nothing downstream can be trusted, no matter how green it looks.
 #
+# Since pcjsvax-e9a (patch 0006), a successful build is ALSO put to work as its own oracle: after
+# EHKAA passes, this script boots ka655x.bin to the console ">>>" prompt under the freshly built
+# binary and runs devtrace-tally.py against the resulting DEVTRACE/EXCTRACE debug log, asserting
+# every KA655 device-register family and the delivered-interrupt trace the device-emulation items
+# after EHKAA depend on actually produced events (see devtrace-tally.py's own header for why: a
+# patch that applies clean, builds clean and passes EHKAA can STILL silently produce zero events
+# for an entire instrumentation family, and nothing else in this pipeline would notice).
+#
 # Usage:
-#     machines/dec/vax/tests/simh/verify-patches.sh              # fresh clone, apply, build, assert PASS
-#     machines/dec/vax/tests/simh/verify-patches.sh --selfcheck  # mutation suite (see below); no build
+#     machines/dec/vax/tests/simh/verify-patches.sh              # fresh clone, apply, build, assert PASS + devtrace tally
+#     machines/dec/vax/tests/simh/verify-patches.sh --selfcheck  # mutation suite (see below)
 #
 # Env:
 #     PCJS_VAX_REPO   the pcjs-vax work repo (holds patch 0001 and the vendored open-simh). Defaults
@@ -29,13 +37,21 @@
 # stale.
 #
 # --selfcheck proves the failure modes are actually caught, by execution, not by inspection:
-#   1. DROP    -- clone + apply with one patch removed from the list.       Must fail, must name it.
-#   2. REORDER -- clone + apply with two adjacent patches swapped.          Must fail, must name it.
-#   3. CORRUPT -- clone + apply with one patch's context line perturbed.    Must fail, must name it.
+#   1. DROP     -- clone + apply with one patch removed from the list.      Must fail, must name it.
+#   2. REORDER  -- clone + apply with two adjacent patches swapped.         Must fail, must name it.
+#   3. CORRUPT  -- clone + apply with one patch's context line perturbed.   Must fail, must name it.
+#   4. SILENCE  -- 0006's WriteReg trace guard neutered (`if (sim_deb)` -> `if (0 && sim_deb)`).
+#                  Applies clean, builds clean, EHKAA PASSes -- and devtrace-tally.py must FAIL,
+#                  by name, on CMCTL/KA/CQBIC/SSC-T0/T1 WRITE. Unlike 1-3, this is not a patch-APPLY
+#                  failure mode: it proves the shipped instrumentation itself is graded, not just
+#                  that the patch text lands. It also closes the gap mutations 1-3 leave open for
+#                  0006 specifically -- being the LAST patch in the chain, 0006 has no downstream
+#                  patch whose context would break if it were silently dropped or neutered, so
+#                  nothing about patch-apply mechanics alone can ever catch it.
 # Each case is independently asserted; the run fails (non-zero exit) if ANY case is silently
 # tolerated (patch applies when it shouldn't, or the failure isn't attributed to the mutated
 # patch). This assertion does not get cheaper as the mutation count grows -- it is a fixed set of
-# three known failure modes, each checked in full, every run.
+# four known failure modes, each checked in full, every run.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -126,6 +142,17 @@ run_build() {
         exit 1
     fi
     echo "PASS: SIMH's own EHKAA hardware-core self-test reports PASS."
+
+    echo
+    echo "booting ka655x.bin to >>> under the patched binary and tallying DEVTRACE/EXCTRACE events"
+    echo "for every KA655 device-register family and delivered interrupt (pcjsvax-e9a's own gate"
+    echo "on its own instrumentation -- a clean apply/build/EHKAA-PASS does not prove 0006 itself"
+    echo "still produces events; see devtrace-tally.py)..."
+    if ! python3 "$HERE/devtrace-tally.py" --simh "$dest/BIN/microvax3900" --src "$dest"; then
+        echo "FATAL: device-register/interrupt trace did not reach every required family. See above." >&2
+        exit 1
+    fi
+
     echo "binary: $dest/BIN/microvax3900"
 }
 
@@ -147,7 +174,7 @@ run_selfcheck() {
         exit 1
     fi
 
-    echo "=== mutation 1/3: DROP (remove $(basename "${PATCHES[$victim_idx]}") from the chain) ==="
+    echo "=== mutation 1/4: DROP (remove $(basename "${PATCHES[$victim_idx]}") from the chain) ==="
     local -a dropped=()
     for i in "${!PATCHES[@]}"; do
         [[ $i -eq $victim_idx ]] && continue
@@ -166,7 +193,7 @@ run_selfcheck() {
     fi
     echo
 
-    echo "=== mutation 2/3: REORDER (swap $(basename "${PATCHES[$victim_idx]}") and the patch after it) ==="
+    echo "=== mutation 2/4: REORDER (swap $(basename "${PATCHES[$victim_idx]}") and the patch after it) ==="
     local -a reordered=("${PATCHES[@]}")
     if [[ $((victim_idx + 1)) -lt "${#PATCHES[@]}" ]]; then
         local tmp="${reordered[$victim_idx]}"
@@ -181,7 +208,7 @@ run_selfcheck() {
     fi
     echo
 
-    echo "=== mutation 3/3: CORRUPT (perturb a context line inside $(basename "${PATCHES[$victim_idx]}")) ==="
+    echo "=== mutation 3/4: CORRUPT (perturb a context line inside $(basename "${PATCHES[$victim_idx]}")) ==="
     mkdir -p "$scratch/corrupt-patches"
     local corrupted="$scratch/corrupt-patches/$(basename "${PATCHES[$victim_idx]}")"
     # Flip one character in a context line (a line starting with a single space) so the patch's
@@ -217,11 +244,93 @@ run_selfcheck() {
     fi
     echo
 
-    if [[ $failures -ne 0 ]]; then
-        echo "SELFCHECK FAILED: $failures/3 mutation(s) were not caught (coverage hole)." >&2
+    echo "=== mutation 4/4: SILENCE (neuter 0006's WriteReg trace guard -- applies clean, builds"
+    echo "    clean, EHKAA PASSes; must be caught by devtrace-tally.py, not by patch mechanics) ==="
+    local victim6_idx=-1
+    for i in "${!PATCHES[@]}"; do
+        [[ "$(basename "${PATCHES[$i]}")" == 0006-* ]] && victim6_idx=$i
+    done
+    if [[ $victim6_idx -lt 0 ]]; then
+        echo "FATAL(selfcheck): could not locate 0006-* in the derived patch list to mutate against." >&2
         exit 1
     fi
-    echo "SELFCHECK PASSED: all 3/3 mutations caught and correctly attributed."
+
+    mkdir -p "$scratch/silence-patches"
+    local silenced="$scratch/silence-patches/$(basename "${PATCHES[$victim6_idx]}")"
+    # Neuter exactly the WriteReg trace guard -- a side channel with no bearing on instruction
+    # semantics, so nothing upstream of devtrace-tally.py can see this mutation at all.
+    python3 - "${PATCHES[$victim6_idx]}" "$silenced" <<'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "r", newline="") as f:
+    content = f.read()
+old = "+        if (sim_deb)                                    /* pcjs-vax: register-space write trace */"
+new = "+        if (0 && sim_deb)                              /* pcjs-vax: register-space write trace */"
+n = content.count(old)
+if n != 1:
+    sys.exit("FATAL(selfcheck): expected exactly one WriteReg trace guard line to neuter, found %d" % n)
+with open(dst, "w", newline="") as f:
+    f.write(content.replace(old, new))
+PYEOF
+    if cmp -s "${PATCHES[$victim6_idx]}" "$silenced"; then
+        echo "FATAL(selfcheck): silence step was a no-op." >&2
+        exit 1
+    fi
+
+    local -a silenced_list=()
+    for i in "${!PATCHES[@]}"; do
+        if [[ $i -eq $victim6_idx ]]; then
+            silenced_list+=("$silenced")
+        else
+            silenced_list+=("${PATCHES[$i]}")
+        fi
+    done
+
+    if ! apply_chain "$scratch/silence" "${silenced_list[@]}" 2>"$scratch/silence-apply.err"; then
+        echo "FATAL(selfcheck): the silenced 0006 variant did not even APPLY cleanly -- the point" >&2
+        echo "                  of this mutation is that it must reach BUILD+RUN to be tested." >&2
+        cat "$scratch/silence-apply.err" >&2
+        exit 1
+    fi
+    echo "silenced variant applied cleanly (expected -- the mutation is semantic, not textual)"
+
+    local silence_buildlog="$scratch/silence-build.log"
+    if ! (cd "$scratch/silence" && make NOASYNCH=1 NONETWORK=1 NOVIDEO=1 -j"$(nproc 2>/dev/null || echo 4)" vax) >"$silence_buildlog" 2>&1; then
+        echo "FATAL(selfcheck): silenced variant failed to build -- cannot test the tally against it." >&2
+        tail -60 "$silence_buildlog" >&2
+        exit 1
+    fi
+    if ! grep -q 'PASSED - MicroVAX 3900 Hardware Core Instruction test EHKAA' "$silence_buildlog"; then
+        echo "FATAL(selfcheck): silenced variant did not report EHKAA PASS -- cannot test the tally against it." >&2
+        exit 1
+    fi
+    echo "silenced variant applies, builds, and passes EHKAA -- exactly as demonstrated: this"
+    echo "mutation is invisible to every OTHER gate in this pipeline."
+
+    local tally_out="$scratch/silence-tally.out"
+    if python3 "$HERE/devtrace-tally.py" --simh "$scratch/silence/BIN/microvax3900" --src "$scratch/silence" >"$tally_out" 2>&1; then
+        echo "COVERAGE HOLE: devtrace-tally.py PASSED against the silenced (REGW-neutered) variant. Not caught." >&2
+        cat "$tally_out" >&2
+        failures=$((failures + 1))
+    else
+        if grep -q "CMCTL WRITE" "$tally_out" && grep -q "KA WRITE" "$tally_out" \
+            && grep -q "CQBIC WRITE" "$tally_out" && grep -q "SSC-T0/T1 WRITE" "$tally_out"; then
+            echo "caught: devtrace-tally.py FAILED against the silenced variant and named exactly"
+            echo "        the four families the mutation kills (CMCTL/KA/CQBIC/SSC-T0/T1 WRITE). Good."
+        else
+            echo "caught: devtrace-tally.py FAILED, but did not name all four expected families" >&2
+            echo "        (see $tally_out). Reporting fail-open on attribution." >&2
+            cat "$tally_out" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+    echo
+
+    if [[ $failures -ne 0 ]]; then
+        echo "SELFCHECK FAILED: $failures/4 mutation(s) were not caught (coverage hole)." >&2
+        exit 1
+    fi
+    echo "SELFCHECK PASSED: all 4/4 mutations caught and correctly attributed."
     rm -rf "$scratch"
 }
 

@@ -24,6 +24,12 @@
 #         which is what excdiff.js replays.  The state a dispatch depends on (STK[], IS, SCBB)
 #         is simulator-internal and appears in NO existing log, so without this the EHKAA
 #         exception sequence cannot be graded at all.
+#   0006  (here) adds the DEVTRACE debug category (IPRR/IPRW at ReadIPR/WriteIPR, REGR/REGW at
+#         ReadReg/WriteReg) and extends 0005's EXCTRACE with an INTD record at the IE_INT call
+#         site in sim_instr()'s dispatch loop -- one machine-readable line per KA655 device
+#         register access (console UART, TODR, SSC timers, CMCTL, KA, CQBIC/CQMAP/CQIPC/CDG) and
+#         per delivered interrupt (vector + IPL), which is the oracle the device-emulation items
+#         after the EHKAA milestone grade against.
 #
 # None changes any instruction semantics; the simulator's own EHKAA self-test still passes,
 # which the build runs automatically.
@@ -55,8 +61,9 @@ PATCH2="$HERE/0002-inst-history-decode-replay.patch"
 PATCH3="$HERE/0003-mmu-differential-support.patch"
 PATCH4="$HERE/0004-fp-differential-support.patch"
 PATCH5="$HERE/0005-exception-differential-support.patch"
+PATCH6="$HERE/0006-device-register-trace.patch"
 
-for f in "$SRC" "$PATCH1" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5"; do
+for f in "$SRC" "$PATCH1" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" "$PATCH6"; do
     if [[ ! -e "$f" ]]; then
         echo "FATAL: required input not found: $f" >&2
         echo "       Set \$PCJS_VAX_REPO to the pcjs-vax work repo if it is not beside this one." >&2
@@ -89,13 +96,14 @@ else
         exit 1
     fi
     cd "$DEST/open-simh"
-    git checkout -- VAX/vax_cpu.c VAX/vax_defs.h VAX/vax_mmu.c VAX/vax_mmu.h 2>/dev/null || true
+    git checkout -- VAX/vax_cpu.c VAX/vax_defs.h VAX/vax_mmu.c VAX/vax_mmu.h VAX/vax_sysdev.c 2>/dev/null || true
     git apply "$PATCH1"
     git apply "$PATCH2"
     git apply "$PATCH3"
     git apply "$PATCH4"
     git apply "$PATCH5"
-    echo "applied 0001, 0002, 0003, 0004 and 0005"
+    git apply "$PATCH6"
+    echo "applied 0001, 0002, 0003, 0004, 0005 and 0006"
 fi
 
 cd "$DEST/open-simh"
