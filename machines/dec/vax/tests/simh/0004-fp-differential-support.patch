@@ -1,0 +1,381 @@
+diff --git a/VAX/vax_cpu.c b/VAX/vax_cpu.c
+index 49a7e7d..d52b4b4 100644
+--- a/VAX/vax_cpu.c
++++ b/VAX/vax_cpu.c
+@@ -353,6 +353,7 @@ t_stat cpu_set_hist (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+ t_stat cpu_show_hist (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
+ t_stat cpu_show_virt (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
+ t_stat cpu_show_mmuop (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
++t_stat cpu_show_fpop (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
+ t_stat cpu_set_mmutrace (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+ t_stat cpu_set_idle (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+ t_stat cpu_show_idle (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
+@@ -471,6 +472,8 @@ MTAB cpu_mod[] = {
+     /* pcjs-vax MMU differential-test support; see machines/dec/vax/tests/simh/README.md */
+     { MTAB_XTD|MTAB_VDV|MTAB_NMO|MTAB_SHP|MTAB_NC, 0, "MMUOP", NULL,
+       NULL, &cpu_show_mmuop, NULL, "perform one MMU op: op:va:lnt:mode[:val]" },
++    { MTAB_XTD|MTAB_VDV|MTAB_NMO|MTAB_SHP|MTAB_NC, 0, "FPOP", NULL,
++      NULL, &cpu_show_fpop, NULL, "execute one F/D/G floating instruction" },
+     { MTAB_XTD|MTAB_VDV|MTAB_NC, 1, NULL, "MMUTRACE",
+       &cpu_set_mmutrace, NULL, NULL, "log every MMU operation to a file" },
+     { MTAB_XTD|MTAB_VDV, 0, NULL, "NOMMUTRACE",
+@@ -3685,6 +3688,359 @@ if (pcjs_mmu_log == NULL)
+ return SCPE_OK;
+ }
+ 
++/* pcjs-vax floating point differential-test support
++   -------------------------------------------------
++   SHOW CPU FPOP=opc:psl:cc:spec:rn:va:d0:d1:n:o0:o1:...    (hex, colon separated
++   -- SHOW splits its argument on commas, so colons it is)
++
++   Executes exactly ONE already-decoded F_floating / D_floating / G_floating
++   instruction and prints one machine-readable line, so that
++   machines/dec/vax/tests/fpadiff.js can grade a JavaScript port of vax_fpa.c
++   against this simulator over inputs a running program would essentially never
++   produce: denormals, reserved operands, exact rounding boundaries, and the
++   exponent extremes that fault.
++
++   What runs is the case body from sim_instr()'s dispatch switch, copied
++   VERBATIM below, so the arithmetic is the real op_* routines from vax_fpa.c,
++   the condition codes are the real macros from vax_defs.h, and the store is the
++   real WRITE_B/WRITE_W/WRITE_L/WRITE_Q macros from the top of this file --
++   including WRITE_Q's Test(va+7) probe, which is what makes a quadword store
++   that straddles into an inaccessible page leave nothing behind.  The only
++   thing transcribed is which case body belongs to which opcode.
++
++   Inputs:  opc     opcode; F/D/G only, anything else is SCPE_ARG
++            psl     ONLY PSW_FU and PSW_IV are taken from it -- the rest of the
++                    PSL, including the current mode that decides `acc`, is left
++                    alone so a caller cannot construct an unreasonable PSL
++            cc      incoming condition codes (CC_IIZP_FP preserves C)
++            spec    last specifier byte: the destination selector the WRITE_*
++                    macros test with `spec > (GRN | nPC)`
++            rn      destination register number
++            va      destination virtual address, for a memory destination
++            d0,d1   initial R[rn] and R[rn+1].  A MEMORY destination is NOT
++                    initialized here; the caller pre-loads it with DEPOSIT,
++                    which is physical, so that a destination deliberately made
++                    inaccessible can still be given a known prior value.
++            n,o...  the resolved operand queue, in specifier order
++
++   Output:  FPOP <opc> ok <cc> <trpirq> <R[rn]> <R[rn+1]>
++            FPOP <opc> abort <abortval> <p1> <p2>
++
++   trpirq is reported because floating overflow, underflow and divide by zero
++   are FAULTS (they abort) while the integer overflow from CVTF/D/G to B/W/L is
++   a TRAP: the instruction completes, stores its result, and only requests the
++   trap -- and only when PSL<IV> is set.  A test that looked only at aborts
++   could not tell those apart.  p1/p2 are meaningful only for the arithmetic
++   abort (-SCB_ARITH), which is the only one of these that sets them.
++
++   Like SHOW CPU MMUOP=, this owns a setjmp of its own, because the FP routines
++   abort through ABORT() and there is no sim_instr frame to land in when they
++   are called from the console.  PSL and trpirq are saved and restored.
++
++   Nothing here changes any instruction semantics. */
++
++t_stat cpu_show_fpop (FILE *of, UNIT *uptr, int32 val, CONST void *desc)
++{
++CONST char *cptr = (CONST char *) desc;
++static volatile int32 f_opc, f_rn;
++static volatile int32 sv_psl, sv_trpirq;
++static FILE * volatile f_of;
++int32 opnd[OPND_SIZE];
++int32 spec, rn, cc, r = 0, rh = 0, flg = 0, mstat = 0, acc, opc, nopnd;
++uint32 va;
++unsigned long fld[10 + OPND_SIZE];
++int nfld = 0, i, abortval;
++const char *p;
++char *ep;
++
++if (cptr == NULL)
++    return SCPE_ARG;
++for (p = cptr; (*p != 0) && (nfld < (int) (sizeof (fld) / sizeof (fld[0]))); ) {
++    fld[nfld] = strtoul (p, &ep, 16);                   /* every field is hex */
++    if (ep == p)
++        return SCPE_ARG;
++    nfld++;
++    p = ep;
++    if (*p != ':')
++        break;
++    p++;
++    }
++if (nfld < 9)
++    return SCPE_ARG;
++opc = (int32) fld[0];
++cc = ((int32) fld[2]) & CC_MASK;
++spec = (int32) fld[3];
++rn = ((int32) fld[4]) & 0xF;
++va = (uint32) fld[5];
++nopnd = (int32) fld[8];
++if ((nopnd < 0) || (nopnd > OPND_SIZE) || (nfld < (9 + nopnd)))
++    return SCPE_ARG;
++for (i = 0; i < OPND_SIZE; i++)
++    opnd[i] = 0;
++for (i = 0; i < nopnd; i++)
++    opnd[i] = (int32) fld[9 + i];
++f_opc = opc;
++f_rn = rn;
++f_of = of;
++sv_psl = PSL;
++sv_trpirq = trpirq;
++PSL = (PSL & ~(PSW_FU | PSW_IV)) | (((int32) fld[1]) & (PSW_FU | PSW_IV));
++trpirq = 0;
++R[rn] = (int32) fld[6];
++R[(rn + 1) & 0xF] = (int32) fld[7];
++set_map_reg ();                                         /* refresh dynamic map regs */
++acc = ACC_MASK (PSL_GETCUR (PSL));
++
++abortval = setjmp (save_env);                           /* set abort handler */
++if (abortval != 0) {
++    fprintf ((FILE *) f_of, "FPOP %03X abort %d %08X %08X\n",
++        f_opc, abortval, p1, p2);
++    PSL = sv_psl;
++    trpirq = sv_trpirq;
++    return SCPE_OK;
++    }
++
++switch (opc) {
++
++/* ---- begin verbatim copy of the floating point cases from sim_instr() ---- */
++
++    case TSTF: case TSTD:
++        r = op_movfd (op0);
++        CC_IIZZ_FP (r);
++        break;
++
++    case TSTG:
++        r = op_movg (op0);
++        CC_IIZZ_FP (r);
++        break;
++
++    case MOVF:
++        r = op_movfd (op0);
++        WRITE_L (r);
++        CC_IIZP_FP (r);
++        break;
++
++    case MOVD:
++        if ((r = op_movfd (op0)) == 0)
++            op1 = 0;
++        WRITE_Q (r, op1);
++        CC_IIZP_FP (r);
++        break;
++
++    case MOVG:
++        if ((r = op_movg (op0)) == 0)
++            op1 = 0;
++        WRITE_Q (r, op1);
++        CC_IIZP_FP (r);
++        break;
++
++    case MNEGF:
++        r = op_mnegfd (op0);
++        WRITE_L (r);
++        CC_IIZZ_FP (r);
++        break;
++
++    case MNEGD:
++        if ((r = op_mnegfd (op0)) == 0)
++            op1 = 0;
++        WRITE_Q (r, op1);
++        CC_IIZZ_FP (r);
++        break;
++
++    case MNEGG:
++        if ((r = op_mnegg (op0)) == 0)
++            op1 = 0;
++        WRITE_Q (r, op1);
++        CC_IIZZ_FP (r);
++        break;
++
++    case CMPF:
++        cc = op_cmpfd (op0, 0, op1, 0);
++        break;
++
++    case CMPD:
++        cc = op_cmpfd (op0, op1, op2, op3);
++        break;
++
++    case CMPG:
++        cc = op_cmpg (op0, op1, op2, op3);
++        break;
++
++    case CVTBF:
++        r = op_cvtifdg (SXTB (op0), NULL, opc);
++        WRITE_L (r);
++        CC_IIZZ_FP (r);
++        break;
++
++    case CVTWF:
++        r = op_cvtifdg (SXTW (op0), NULL, opc);
++        WRITE_L (r);
++        CC_IIZZ_FP (r);
++        break;
++
++    case CVTLF:
++        r = op_cvtifdg (op0, NULL, opc);
++        WRITE_L (r);
++        CC_IIZZ_FP (r);
++        break;
++
++    case CVTBD: case CVTBG:
++        r = op_cvtifdg (SXTB (op0), &rh, opc);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++    case CVTWD: case CVTWG:
++        r = op_cvtifdg (SXTW (op0), &rh, opc);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++    case CVTLD: case CVTLG:
++        r = op_cvtifdg (op0, &rh, opc);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++    case CVTFB: case CVTDB: case CVTGB:
++        r = op_cvtfdgi (opnd, &flg, opc) & BMASK;
++        WRITE_B (r);
++        CC_IIZZ_B (r);
++        if (flg) {
++            V_INTOV;
++            }
++        break;
++
++    case CVTFW: case CVTDW: case CVTGW:
++        r = op_cvtfdgi (opnd, &flg, opc) & WMASK;
++        WRITE_W (r);
++        CC_IIZZ_W (r);
++        if (flg) {
++            V_INTOV;
++            }
++        break;
++
++    case CVTFL: case CVTDL: case CVTGL:
++    case CVTRFL: case CVTRDL: case CVTRGL:
++        r = op_cvtfdgi (opnd, &flg, opc) & LMASK;
++        WRITE_L (r);
++        CC_IIZZ_L (r);
++        if (flg) {
++            V_INTOV;
++            }
++        break;
++
++    case CVTFD:
++        r = op_movfd (op0);
++        WRITE_Q (r, 0);
++        CC_IIZZ_FP (r);
++        break;
++
++    case CVTDF:
++        r = op_cvtdf (opnd);
++        WRITE_L (r);
++        CC_IIZZ_FP (r);
++        break;
++
++    case CVTFG:
++        r = op_cvtfg (opnd, &rh);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++    case CVTGF:
++        r = op_cvtgf (opnd);
++        WRITE_L (r);
++        CC_IIZZ_FP (r);
++        break;
++
++    case ADDF2: case ADDF3:
++        r = op_addf (opnd, FALSE);
++        WRITE_L (r);
++        CC_IIZZ_FP (r);
++        break;
++
++    case ADDD2: case ADDD3:
++        r = op_addd (opnd, &rh, FALSE);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++    case ADDG2: case ADDG3:
++        r = op_addg (opnd, &rh, FALSE);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++    case SUBF2: case SUBF3:
++        r = op_addf (opnd, TRUE);
++        WRITE_L (r);
++        CC_IIZZ_FP (r);
++        break;
++
++    case SUBD2: case SUBD3:
++        r = op_addd (opnd, &rh, TRUE);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++    case SUBG2: case SUBG3:
++        r = op_addg (opnd, &rh, TRUE);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++    case MULF2: case MULF3:
++        r = op_mulf (opnd);
++        WRITE_L (r);
++        CC_IIZZ_FP (r);
++        break;
++
++    case MULD2: case MULD3:
++        r = op_muld (opnd, &rh);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++    case MULG2: case MULG3:
++        r = op_mulg (opnd, &rh);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++    case DIVF2: case DIVF3:
++        r = op_divf (opnd);
++        WRITE_L (r);
++        CC_IIZZ_FP (r);
++        break;
++
++    case DIVD2: case DIVD3:
++        r = op_divd (opnd, &rh);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++    case DIVG2: case DIVG3:
++        r = op_divg (opnd, &rh);
++        WRITE_Q (r, rh);
++        CC_IIZZ_FP (r);
++        break;
++
++/* ---- end verbatim copy ---- */
++
++    default:
++        PSL = sv_psl;
++        trpirq = sv_trpirq;
++        return SCPE_ARG;
++        }
++
++fprintf (of, "FPOP %03X ok %X %08X %08X %08X\n",
++    opc, cc, trpirq, R[rn], R[(rn + 1) & 0xF]);
++PSL = sv_psl;
++trpirq = sv_trpirq;
++return SCPE_OK;
++}
++
+ /* Set history */
+ 
+ t_stat cpu_set_hist (UNIT *uptr, int32 val, CONST char *cptr, void *desc)

@@ -1,18 +1,28 @@
 # Instrumented Open SIMH for the VAX differentials
 
-`decodediff.js` and `mmudiff.js` grade our decoder and our MMU against a real
-Open SIMH `microvax3900`. Doing that requires the simulator to expose things it
-does not expose on its own: enough state for a decode to be *replayed* rather
-than merely inspected, and a way to observe a translation at all. This directory
+`decodediff.js`, `mmudiff.js` and `fpadiff.js` grade our decoder, our MMU and our
+floating point against a real Open SIMH `microvax3900`. Doing that requires the
+simulator to expose things it does not expose on its own: enough state for a
+decode to be *replayed* rather than merely inspected, a way to observe a
+translation at all, and a way to hand one floating instruction the operands you
+choose rather than the operands a program happened to produce. This directory
 holds the patches that add them, and the script that builds them.
 
 ```
 machines/dec/vax/tests/simh/build.sh          # -> $TMPDIR/pcjs-vax-simh/open-simh/BIN/microvax3900
 export SIMH_DECODE_BIN=$TMPDIR/pcjs-vax-simh/open-simh/BIN/microvax3900
 export SIMH_MMU_BIN=$SIMH_DECODE_BIN
+export SIMH_FP_BIN=$SIMH_DECODE_BIN
 node machines/dec/vax/tests/decodediff.js
 node machines/dec/vax/tests/mmudiff.js
+node machines/dec/vax/tests/fpadiff.js
 ```
+
+**`build.sh` REUSES an existing destination directory.** If you add a patch, or
+pull one, delete the destination first — otherwise the new patch is silently
+absent from the binary and the test that needs it fails with "this simulator
+does not implement ...", which reads like a missing feature rather than a stale
+build.
 
 ## Why a patch at all
 
@@ -130,12 +140,57 @@ user" rather than against the current mode. We reproduce it exactly, because
 `acc` is opaque to the MMU and we port *from* SIMH; it is recorded here so
 nobody spends a day rediscovering it.
 
+## What 0004 adds
+
+Floating point is unobservable from outside the machine for a different reason
+than memory management: it is perfectly observable, but only for the operands a
+running program produces — and a running program never produces a reserved
+operand, an exact rounding tie, or an exponent one step past overflow. Those are
+precisely the cases a port gets wrong. One addition closes it:
+
+| Addition | Purpose |
+|---|---|
+| `SHOW CPU FPOP=opc:psl:cc:spec:rn:va:d0:d1:n:o0:o1:...` | Execute exactly one F/D/G floating instruction on an operand queue you supply, and print one machine-readable line. Colon separated, because `SHOW` splits its argument on commas. |
+
+Output is `FPOP <opc> ok <cc> <trpirq> <R[rn]> <R[rn+1]>`, or
+`FPOP <opc> abort <abortval> <p1> <p2>`.
+
+Three details are load-bearing:
+
+* **The case bodies are copied verbatim out of `sim_instr()`'s dispatch switch**,
+  between two marker comments, rather than reimplemented. So the arithmetic is
+  the real `op_*` routines in `vax_fpa.c`, the condition codes are the real
+  `CC_IIZZ_FP` / `CC_IIZP_FP` macros in `vax_defs.h`, and the store is the real
+  `WRITE_B`/`WRITE_W`/`WRITE_L`/`WRITE_Q` macros at the top of `vax_cpu.c` —
+  including `WRITE_Q`'s `Test (va + 7)` probe, which is what makes a quadword
+  store that straddles into an inaccessible page leave nothing behind. The only
+  thing transcribed is which case body belongs to which opcode.
+* **`trpirq` is reported, not just aborts.** Floating overflow, underflow and
+  divide by zero are *faults*: they abort. The integer overflow from `CVTF/D/G`
+  to `B`/`W`/`L` is a *trap*: the instruction completes, stores its result, and
+  only requests the trap — and only when `PSL<IV>` is set. A test that looked at
+  aborts alone could not tell the two apart.
+* **Only `PSW_FU` and `PSW_IV` are taken from the caller's `psl`.** The rest of
+  the PSL, including the current access mode that decides `acc`, is left alone,
+  so a caller cannot construct an unreasonable PSL. `PSL` and `trpirq` are saved
+  and restored around the call.
+
+Like `SHOW CPU MMUOP=`, it owns a `setjmp` of its own: the floating routines
+abort through `ABORT()`, and called from the console there is no `sim_instr`
+frame to land in.
+
+A *memory* destination is deliberately **not** initialized by the command — the
+caller pre-loads it with `DEPOSIT`, which is physical — so that a destination
+made deliberately inaccessible can still be given a known prior value, which is
+how `fpadiff.js`'s QUADSTORE phase proves that nothing was partially written.
+
 ## Provenance and rebasing
 
-All three patches are against Open SIMH at commit `a1f57fa3`. Keep them small and
+All four patches are against Open SIMH at commit `a1f57fa3`. Keep them small and
 additive so they keep applying as upstream moves; net diff is two files +79 lines
-for 0002 and three files +166/-4 for 0003, with every copyright header untouched.
-No patch changes instruction semantics — the simulator's own EHKAA self-test,
-which `make ... vax` runs, passes unmodified with all three applied.
+for 0002, three files +166/-4 for 0003 and one file +356/-0 for 0004, with every
+copyright header untouched. No patch changes instruction semantics — the
+simulator's own EHKAA self-test, which `make ... vax` runs, passes unmodified
+with all four applied.
 
 Open SIMH is MIT, © 1998–2019 Robert M Supnik.
