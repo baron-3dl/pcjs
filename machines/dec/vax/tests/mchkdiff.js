@@ -10,86 +10,121 @@
  * WHAT THIS IS
  * ------------
  * pcjsvax-446: a physical reference to an address BusVAX.RESERVED reserves but does not decode
- * (the KA655 I/O, ROM, register, SSC and Qbus-memory ranges) must raise a VAX machine check
+ * (the KA655 I/O, register, SSC, NVR and Qbus-memory ranges) must raise a VAX machine check
  * through the SCB -- exactly as a real KA655 does when the console ROM probes for hardware --
  * instead of stopping the simulator (cpustate.js's old onBusFault()).  The observable is TWO
  * things, not one: the machine check is delivered (new PC, new PSL, the exact 7-longword
  * exception+mcheck stack frame) AND the SSC bus-timeout register reads back with its timeout bit
- * set afterward.  This item does NOT decode any device register -- it is entirely about what
- * happens when one is ABSENT.
+ * set afterward -- EXCEPT for the one measured mechanism (below) where real SIMH itself never
+ * sets that bit, which this file grades as precisely as it grades the bit being set. This item
+ * does NOT decode any device register -- it is entirely about what happens when one is ABSENT.
  *
  * NO SIMH PATCH IS NEEDED.  Unlike busdiff.js's/excdiff.js's siblings, this differential does not
  * need instrumented state: `deposit`/`step 1`/`examine` (stock SCP) is enough, because everything
  * graded here -- the new PC, the new PSL, the pushed stack frame, and the SSC bus-timeout
  * register (SIMH: `examine sysd bto`) -- is architecturally visible after one step.
  *
+ * VERACITY RE-DISPATCH (this file's second revision) -- READ BEFORE CHANGING THE POOL LOGIC
+ * -------------------------------------------------------------------------------------------
+ * The first revision calibrated an address into the graded pool only when SIMH BOTH dispatched a
+ * machine check AND set ssc_bto.  That collapsed two independent questions -- "does SIMH dispatch
+ * here" and "does my CURRENT implementation happen to agree" -- into one, and the excluded set
+ * became an unexamined proxy for wherever the implementation was wrong: IOPAGE/CQM READS
+ * genuinely DO dispatch a machine check on real SIMH (vax_io.c ReadQb() -> cq_merr() ->
+ * MACH_CHECK()), just without ever touching ssc_bto -- and cpustate.js's onBusFault() had a real
+ * bug that set ssc_bto there anyway.  Because those addresses were excluded rather than graded,
+ * the bug was invisible to this file's own coverage floors.
+ *
+ * The fix: calibrate() now decides GRADED vs EXCLUDED on ONE fact only -- does SIMH dispatch a
+ * machine check at all (PC reaches the handler)?  Whether ssc_bto ends up set is tracked
+ * separately (`btoSeen`) and is graded like every other observable, by ordinary equality in
+ * compareCase() -- it no longer gates pool membership.  See onBusFault()'s doc comment in
+ * cpustate.js for the resulting read/write split on IOPAGE/CQM.
+ *
  * WHY EVERY "RESERVED" ADDRESS IS NOT A "MUST MACHINE-CHECK" ADDRESS ON REAL SIMH
  * ---------------------------------------------------------------------------------
- * BusVAX.RESERVED marks five ranges this bus reserves but does not decode.  Real SIMH, however,
+ * BusVAX.RESERVED marks six ranges this bus reserves but does not decode.  Real SIMH, however,
  * DOES decode most of them (vax_sysdev.c's `regtable[]`: CQBIC, CMCTL, KA655 regs, CQMAP, SSC,
- * NVR, and a real ROM image) -- because SIMH implements the peripherals this project has not
- * built yet.  Measured directly (see calibrate() below, and its printed report):
+ * NVR) -- because SIMH implements the peripherals this project has not built yet, or (ROM) a
+ * sibling item already has.  Measured directly (see calibrate() below, and its printed report,
+ * and EXPECTED_CALIBRATION's committed counts):
  *
  *   - CDG_BASE is backed END TO END (`cdg_rd`/`cdg_wr` span exactly VAX.PHYSMEM.CDG_LENGTH):
  *     every access SIMH does not machine-check.  100% expected divergence; reported, not graded.
- *   - ROM_BASE READS are backed end to end (a real ROM image); ROM_BASE WRITES are NOT (`rom_rd`
- *     but no `rom_wr` in SIMH's regtable, so a write falls through to the machine-check default
- *     exactly like an absent register) -- confirmed by direct probe before this file was written.
  *   - REG_BASE is a MIX: several real sub-windows (CQBIC at +0, CMCTL at +0x100, KA655 regs at
  *     +0x4000, CQIPC at +0x1F40, CQMAP at +0x8000) are backed; the rest of its 512KB genuinely
  *     machine-checks on both sides THROUGH ReadReg()/WriteReg(), the mechanism this item models.
- *   - IOPAGE_BASE and CQM_BASE are a SECOND, DIFFERENT divergence, discovered empirically while
- *     writing this file (an early run showed ssc_bto staying clear despite PC reaching the
- *     handler -- not a bug, a different SIMH code path).  `ADDR_IS_IO`/`ADDR_IS_CQM` route these
- *     two ranges to vax_io.c's `ReadQb()`/`ReadIO()`/`WriteQb()`, not vax_sysdev.c's ReadReg/
- *     WriteReg: an unbacked reference there calls `cq_merr()` (sets the CQBIC's DSER/MEAR error
- *     registers, which this item does not model) and, for READS ONLY, the SAME `MACH_CHECK()` --
- *     but NEVER touches ssc_bto.  WRITES there don't even raise the exception synchronously:
- *     `WriteQb()`'s unbacked case sets `mem_err = 1` (a DEFERRED MEMERR interrupt) and returns
- *     normally.  This matches the rd item's own measured-facts section, which cites ONLY
- *     ReadReg/WriteReg and ReadIPR/WriteIPR -- never ReadQb/WriteQb/cq_merr -- so modelling the
- *     Qbus path is a different (later, device-shaped) item's work, not a gap in this one.  Both
- *     ranges are therefore excluded from the graded pool and reported under "different mechanism"
- *     rather than silently absorbed into "confirmed absent".
+ *   - SSC_BASE and NVR_BASE (added to BusVAX.RESERVED by this re-dispatch -- see bus.js's
+ *     isReserved(), standing rule 7) are ALSO backed end to end (`ssc_rd`/`ssc_wr`,
+ *     `nvr_rd`/`nvr_wr`): the SSC's and NVR's OWN configuration registers are real devices in
+ *     SIMH, addressed through the same ReadReg/WriteReg table as everything else here.  100%
+ *     expected divergence, same as CDG -- but they must be IN the pool's candidate space (not a
+ *     silent gap) for that fact to be checked and reported rather than assumed.  This is exactly
+ *     the address pcjsvax-223 measured as the ROM's FIRST hardware probe (SSC+0x0).
+ *   - IOPAGE_BASE and CQM_BASE are ADDR_IS_IO()/ADDR_IS_CQM() territory: a KA655 routes Qbus
+ *     I/O-page and Qbus-memory references through vax_io.c's `ReadQb()`/`WriteQb()`, not
+ *     vax_sysdev.c's ReadReg()/WriteReg().  An unbacked reference there calls `cq_merr()` (sets
+ *     the CQBIC's DSER/MEAR error registers, which this item does not model -- filed as
+ *     pcjsvax-d22) and, for READS ONLY, the SAME `MACH_CHECK()` -- but NEVER touches ssc_bto.
+ *     WRITES there don't even raise the exception synchronously: `WriteQb()`'s unbacked case sets
+ *     `mem_err = 1` (a DEFERRED MEMERR interrupt) and returns normally.  So: IOPAGE/CQM READS are
+ *     GRADED (btoSeen is expected false and IS graded, per the fix above); IOPAGE/CQM WRITES are
+ *     EXCLUDED (SIMH never dispatches at all -- there is nothing to compare).  This matches the
+ *     rd item's own measured-facts section, which cites ONLY ReadReg/WriteReg and ReadIPR/
+ *     WriteIPR -- never ReadQb/WriteQb/cq_merr -- so modelling the Qbus mem_err/DSER path is
+ *     pcjsvax-d22's work, not a gap in this one.
  *
  * So the address pool this differential grades against is not "every address in
  * BusVAX.RESERVED" -- it is CALIBRATED against the real oracle first: candidate addresses (walked
- * OFF BusVAX.RESERVED programmatically, never hand-enumerated) are probed once, and only the ones
- * where BOTH the machine check fires AND ssc_bto is set go into the comparison pool -- exactly the
- * two observables the DONE CONDITION names.  Everything else is reported by name as an excluded,
- * out-of-scope divergence -- the same convention busdiff.js's reportScopeGaps() established for
- * the console-EXAMINE path.  This is why calibrate() is not optional plumbing: without it the
- * "randomized" pool would mostly compare a JS fault against a SIMH success (or a different SIMH
- * fault mechanism) and every failure would be noise, exactly the uniform-address-pool trap
- * docs/design/vax-on-pcjs.md's testing lesson describes for busdiff.js.
+ * OFF BusVAX.RESERVED programmatically, never hand-enumerated) are probed once, and every one
+ * where the machine check DISPATCHES AT ALL goes into the comparison pool, whatever ssc_bto ends
+ * up being.  Only addresses where SIMH itself never dispatches are excluded.  Every exclusion is
+ * reported by name -- the same convention busdiff.js's reportScopeGaps() established for the
+ * console-EXAMINE path -- and EXPECTED_CALIBRATION asserts the excluded (and graded) counts
+ * against committed numbers, so a rebase or an implementation change that silently widens what
+ * gets excluded FAILS the run instead of quietly shrinking coverage.
  *
  * TWO PHASES, PER THE PROJECT'S STANDING RULE
  * --------------------------------------------
- *   ENUMERATED   Deterministic: every CONFIRMED-ABSENT address (boundary points of every
- *                reserved range, from calibrate()), both directions (read/write, MOVx vs TSTx),
- *                all three sizes (byte/word/long).  Guarantees full-range, full-size coverage
- *                that a random draw cannot promise -- this project has no real workload that
- *                probes devices yet (the console ROM is a LATER milestone), so this phase stands
- *                in for it.
- *   RANDOMIZED   Random draws from the same confirmed pool, with random surrounding machine state
+ *   ENUMERATED   Deterministic: every CONFIRMED address (boundary points of every reserved range,
+ *                from calibrate()), both directions (read/write, MOVx vs TSTx), all three ALIGNED
+ *                sizes (byte/word/long), PLUS every UNALIGNED word/long offset of every confirmed
+ *                address (+1/+2/+3 for long, +1/+3 for word -- +2 is itself word-aligned).
+ *                Guarantees full-range, full-size, full-alignment coverage that a random draw
+ *                cannot promise -- this project has no real workload that probes devices yet (the
+ *                console ROM is a LATER milestone), so this phase stands in for it.
+ *   RANDOMIZED   Random draws from the same confirmed pool (aligned addresses only -- see
+ *                UNALIGNED_OFFSETS' doc comment for why), with random surrounding machine state
  *                (PSL mode/IPL/condition codes, SISR, general registers) that the deterministic
  *                phase does not vary -- old PSL/CC values ride into the pushed exception frame
  *                unchanged, so this is the phase that catches a wrong pass-through of that state.
+ *
+ * BOTH PHASES DRAW FROM THE SAME CALIBRATED POOL, AND THAT IS A REAL LIMITATION, NOT AN OVERSIGHT:
+ * they are one view at two granularities (exhaustive vs. varied-state), not two structurally
+ * independent oracles.  Both were blind to the ssc_bto-on-IOPAGE/CQM-reads bug identically, for
+ * the same reason: NEITHER phase can see a bug in the CRITERION that built the pool they both draw
+ * from.  The genuine independent check on the criterion itself is EXPECTED_CALIBRATION's asserted
+ * counts (committed once, against the real oracle, and re-verified every run) plus this file's own
+ * --selfcheck, which mutates the SHIPPED code the pool-independent way: by breaking behavior, not
+ * by narrowing what gets compared.
  *
  * WHAT IS DELIBERATELY NOT MODELLED (see exc.js's busTimeout()/takeFault() doc comments)
  * -----------------------------------------------------------------------------------------
  *   - SIMH's REF_P (mchk_ref=1) half of the machine-check "address" parameter.  Every case here
  *     reaches the fault through mmu.readData()/writeData() (an ordinary instruction's data
  *     reference), which is SIMH's REF_V (0) path -- the one a console-ROM probe actually uses.
- *   - CADR/MSER (state1's low 16 bits): SSC/CMCTL device state exc.js defers (IPR_DEVICE). No
- *     case here writes them, so both sides read 0 there by construction, not by a modelled match.
+ *   - CADR/MSER (state1's low 16 bits): SSC/CMCTL device state exc.js defers (IPR_DEVICE), a PRIOR
+ *     design decision this item did not make.  No case here writes them, so both sides read 0
+ *     there by construction -- UNTESTED, not a modelled match; see exc.js's SCB.MCHK case for the
+ *     pcjsvax-622 forward-reference (that item writes CADR).
  *   - Any machine-check trigger other than a bus fault (parity/ECC, etc.) -- none exist yet.
- *   - Unaligned / cross-boundary probe accesses. busdiff.js already grades the bus's byte/word/
- *     long stitching; this file grades the FAULT and its DISPATCH, not addressing arithmetic.
+ *   - The Qbus/CQBIC `cq_merr`/DSER/MEAR/deferred-`mem_err` mechanism itself (pcjsvax-d22) --
+ *     IOPAGE/CQM writes are excluded from grading for exactly this reason (see above).
  *
  *      node machines/dec/vax/tests/mchkdiff.js [options]
  *        --simh PATH       microvax3900 (else $SIMH_BIN, else the scratch build)
- *        --cases N         randomized cases (default 300, floor 150)
+ *        --cases N         randomized cases (default 300; below MIN_CASES_FLOOR the run FAILS --
+ *                           it no longer silently clamps up)
  *        --seed S          PRNG seed, printed on failure so a run is reproducible
  *        --selfcheck        prove the differential detects deliberate defects
  */
@@ -106,6 +141,7 @@ import { VAX } from "../modules/v2/defines.js";
 import { OPCODES } from "../modules/v2/drom.js";
 import CPUStateVAX, { VAXStop } from "../modules/v2/cpustate.js";
 import { VAXExc, SCB } from "../modules/v2/exc.js";
+import { VAXFault } from "../modules/v2/decode.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
@@ -234,8 +270,14 @@ function candidatesFor(base, len)
     return [...a].filter((x) => x >= base && x < base + len).sort((x, y) => x - y);
 }
 
-/** {name, base, len, addrs} for every BusVAX.RESERVED entry -- names are diagnostic labels only. */
-const RANGE_NAMES = ["CDG", "IOPAGE", "ROM", "REG", "CQM"];
+/** {name, base, len, addrs} for every BusVAX.RESERVED entry -- names are diagnostic labels only.
+    Order MUST track bus.js's BusVAX.RESERVED array (asserted at load time below). */
+const RANGE_NAMES = ["CDG", "IOPAGE", "REG", "CQM", "SSC", "NVR"];
+if (RANGE_NAMES.length !== BusVAX.RESERVED.length) {
+    throw new Error(`mchkdiff.js: RANGE_NAMES has ${RANGE_NAMES.length} entries, ` +
+        `BusVAX.RESERVED has ${BusVAX.RESERVED.length} -- bus.js's reserved-range list changed ` +
+        `shape; update RANGE_NAMES (and re-measure EXPECTED_CALIBRATION) to match.`);
+}
 const RANGES = BusVAX.RESERVED.map((r, i) => ({
     name: RANGE_NAMES[i] || `RESERVED[${i}]`,
     base: r[0], len: r[1],
@@ -261,6 +303,15 @@ class Case {
         this.psl = 0;
         this.regs = new Int32Array(15);         // R0..R14 (GPRs + the live stack pointer)
         this.sisr = 0;
+        /*
+         * Set directly from the pool entry that generated this case (range/btoSeen/unaligned),
+         * rather than re-derived later by matching `addr` back against the pool: an UNALIGNED
+         * case's addr is base+offset, which does not equal any pool entry's addr, so an
+         * address-based lookup would silently lose exactly the cases this re-dispatch added.
+         */
+        this.range = null;
+        this.btoSeen = null;                    // expected ssc_bto state, or null if not from the pool
+        this.unaligned = false;
     }
 }
 
@@ -444,13 +495,34 @@ function calibrate(simh, scratch)
         }
     }
     let sr = runBatch(simh, cases, scratch);
-    let confirmed = {write: new Map(), read: new Map()};     // rangeName -> Array<addr>
-    let backed = {write: new Map(), read: new Map()};        // SIMH did not machine-check at all
-    let otherMech = {write: new Map(), read: new Map()};     // SIMH machine-checked WITHOUT ssc_bto
+    /*
+     * TWO independent facts per (range, direction, address), tracked separately because they are
+     * decided by DIFFERENT SIMH mechanisms (veracity re-dispatch, pcjsvax-446):
+     *
+     *   confirmed  -- does SIMH dispatch a machine check here AT ALL (PC reaches R_HANDLER)?  This
+     *                 alone decides GRADED vs EXCLUDED.  An address is excluded only when SIMH
+     *                 itself never dispatches -- a real device answered (CDG, REG's backed
+     *                 sub-windows), or the reference is an IOPAGE/CQM WRITE, whose unbacked case
+     *                 (vax_io.c WriteQb) sets a deferred `mem_err` and returns normally with no
+     *                 synchronous exception at all (pcjsvax-d22).  Nothing else is excluded.
+     *   btoSeen    -- given a dispatch happened, did ssc_bto actually get set?  IOPAGE/CQM READS
+     *                 dispatch (ReadQb -> cq_merr -> the same MACH_CHECK) WITHOUT ever touching
+     *                 ssc_bto (pcjsvax-d22) -- those are graded (confirmed=true) with btoSeen=false,
+     *                 and cpustate.js's onBusFault() now reproduces exactly that split.  Everywhere
+     *                 else that dispatches, ssc_bto is set (btoSeen=true).
+     *
+     * This is the fix for the veracity finding that calibrating "is it backed" and "does it match
+     * my implementation" as ONE decision made the excluded set into an unexamined proxy for the
+     * defect set: IOPAGE/CQM reads used to be excluded (as "different mechanism") instead of
+     * graded, which is exactly where onBusFault() had a real bug (it set ssc_bto unconditionally).
+     * Now the exclusion decision depends ONLY on whether SIMH dispatches -- never on whether the
+     * CURRENT implementation happens to agree with it.
+     */
+    let confirmed = {write: new Map(), read: new Map()};     // rangeName -> Array<{addr, btoSeen}>
+    let backed = {write: new Map(), read: new Map()};        // rangeName -> Array<addr>, SIMH never dispatched
     for (let r of RANGES) {
         confirmed.write.set(r.name, []); confirmed.read.set(r.name, []);
         backed.write.set(r.name, []); backed.read.set(r.name, []);
-        otherMech.write.set(r.name, []); otherMech.read.set(r.name, []);
     }
     let notReached = [];
     for (let i = 0; i < cases.length; i++) {
@@ -460,29 +532,12 @@ function calibrate(simh, scratch)
         if (!res || !res.reached) { notReached.push(`calibrate ${dir} ${k.range}@0x${hex(k.addr)} (case ${i})`); continue; }
         let mchk = (res.pc >>> 0) === R_HANDLER;
         if (!mchk) {
-            /* SIMH did not dispatch a machine check at all: either a real device answered (CDG,
-               the backed windows of REG, ROM reads), or -- for IOPAGE/CQM writes -- SIMH's
-               cq_merr()/WriteQb() only sets a DEFERRED mem_err (an async MEMERR interrupt), which
-               is not this item's scope (see the file header's ReadQb/WriteQb note) and looks
-               identical to "backed" from PC alone. Either way: excluded, not a bug. */
             backed[dir].get(k.range).push(k.addr);
-        } else if (!res.bto) {
-            /*
-             * MEASURED, not assumed (see the file header): IOPAGE_BASE and CQM_BASE do not route
-             * through vax_sysdev.c's ReadReg()/WriteReg() at all -- ADDR_IS_IO/ADDR_IS_CQM send
-             * them to vax_io.c's ReadQb()/ReadIO(), whose unbacked case is `cq_merr()` (a CQBIC
-             * DSER/MEAR error register this item does not model) followed by the SAME
-             * MACH_CHECK(), but WITHOUT ever touching ssc_bto.  A real machine check that reaches
-             * this handler with the SSC bus-timeout bit still clear is therefore evidence of that
-             * DIFFERENT mechanism, not a bug in either machine -- excluded from the graded pool,
-             * same as `backed`, and reported separately so it isn't confused with one.
-             */
-            otherMech[dir].get(k.range).push(k.addr);
         } else {
-            confirmed[dir].get(k.range).push(k.addr);
+            confirmed[dir].get(k.range).push({addr: k.addr, btoSeen: !!res.bto});
         }
     }
-    return {confirmed, backed, otherMech, notReached};
+    return {confirmed, backed, notReached};
 }
 
 /* ------------------------------------------------------------------------------------------- *
@@ -490,18 +545,86 @@ function calibrate(simh, scratch)
  * ------------------------------------------------------------------------------------------- */
 
 /*
- * Floors measured against the ENFORCED MINIMUM run (`--cases` clamped to 150 -- see nRandom in
- * runPhase()), not the default (300): a floor that only the default satisfies would silently pass
- * at the minimum while covering less than it claims.  Only TWO of the five BusVAX.RESERVED ranges
- * can ever contribute a confirmed-absent comparison in this item's scope (ROM writes and REG's
- * gaps) -- CDG is backed end to end, and IOPAGE/CQM are the different-mechanism exclusion the file
- * header documents -- so MIN_RANGES_WITH_COVERAGE is 2, not "most of 5".
+ * EXPECTED_CALIBRATION -- committed against the real oracle (measured 2026-07-26, all six ranges,
+ * candidatesFor()'s deterministic candidate set, ten addresses per range).  Asserted EXACTLY, not
+ * as a floor: a rebase or an implementation change that silently widens the excluded set (or
+ * shrinks the confirmed one) FAILS the run instead of the excluded set quietly absorbing whatever
+ * calibrate() decides to hand it -- the exact failure mode the veracity re-dispatch found (the
+ * excluded set was an unexamined proxy for wherever the implementation disagreed with the oracle).
+ * `confirmed` counts BOTH btoSeen=true and btoSeen=false entries (IOPAGE/CQM reads are confirmed
+ * with btoSeen=false -- see calibrate()'s doc comment); `backed` is SIMH never dispatching at all.
  */
+const EXPECTED_CALIBRATION = {
+    CDG:    {confirmed: {write: 0, read: 0},  backed: {write: 10, read: 10}},
+    IOPAGE: {confirmed: {write: 0, read: 10}, backed: {write: 10, read: 0}},
+    REG:    {confirmed: {write: 8, read: 8},  backed: {write: 2,  read: 2}},
+    CQM:    {confirmed: {write: 0, read: 10}, backed: {write: 10, read: 0}},
+    SSC:    {confirmed: {write: 0, read: 0},  backed: {write: 10, read: 10}},
+    NVR:    {confirmed: {write: 0, read: 0},  backed: {write: 10, read: 10}}
+};
+
+/**
+ * assertCalibration(cal)
+ *
+ * @param {Object} cal as returned by calibrate()
+ * @returns {Array.<string>} mismatches (empty means calibration matches the committed numbers)
+ */
+function assertCalibration(cal)
+{
+    let bad = [];
+    for (let r of RANGES) {
+        let exp = EXPECTED_CALIBRATION[r.name];
+        if (!exp) { bad.push(`CALIBRATION: range "${r.name}" has no EXPECTED_CALIBRATION entry`); continue; }
+        for (let dir of ["write", "read"]) {
+            let gotC = cal.confirmed[dir].get(r.name).length;
+            let gotB = cal.backed[dir].get(r.name).length;
+            if (gotC !== exp.confirmed[dir]) {
+                bad.push(`CALIBRATION: ${r.name} confirmed.${dir} = ${gotC}, expected ${exp.confirmed[dir]}`);
+            }
+            if (gotB !== exp.backed[dir]) {
+                bad.push(`CALIBRATION: ${r.name} backed.${dir} = ${gotB}, expected ${exp.backed[dir]}`);
+            }
+        }
+    }
+    return bad;
+}
+
+/*
+ * MIN_RANGES_WITH_COVERAGE / MIN_RANGE_DIR_PAIRS / MIN_DISTINCT_ADDRESSES are DERIVED from
+ * EXPECTED_CALIBRATION -- a committed, asserted constant (above) -- not from whatever a live run
+ * happens to observe.  Computed once here so a change to EXPECTED_CALIBRATION (the only place
+ * that legitimately changes, e.g. after a real device item lands) automatically updates the
+ * floors that depend on it, instead of two numbers drifting apart silently.
+ */
+const RANGES_WITH_COVERAGE = Object.keys(EXPECTED_CALIBRATION)
+    .filter((name) => EXPECTED_CALIBRATION[name].confirmed.write > 0 || EXPECTED_CALIBRATION[name].confirmed.read > 0);
+const RANGE_DIR_PAIRS_WITH_COVERAGE = Object.keys(EXPECTED_CALIBRATION)
+    .flatMap((name) => ["write", "read"].filter((dir) => EXPECTED_CALIBRATION[name].confirmed[dir] > 0)
+        .map((dir) => `${name}:${dir}`));
+const EXPECTED_DISTINCT_ADDRESSES = Object.values(EXPECTED_CALIBRATION)
+    .reduce((n, e) => n + Math.max(e.confirmed.write, e.confirmed.read), 0);   // per-range union, upper bound
+
+const MIN_RANGES_WITH_COVERAGE = RANGES_WITH_COVERAGE.length;
+const MIN_RANGE_DIR_PAIRS = RANGE_DIR_PAIRS_WITH_COVERAGE.length;
+/*
+ * A FLOOR on distinct addresses used across the WHOLE pool actually driving case generation --
+ * not merely on calibrate()'s own report.  This is what closes the adversary's specific attack:
+ * truncating the pool AFTER calibration reports correctly (calibrate() itself would still pass
+ * assertCalibration() above) but BEFORE case generation, so the run graded almost nothing while
+ * every floor upstream of this one stayed green.
+ */
+const MIN_DISTINCT_ADDRESSES = Math.max(4, EXPECTED_DISTINCT_ADDRESSES - 8);   // measured 28; keep slack, not zero
+
+/*
+ * --cases FLOOR.  Below this, the run must FAIL, not clamp itself up to look fine (the specific
+ * vacuous-floor attack the veracity re-dispatch found: `--cases 1` and `--cases 0` both used to
+ * report PASS).  See main()'s argument parsing for the exit-non-zero enforcement.
+ */
+const MIN_CASES_FLOOR = 150;
 const MIN_TOTAL_OPS = 240;
 const MIN_PER_DIRECTION = 60;
 const MIN_PER_SIZE = 70;
-const MIN_BTO_SET = 200;
-const MIN_RANGES_WITH_COVERAGE = 2;           // of 5; see the comment above and the file header
+const MIN_BTO_SET = 150;
 
 /* ------------------------------------------------------------------------------------------- *
  * Self-check mutations                                                                          *
@@ -542,6 +665,15 @@ const MUTATIONS = [
     }},
     {name: "fault swallowed entirely (no exception, no ssc_bto -- the pre-fix behavior)", apply() {
         CPUStateVAX.prototype.onBusFault = function(addr, access) { /* nothing at all */ };
+    }},
+    {name: "ssc_bto set unconditionally, including on IOPAGE/CQM reads (bug 1, veracity re-dispatch)", apply() {
+        /* Reproduces the exact regression this re-dispatch fixed: onBusFault() calling
+           busTimeout() for EVERY dispatch, without the ADDR_IS_IO/ADDR_IS_CQM exception. */
+        CPUStateVAX.prototype.onBusFault = function(addr, access) {
+            let p1 = this.exc.busTimeout(access === VAX.ACCESS.WRITE);
+            let delta = (this.regs[15] - this.exc.faultPC) | 0;
+            throw new VAXFault(-SCB.MCHK, p1, delta);
+        };
     }}
 ];
 
@@ -575,28 +707,64 @@ function poolAddresses(cal)
 {
     let pool = [];
     for (let r of RANGES) {
-        for (let addr of cal.confirmed.write.get(r.name)) pool.push({range: r.name, addr, fWrite: true});
-        for (let addr of cal.confirmed.read.get(r.name)) pool.push({range: r.name, addr, fWrite: false});
+        for (let e of cal.confirmed.write.get(r.name)) pool.push({range: r.name, addr: e.addr, fWrite: true, btoSeen: e.btoSeen});
+        for (let e of cal.confirmed.read.get(r.name)) pool.push({range: r.name, addr: e.addr, fWrite: false, btoSeen: e.btoSeen});
     }
     return pool;
+}
+
+/*
+ * Unaligned offsets relative to a longword-aligned confirmed-absent base address.  vax_mmu.h's
+ * WriteU()/ReadU() operate on the LONGWORD CONTAINING the target address, so "is this backed" for
+ * an unaligned reference is answered by the SAME ReadReg/WriteReg lookup as its aligned
+ * container -- no separate calibration needed; compareCase() grades it against the real oracle
+ * exactly like every other case.  +2 is omitted for WORD: offset+2 relative to a longword base is
+ * itself word-aligned, so a word access there takes the ALIGNED fast path (no read-modify-write)
+ * and is not a genuinely unaligned case -- see cpustate.js's onBusFault() doc comment for why the
+ * read-modify-write path specifically is where the misclassified-MCHK-type bug the veracity
+ * re-dispatch found could have lived (measured: it does not reproduce on this item's remaining
+ * ranges post-pcjsvax-223, since ROM -- the one range with a read-succeeds/write-fails split -- is
+ * no longer part of this item's scope; see the file header).
+ */
+const UNALIGNED_OFFSETS = {4: [1, 2, 3], 2: [1, 3]};
+
+function poolStats(pool)
+{
+    let addrs = new Set(pool.map((p) => p.addr));
+    let pairs = new Set(pool.map((p) => `${p.range}:${p.fWrite ? "write" : "read"}`));
+    return {distinctAddresses: addrs.size, distinctPairs: pairs.size};
 }
 
 function runPhase(simh, scratch, opts, label)
 {
     let cal = calibrate(simh, scratch);
+    let calMismatch = assertCalibration(cal);
     let pool = poolAddresses(cal);
-    if (!pool.length) throw new Error(`mchkdiff: calibration found NO confirmed-absent address anywhere; cannot grade anything`);
+    if (!pool.length) throw new Error(`mchkdiff: calibration found NO confirmed address anywhere; cannot grade anything`);
 
     let rnd = mulberry32(opts.seed || 1);
     let cases = [];
     let index = 0;
 
-    /* ENUMERATED: every confirmed (range, direction) entry, all three sizes. */
+    /* ENUMERATED: every confirmed (range, direction) entry, all three ALIGNED sizes, plus every
+       UNALIGNED word/long offset of that same address. */
     for (let p of pool) {
         for (let size of [1, 2, 4]) {
             let c = new Case(index++, p.fWrite, size, p.addr);
             c.psl = 0;
+            c.range = p.range;
+            c.btoSeen = p.btoSeen;
             cases.push(c);
+        }
+        for (let size of [2, 4]) {
+            for (let off of UNALIGNED_OFFSETS[size]) {
+                let c = new Case(index++, p.fWrite, size, (p.addr + off) >>> 0);
+                c.psl = 0;
+                c.range = p.range;
+                c.btoSeen = p.btoSeen;
+                c.unaligned = true;
+                cases.push(c);
+            }
         }
     }
     /* RAM controls: must NOT machine-check, both directions, all sizes. */
@@ -611,12 +779,19 @@ function runPhase(simh, scratch, opts, label)
             }
         }
     }
-    /* RANDOMIZED: draws from the pool, with PSL mode/IPL/CC noise and register/SISR noise. */
-    let nRandom = Math.max(opts.cases || 300, 150);
+    /*
+     * RANDOMIZED: draws from the pool (ALIGNED addresses only -- the enumerated phase above is
+     * what exhaustively covers unaligned offsets; this phase's job is varying the SURROUNDING
+     * machine state the enumerated phase does not), with PSL mode/IPL/CC noise and register/SISR
+     * noise.
+     */
+    let nRandom = opts.cases;
     for (let k = 0; k < nRandom; k++) {
         let p = pick(rnd, pool);
         let size = pick(rnd, [1, 2, 4]);
         let c = new Case(index++, p.fWrite, size, p.addr);
+        c.range = p.range;
+        c.btoSeen = p.btoSeen;
         /*
          * Legal PSLs only -- SIMH refuses to `step` at all ("Unreasonable PSL value") otherwise,
          * which showed up as SIMH not executing the probe (PC unchanged) while JS, having no such
@@ -634,10 +809,13 @@ function runPhase(simh, scratch, opts, label)
         cases.push(c);
     }
 
-    let stats = {nOps: cases.length, byDir: {write: 0, read: 0}, bySize: {1: 0, 2: 0, 4: 0}, byRange: {}, nBtoSet: 0, nRamOk: 0};
+    let stats = {
+        nOps: cases.length, byDir: {write: 0, read: 0}, bySize: {1: 0, 2: 0, 4: 0}, byRange: {},
+        nBtoSet: 0, nBtoClearExpected: 0, nUnaligned: 0, nRamOk: 0
+    };
     for (let r of RANGES) stats.byRange[r.name] = 0;
 
-    let failures = [], notReached = [];
+    let failures = calMismatch.slice(), notReached = [];
     let ramSet = new Set(ramCaseIdx);
     let m = makeMachine();
     const BATCH = 80;
@@ -662,19 +840,39 @@ function runPhase(simh, scratch, opts, label)
             } else {
                 stats.byDir[c.fWrite ? "write" : "read"]++;
                 stats.bySize[c.size]++;
-                if (res.bto) stats.nBtoSet++;
-                let p = pool.find((q) => q.addr === c.addr && q.fWrite === c.fWrite);
-                if (p) stats.byRange[p.range]++;
+                if (c.unaligned) stats.nUnaligned++;
+                if (c.range) stats.byRange[c.range]++;
+                if (c.btoSeen === true && res.bto) stats.nBtoSet++;
+                if (c.btoSeen === false && !res.bto) stats.nBtoClearExpected++;
             }
         }
     }
 
-    return {failures, notReached, stats, cal};
+    return {failures, notReached, stats, cal, pool};
 }
 
 /* ------------------------------------------------------------------------------------------- *
  * main                                                                                            *
  * ------------------------------------------------------------------------------------------- */
+
+/**
+ * parseCases(raw)
+ *
+ * MEASURED BUG, fixed here (veracity re-dispatch): `+getArg("--cases", 300)` treated `--cases 0`
+ * as falsy and silently substituted 300, and a separate `Math.max(n, 150)` clamped anything below
+ * the floor UP instead of failing -- so `--cases 1` and `--cases 0` both used to report PASS.
+ * Below MIN_CASES_FLOOR the run must FAIL, not quietly cover more than it was asked to.
+ *
+ * @param {string|null} raw
+ * @returns {number} the parsed case count (may be below the floor; caller checks that explicitly)
+ */
+function parseCases(raw)
+{
+    if (raw === null || raw === undefined) return 300;
+    let n = Number(raw);
+    if (!Number.isFinite(n)) throw new Error(`mchkdiff.js: --cases "${raw}" is not a number`);
+    return n;
+}
 
 function main()
 {
@@ -682,7 +880,7 @@ function main()
     let getArg = (name, dflt) => { let i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : dflt; };
     let simh = findSimh(getArg("--simh", null));
     let seed = +getArg("--seed", 0xB16B00B5);
-    let nCases = +getArg("--cases", 300);
+    let nCases = parseCases(getArg("--cases", null));
     let fSelfCheck = argv.indexOf("--selfcheck") >= 0;
     let scratch = fs.mkdtempSync(path.join(os.tmpdir(), "vax-mchkdiff-"));
 
@@ -690,29 +888,37 @@ function main()
     console.log("  SIMH binary: %s", simh);
     console.log("  seed=0x%s cases=%d", hex(seed), nCases);
 
+    if (nCases < MIN_CASES_FLOOR) {
+        console.log("\nFAILED: --cases %d is below the enforced floor (%d); this run would under-cover " +
+            "and must not be allowed to pass.", nCases, MIN_CASES_FLOOR);
+        process.exit(1);
+    }
+
     let errors = [];
     try {
         let t0 = Date.now();
-        let {failures, notReached, stats, cal} = runPhase(simh, scratch, {seed, cases: nCases}, "main");
+        let {failures, notReached, stats, cal, pool} = runPhase(simh, scratch, {seed, cases: nCases}, "main");
         console.log("  elapsed: %ds", ((Date.now() - t0) / 1000).toFixed(1));
 
-        console.log("\nCalibration (measured against the real oracle, not assumed):");
+        console.log("\nCalibration (measured against the real oracle, asserted against EXPECTED_CALIBRATION):");
         for (let r of RANGES) {
             let cw = cal.confirmed.write.get(r.name).length, cr = cal.confirmed.read.get(r.name).length;
             let bw = cal.backed.write.get(r.name).length, br = cal.backed.read.get(r.name).length;
-            let ow = cal.otherMech.write.get(r.name).length, or_ = cal.otherMech.read.get(r.name).length;
-            console.log(`  ${r.name.padEnd(8)} confirmed-absent(graded): write=${cw} read=${cr}   ` +
-                `backed-by-SIMH(excluded): write=${bw} read=${br}   ` +
-                `different-mechanism(excluded, no ssc_bto): write=${ow} read=${or_}`);
+            console.log(`  ${r.name.padEnd(8)} confirmed(graded): write=${cw} read=${cr}   ` +
+                `backed(excluded, SIMH never dispatches): write=${bw} read=${br}`);
         }
         if (cal.notReached.length) {
             console.log("  calibration cases that did not reach comparison:");
             for (let n of cal.notReached) console.log("    " + n);
         }
+        let {distinctAddresses, distinctPairs} = poolStats(pool);
+        console.log(`  pool: ${pool.length} (range,direction,address) entries, ` +
+            `${distinctAddresses} distinct addresses, ${distinctPairs} distinct (range,direction) pairs`);
 
-        console.log("\nComparisons: ops=%d write=%d read=%d byte=%d word=%d long=%d bto-set=%d ram-controls-ok=%d",
+        console.log("\nComparisons: ops=%d write=%d read=%d byte=%d word=%d long=%d unaligned=%d " +
+            "bto-set=%d bto-clear(expected)=%d ram-controls-ok=%d",
             stats.nOps, stats.byDir.write, stats.byDir.read, stats.bySize[1], stats.bySize[2], stats.bySize[4],
-            stats.nBtoSet, stats.nRamOk);
+            stats.nUnaligned, stats.nBtoSet, stats.nBtoClearExpected, stats.nRamOk);
         console.log("  by range: %s", JSON.stringify(stats.byRange));
 
         for (let f of failures.slice(0, 40)) errors.push(f);
@@ -726,12 +932,29 @@ function main()
         require(stats.bySize[1] >= MIN_PER_SIZE, `too few byte-size probes (${stats.bySize[1]})`);
         require(stats.bySize[2] >= MIN_PER_SIZE, `too few word-size probes (${stats.bySize[2]})`);
         require(stats.bySize[4] >= MIN_PER_SIZE, `too few long-size probes (${stats.bySize[4]})`);
-        require(stats.nBtoSet >= MIN_BTO_SET, `too few cases observing ssc_bto set (${stats.nBtoSet})`);
+        require(stats.nUnaligned >= MIN_PER_SIZE, `too few unaligned probes (${stats.nUnaligned})`);
+        require(stats.nBtoSet >= MIN_BTO_SET, `too few cases observing ssc_bto SET (${stats.nBtoSet})`);
+        require(stats.nBtoClearExpected >= 60, `too few cases observing ssc_bto correctly CLEAR ` +
+            `(IOPAGE/CQM reads, ${stats.nBtoClearExpected}) -- this is exactly where the bug the ` +
+            `veracity re-dispatch found lived; a floor of 0 here would let it back in silently`);
         require(stats.nRamOk >= ramCaseCountFloor(), `too few RAM control cases confirmed non-faulting (${stats.nRamOk})`);
         let rangesWithCoverage = RANGES.filter((r) => stats.byRange[r.name] > 0).length;
         require(rangesWithCoverage >= MIN_RANGES_WITH_COVERAGE,
-            `too few reserved ranges contributing confirmed-absent comparisons (${rangesWithCoverage}); ` +
-            `note CDG_BASE is expected to contribute none (fully backed by SIMH's cache-diagnostic model)`);
+            `too few reserved ranges contributing confirmed comparisons (${rangesWithCoverage} of ` +
+            `${MIN_RANGES_WITH_COVERAGE} expected: ${RANGES_WITH_COVERAGE.join(", ")})`);
+        /*
+         * These two are what specifically closes the "truncate the pool after calibration reports
+         * correctly" attack: a pool sliced down to (say) 2 entries cannot reach either floor, even
+         * though calibrate() itself -- and therefore assertCalibration() above -- would still see
+         * and report the full, correct set.
+         */
+        require(distinctAddresses >= MIN_DISTINCT_ADDRESSES,
+            `too few distinct confirmed addresses actually used for case generation ` +
+            `(${distinctAddresses} of a floor of ${MIN_DISTINCT_ADDRESSES}) -- the pool may have been ` +
+            `truncated after calibration ran`);
+        require(distinctPairs >= MIN_RANGE_DIR_PAIRS,
+            `too few distinct (range,direction) pairs actually used for case generation ` +
+            `(${distinctPairs} of a floor of ${MIN_RANGE_DIR_PAIRS}: ${RANGE_DIR_PAIRS_WITH_COVERAGE.join(", ")})`);
 
         if (fSelfCheck) {
             console.log("\nSelf-check: the differential must FAIL when the mechanism is deliberately broken.");
@@ -747,7 +970,8 @@ function main()
         for (let e of errors) console.log("  " + e);
         process.exit(1);
     }
-    console.log("\nPASS: an absent physical register machine-checks, with matching ssc_bto, exactly as real SIMH does.");
+    console.log("\nPASS: an absent physical register machine-checks, with matching ssc_bto (set OR " +
+        "correctly clear), exactly as real SIMH does.");
 }
 
 function ramCaseCountFloor() { return 3 * 2 * 3 - 2; }     // 3 addrs * 2 dirs * 3 sizes, minus slack

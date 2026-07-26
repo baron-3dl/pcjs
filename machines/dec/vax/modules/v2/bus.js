@@ -166,6 +166,13 @@ export default class BusVAX extends Component {
      * ROM_BASE is NOT in this list: pcjsvax-223 decodes it (see addRom()), so it is no longer
      * reserved-but-undecoded -- it is reserved-and-DECODED, like RAM.
      *
+     * SSC_BASE and NVR_BASE were MISSING from BusVAX.RESERVED until pcjsvax-446's veracity review
+     * caught the gap (standing rule 7: scope lives in code, not comments -- this comment already
+     * claimed "SSC, NVR" were covered while the array below did not list them).  Both sit past
+     * REG_BASE's span (REG_BASE+REG_LENGTH = 0x20100000; SSC_BASE = 0x20140000), so any code
+     * deriving "what this bus reserves" from the array alone silently missed them -- and
+     * pcjsvax-223 measured the ROM's FIRST absent-hardware probe as SSC+0x0.
+     *
      * @this {BusVAX}
      * @param {number} addr (physical)
      * @returns {boolean}
@@ -871,7 +878,9 @@ BusVAX.RESERVED = [
     [VAX.PHYSMEM.CDG_BASE,    VAX.PHYSMEM.CDG_LENGTH],
     [VAX.PHYSMEM.IOPAGE_BASE, VAX.PHYSMEM.IOPAGE_LENGTH],
     [VAX.PHYSMEM.REG_BASE,    VAX.PHYSMEM.REG_LENGTH],
-    [VAX.PHYSMEM.CQM_BASE,    VAX.PHYSMEM.CQM_LENGTH]
+    [VAX.PHYSMEM.CQM_BASE,    VAX.PHYSMEM.CQM_LENGTH],
+    [VAX.PHYSMEM.SSC_BASE,    VAX.PHYSMEM.SSC_LENGTH],   // added pcjsvax-446: was a gap (see isReserved())
+    [VAX.PHYSMEM.NVR_BASE,    VAX.PHYSMEM.NVR_LENGTH]    // added pcjsvax-446: was a gap (see isReserved())
     /* ROM_BASE removed by pcjsvax-223: it is decoded now (see addRom()), not merely reserved. */
 ];
 

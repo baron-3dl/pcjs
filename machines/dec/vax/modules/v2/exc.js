@@ -404,7 +404,20 @@ class VAXExc {
         this.memErr = this.crdErr = this.hltPin = 0;
         this.intReq.fill(0);
         this.faultPC = 0;
-        this.sscBto = 0;                     // vax_sysdev.c:1789, cleared on reset
+        /*
+         * MEASURED CORRECTION (veracity re-dispatch, pcjsvax-446): `ssc_bto = 0` (vax_sysdev.c:
+         * 1789) is inside `sysd_powerup()`, NOT `sysd_reset()` -- SIMH's own `reset all` does NOT
+         * clear it (verified directly: a case that sets ssc_bto leaves it set across `reset all`
+         * for every later case in the same process).  Clearing it in THIS reset() is therefore a
+         * deliberate departure from a literal port: it fits the two machines' state at each
+         * differential CASE boundary (tests/mchkdiff.js issues `deposit sysd bto 0` per case for
+         * the same reason, on the SIMH side), not a claim that VAXExc.reset() == sysd_reset().
+         * Sticky accumulation across MULTIPLE faults and the W1C (write-one-to-clear) semantics of
+         * a real write to the BTO register are UNGRADED by this item -- mutation 1 of
+         * mchkdiff.js's --selfcheck still catches "ssc_bto never gets set" regardless, but nothing
+         * here proves the bit stays set correctly across a second, later fault.
+         */
+        this.sscBto = 0;
     }
 
     /**
@@ -774,9 +787,16 @@ class VAXExc {
              * before intexc() runs: intexc() pushes the old PC/PSL through mmu.writeData(), which
              * overwrites mchkVA with the PUSH address -- exactly the clobber SIMH's own
              * `p2 = mchk_va + 4` (vax_sysdev.c:1649) avoids by capturing it before its own call to
-             * intexc().  CADR/MSER (state1's low 16 bits) are SSC/CMCTL device state this file
-             * defers (IPR_DEVICE); mchkdiff.js never writes them, so both sides read 0 there --
-             * see that file's header for the scope note.
+             * intexc().
+             *
+             * CADR/MSER (state1's low 16 bits) ARE NOT MODELLED: this file already defers them to
+             * the SSC/CMCTL device (IPR_DEVICE, see the file header) as a PRIOR design decision,
+             * not one this item made.  st1 hardcodes that term to 0, which mchkdiff.js's cases
+             * currently never contradict (no case issues an MTPR to CADR/MSER, and every SIMH
+             * process starts from powerup with both zero) -- so the match is UNTESTED, not proven.
+             * pcjsvax-622 (the ROM's cache self-test) writes CADR; the first item that models CADR
+             * storage MUST update this line and mchkdiff.js's expected st1 computation together, or
+             * a machine check taken after that write will silently diverge here.
              */
             if (this.inIE) throw new VAXStop(VAXStop.REASON.INIE, vec);
             let p1 = fault.p1;
@@ -785,7 +805,7 @@ class VAXExc {
             let opc = cpu.decoder.opc;
             let hsir = 0;
             for (let i = 0; i < 16; i++) { if ((this.sisr >>> i) & 1) hsir = i; }
-            let st1 = (((opc & 0xFF) << 24) | (hsir << 16)) | 0;      // + CADR/MSER, unmodelled (0)
+            let st1 = (((opc & 0xFF) << 24) | (hsir << 16)) | 0;      // + CADR/MSER, unmodelled (0) -- see above
             let st2 = (0x00C07000 + (delta & 0xFF)) | 0;
             this.intexc(cpu, SCB.MCHK, 0, IE.SVE);
             this.inIE = 1;
