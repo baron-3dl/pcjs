@@ -56,37 +56,66 @@
  *   PHASE 1 (FIXED)       An enumerated, hand-built matrix of scenarios matching pcjsvax-954's own
  *                         DONE CONDITION bullets one-for-one (IE on/off, ack path, NICR/ICR
  *                         passthrough, TODR in both contexts, TODR writes, one interrupt delivered,
- *                         one masked) -- each driven through REAL MTPR/MFPR/step execution on BOTH
- *                         engines, analogous to hwintdiff.js's "prime a device, dispatch, compare"
- *                         cases but for register semantics instead of arbitration.
+ *                         one masked, power-on state, wall-clock RATE) -- each driven through REAL
+ *                         MTPR/MFPR/step execution on BOTH engines, analogous to hwintdiff.js's
+ *                         "prime a device, dispatch, compare" cases but for register semantics.
  *   PHASE 2 (RANDOMIZED)  Random ICCS/TODR values and random ROM/non-ROM contexts, catching a wrong
  *                         mask or a wrong ROM-window boundary a small fixed matrix would not land
  *                         on by chance (the same reason romdiff.js's SSC-base phase exists at all).
  *
- * This is disclosed explicitly in the report's test_decisions: neither phase is a "real, unscripted
- * external program," because none is reachable; the two phases are nonetheless structurally
- * independent generators over the SAME oracle, exactly matching romdiff.js's own precedent for a
- * register this narrow.
+ * This exemption is disclosed, not concealed, in the report's test_decisions -- and it EXPIRES the
+ * moment it stops being true: romdiff.js's own boundary sits at instruction #3 today (a DIFFERENT
+ * item's undecoded SSC register), but the ROM's own first bare TODR read is only 30 instructions
+ * further in (measured live: DBG(33), `MFPR #1B,34(R1)` at PC=0x200401E9).  The instant a later
+ * item (pcjsvax-bfb/622/69a or similar) pushes that boundary past #33, romdiff.js starts replaying
+ * a REAL todr_rd(ROM) call this file's grading must then agree with -- do not manufacture a
+ * workload here in the meantime; wire the replay when the boundary actually reaches it.
  *
  * THE ROM-DETECTION SPECIAL CASE, AND HOW ITS CROSS-ENGINE COMPARISON ACTUALLY WORKS
  * -------------------------------------------------------------------------------------
- * Inside the ROM window, todr_rd() returns the RAW counted register -- time-independent, so this
- * file grades it BIT-EXACT against SIMH for any deposited value, including 0.
+ * MEASURED CORRECTION (veracity re-dispatch): an earlier version of this file graded the ROM
+ * branch ONLY via "MTPR (write) immediately followed by MFPR (read)" and argued no live bit-exact
+ * comparison was possible because two OS processes cannot share a wall-clock instant.  That
+ * argument is correct about the WALL-CLOCK branch but was wrongly applied to the ROM branch too:
+ * SIMH exposes todr_reg as a plain settable device register (`deposit CLK TODR n`, vax_stddev.c
+ * REG table, DRDATAD TODR) that does NOT touch the wall-clock anchor (toy_gmtbase) -- so poking the
+ * SAME raw value into both engines' counted register (`deposit CLK TODR n` / `clk.todrReg = n`,
+ * bypassing MTPR/todrWr on BOTH sides) and reading back via a real MFPR from a ROM-window PC is a
+ * BIT-EXACT, time-independent, live cross-engine comparison, strictly stronger than the
+ * write-then-immediate-read band the earlier version relied on exclusively -- see
+ * caseRomVsNonRomRawDiscriminator() below, which is now what actually distinguishes "returns the
+ * raw counted register" from "always computes wall-clock" cross-engine (the earlier version's
+ * write-then-immediate-read could not: reading back near-instantly after a WRITE reconstructs
+ * approximately the SAME value via EITHER branch, which is why a "ROM special case omitted"
+ * mutation survived that shape and had to be caught a different way -- see MUTATIONS below).
  *
  * Outside the ROM window with a nonzero TODR, todr_rd() computes a real WALL-CLOCK-derived value
- * (vax_stddev.c:471-501: `now - toy_gmtbase`) -- and there is no way to make two INDEPENDENT OS
+ * (vax_stddev.c:471-501: `now - toy_gmtbase`) -- and there IS no way to make two INDEPENDENT OS
  * processes (this Node process, and the separately-spawned SIMH child) observe the same wall-clock
- * instant.  A live bit-for-bit cross-process comparison of that branch is not merely hard, it is
- * structurally impossible, and pretending otherwise (e.g. by adding a generous tolerance and
- * calling the result "exact") would be exactly the kind of false claim this project's veracity
- * passes exist to catch.  The honest comparison this file makes instead: MTPR (write) immediately
- * followed by MFPR (read), on EACH ENGINE INDEPENDENTLY, with no other work between the two -- the
- * elapsed real time within a single process executing two back-to-back operations is microseconds,
- * two orders of magnitude under TODR's 10ms tick, so EACH engine's own readback converges to the
- * value it just wrote (occasionally +1 tick on an unlucky scheduling boundary).  Both engines are
- * therefore graded against the SAME analytically-known expected band [data, data+1], not against
- * each other's wall clock -- see checkTodrRunning() below.  TODR=0 (stopped) and the ROM branch
- * are graded bit-exact with NO band, because both are genuinely time-independent.
+ * instant, so a live bit-for-bit comparison of THIS branch's absolute value remains structurally
+ * impossible, and this file does not claim otherwise.  What it grades instead, on EACH ENGINE
+ * INDEPENDENTLY:
+ *
+ *   - ROUND-TRIP: MTPR (write) immediately followed by MFPR (read), no other work between the two
+ *     -- elapsed real time within a single process executing two back-to-back operations is
+ *     microseconds, two orders of magnitude under TODR's 10ms tick, so each engine's own readback
+ *     converges to the value it just wrote (occasionally +1/+2 ticks on an unlucky scheduling
+ *     boundary).  Graded against the analytically-known band [data, data+2] -- see
+ *     checkTodrRunning().  This proves the read is the INVERSE of the write; it does NOT, by
+ *     itself, prove the RATE the formula advances at (a formula returning milliseconds instead of
+ *     centiseconds -- a straight 10x scale bug -- is invisible when the elapsed real gap is itself
+ *     under a millisecond either way).
+ *   - RATE: MTPR (write), a REAL, SIMH-native `sleep <seconds>` (confirmed by direct execution to
+ *     be a genuine blocking wait -- SIMH's event queue and todr_reg do NOT advance during it,
+ *     since nothing is stepped) matched by an equal-duration host busy-wait on the JS side, then
+ *     MFPR (read).  The expected delta is computed from the ACTUALLY MEASURED elapsed
+ *     milliseconds on each engine independently (Date.now() before/after on the JS side; the
+ *     `sleep` argument on the SIMH side), not assumed to be exact -- see caseTodrRate().  A 10x (or
+ *     100x) scale bug is off by two-to-four orders of magnitude from ANY reasonable scheduling-
+ *     jitter tolerance, so this is a low-precision, high-margin check, not a timing race.
+ *
+ * TODR=0 (stopped) and the ROM branch (via the raw-register discriminator above) are graded
+ * BIT-EXACT with NO band, because both are genuinely time-independent.
  *
  *      node machines/dec/vax/tests/timerdiff.js [--simh PATH] [--selfcheck] [--cases N]
  */
@@ -206,8 +235,10 @@ const R_CODE    = 0x00104000;           // non-ROM test code
 const R_KSP     = 0x00110000;
 
 const ROM_TEST_OFF = 0x1000;            // arbitrary, well clear of ROM_BASE/+4 (the magic byte)
-const ROM_CODE_ADDR = (VAX.PHYSMEM.ROM_BASE + ROM_TEST_OFF) >>> 0;
-const ROM_MIRROR_CODE_ADDR = (VAX.PHYSMEM.ROM_BASE + VAX.PHYSMEM.ROM_SIZE + ROM_TEST_OFF) >>> 0;
+const ROM_BASE_CONST = VAX.PHYSMEM.ROM_BASE >>> 0;
+const ROM_SIZE_CONST = VAX.PHYSMEM.ROM_SIZE >>> 0;
+const ROM_CODE_ADDR = (ROM_BASE_CONST + ROM_TEST_OFF) >>> 0;
+const ROM_MIRROR_CODE_ADDR = (ROM_BASE_CONST + ROM_SIZE_CONST + ROM_TEST_OFF) >>> 0;
 
 /* ------------------------------------------------------------------------------------------- *
  * Coverage floors.  Every one of these FAILS the run and does NOT shrink with --cases.            *
@@ -260,6 +291,18 @@ function runFixedCase(bin, scratch, name, code, opts = {})
     L.push(`deposit R14 ${hex(R_KSP)}`);
     for (let k = 0; k < 16; k++) L.push(`deposit -b ${hex(R_HANDLER + k)} ${NOP_BYTE.toString(16)}`);
     L.push(`deposit ${hex(R_SCBB + SCB.INTTIM)} ${hex(R_HANDLER)}`);
+    if (opts.rawTodr !== undefined) {
+        /* A RAW poke of the counted register itself (vax_stddev.c's plain DRDATAD TODR entry),
+           NOT a WriteIPR/todr_wr() -- this deliberately does NOT touch the wall-clock anchor
+           (toy_gmtbase), which is exactly what makes a subsequent MFPR from ROM vs non-ROM PC a
+           genuine, live, BIT-EXACT (in the ROM case) discriminator between the two branches --
+           see caseRomVsNonRomRawDiscriminator() and the file header. */
+        /* CLK's TODR register is DRDATAD (vax_stddev.c REG table) -- DECIMAL radix for deposit,
+           unlike CSR's HRDATAD (hex).  Measured directly: `deposit CLK TODR 2A` -> "Invalid
+           argument"; `deposit CLK TODR 42` (decimal) -> readback 0x2A via `examine -h`.  `-h` on
+           examine forces hex DISPLAY regardless of the register's native deposit radix. */
+        L.push(`deposit CLK TODR ${(opts.rawTodr >>> 0)}`);
+    }
     for (let i = 0; i < code.length; i++) L.push(`deposit -b ${hex((writeAddr + i) >>> 0)} ${code[i].toString(16)}`);
     /* pad with NOPs so a masked case's extra step never runs off into whatever else lives there */
     for (let k = 0; k < 8; k++) L.push(`deposit -b ${hex((writeAddr + code.length + k) >>> 0)} ${NOP_BYTE.toString(16)}`);
@@ -280,6 +323,7 @@ function runFixedCase(bin, scratch, name, code, opts = {})
     cpu.exc.stk[0] = R_KSP;
     for (let k = 0; k < 16; k++) bus.setByte(R_HANDLER + k, NOP_BYTE);
     bus.setLong(R_SCBB + SCB.INTTIM, R_HANDLER);
+    if (opts.rawTodr !== undefined) clk.todrReg = opts.rawTodr | 0;   // mirrors `deposit CLK TODR` above
     let writeCode = opts.rom ? (a, b) => bus.setByteDirect(a, b) : (a, b) => bus.setByte(a, b);
     for (let i = 0; i < code.length; i++) writeCode((writeAddr + i) >>> 0, code[i]);
     for (let k = 0; k < 8; k++) writeCode((writeAddr + code.length + k) >>> 0, NOP_BYTE);
@@ -363,8 +407,45 @@ function caseNicrIcrInert(bin, scratch, failures)
         let code = asm(mtpr(0x12345678, prn), mfpr(prn, 0));
         let {js, simh} = runFixedCase(bin, scratch, tag, code, {steps: 2});
         checkExact(failures, tag, js.R0, simh.R0, "R0 (must read back 0, not the written value)");
+        /*
+         * MEASURED, DISCLOSED DIVERGENCE (not graded as a failure): vax_sysdev.c's ReadIPR/
+         * WriteIPR `default:` case -- the one NICR/ICR fall into -- ALSO sets SSCBTO_BTO
+         * (`examine sysd bto` measured 0x00000000 -> 0x80000000 across a real MFPR NICR).  exc.js's
+         * OWN default (readIPR()/writeIPR() with no device installed) does not set this bit either
+         * -- a pre-existing gap in exc.js itself (see its own default-case comments), and this
+         * item's constraint (do not touch exc.js) leaves this file unable to close it.  Reported
+         * by name so the gap is visible in every run, not silently absent from what gets checked.
+         */
+        let btoOut = runSimh(bin, [
+            "set cpu 16m", "set cpu simhalt", "reset all", "deposit MAPEN 0",
+            `deposit -b ${hex(R_CODE)} ${MFPR_OPC.toString(16)}`,
+            `deposit -b ${hex(R_CODE + 1)} ${(prn & 0x3F).toString(16)}`,
+            `deposit -b ${hex(R_CODE + 2)} 50`,
+            "deposit PSL 0", `deposit PC ${hex(R_CODE)}`, "step 1",
+            "examine -h sysd bto", "exit"
+        ].join("\n") + "\n", path.join(scratch, `timerdiff-${tag}-bto.ini`));
+        let simhBtoAfter = parseSimhBto(btoOut);
+        let jsBtoAfter = (() => {
+            let {cpu} = makeMachine();
+            cpu.exc.scbb = R_SCBB;
+            let addr = R_CODE;
+            let mfprCode = mfpr(prn, 0);
+            for (let i = 0; i < mfprCode.length; i++) cpu.bus.setByte(addr + i, mfprCode[i]);
+            cpu.setPC(addr);
+            cpu.stepCPU(1);
+            return cpu.exc.sscBto >>> 0;
+        })();
+        console.log(`  [disclosed, not graded] ${tag}: sysd BTO after -- simh=${hex(simhBtoAfter)} js=${hex(jsBtoAfter)} ` +
+            (simhBtoAfter !== jsBtoAfter ? "(KNOWN DIVERGENCE -- exc.js pre-existing gap, out of this item's scope)" : "(match)"));
     }
     covered.nicrIcrInert = true;
+}
+
+function parseSimhBto(out)
+{
+    let m = /^BTO:\s*([0-9A-Fa-f]+)/m.exec(out);
+    if (!m) throw new Error(`timerdiff: SIMH did not report sysd BTO; output:\n${out}`);
+    return parseInt(m[1], 16) >>> 0;
 }
 
 /** TODR=0 is "clock not running" -- todr_rd() returns 0 unconditionally, in EITHER context, with
@@ -408,8 +489,244 @@ function caseTodrRomMirrorIsNotRom(bin, scratch, failures)
 }
 
 /**
+ * caseRomVsNonRomRawDiscriminator(bin, scratch, failures)
+ *
+ * THE authoritative, live, BIT-EXACT, time-independent grading of the ROM-detection special case
+ * -- see the file header's "THE ROM-DETECTION SPECIAL CASE" section for why write-then-immediate-
+ * read cannot do this (it converges to approximately the written value via EITHER branch) and why
+ * a raw register poke can: `deposit CLK TODR n` (SIMH) / `clk.todrReg = n` (JS) sets the COUNTED
+ * register directly, WITHOUT touching the wall-clock anchor, on both engines.
+ *
+ * THREE contexts, same poked value `n`, three fresh runFixedCase() invocations (one process each,
+ * `reset all` between them -- no state leaks):
+ *
+ *   ROM PRIMARY   MFPR from ROM_CODE_ADDR must read back EXACTLY `n` -- raw register, unconditional
+ *                 -- on BOTH engines, bit-exact.  A "todrRd always wall-clock" mutation (the item's
+ *                 own named gotcha, inverse direction) fails HERE: the wall-clock formula ignores
+ *                 the raw poke entirely (the anchor is still wherever the last real todr_wr/resync
+ *                 left it), so a mutant's ROM-context read is NOT `n`.
+ *   ROM MIRROR    MFPR from ROM_MIRROR_CODE_ADDR (same bytes, aliased) must NOT read back `n` on
+ *                 EITHER engine -- the correct ROM_MASK does not match the mirror, so this is
+ *                 STILL the wall-clock branch there.  A "ROM_MASK widened to the mirror" mutation
+ *                 (MUTATIONS.rom_mask_includes_mirror) fails HERE: it WOULD read back `n`.
+ *   NON-ROM       MFPR from R_CODE must NOT read back `n` on EITHER engine, for the same reason.
+ *                 A "todrRd always raw" mutation (M6 -- the item's own gotcha in the FORWARD
+ *                 direction: never taking the wall-clock branch at all) fails HERE: it WOULD read
+ *                 back `n` outside ROM too.
+ *
+ * Cross-engine equality is asserted ONLY for the ROM-primary case (the one branch that is
+ * genuinely time-independent); the mirror/non-ROM cases assert "not n" independently on each
+ * engine, which is the honest, time-independent claim those two branches actually support.
+ *
+ * @param {string} bin
+ * @param {string} scratch
+ * @param {Array<string>} failures
+ */
+function caseRomVsNonRomRawDiscriminator(bin, scratch, failures)
+{
+    let n = 0x2A;
+    let contexts = [
+        {tag: "raw_rom_primary", opts: {rom: true, romMirror: false}, mustEqualN: true},
+        {tag: "raw_rom_mirror", opts: {rom: true, romMirror: true}, mustEqualN: false},
+        {tag: "raw_nonrom", opts: {rom: false}, mustEqualN: false}
+    ];
+    for (let c of contexts) {
+        let code = mfpr(MT.TODR, 0);
+        let {js, simh} = runFixedCase(bin, scratch, c.tag, code,
+            Object.assign({steps: 1, rawTodr: n}, c.opts));
+        if (c.mustEqualN) {
+            if ((js.R0 >>> 0) !== n) failures.push(`${c.tag}: JS R0=${hex(js.R0)}, expected the raw-poked value ${hex(n)} (ROM branch)`);
+            if ((simh.R0 >>> 0) !== n) failures.push(`${c.tag}: SIMH R0=${hex(simh.R0)}, expected the raw-poked value ${hex(n)} (ROM branch)`);
+        } else {
+            if (js.R0 === n) failures.push(`${c.tag}: JS R0 == raw-poked value 0x${hex(n)} -- wrongly took the ROM (raw) branch outside the primary ROM window`);
+            if (simh.R0 === n) failures.push(`${c.tag}: SIMH R0 == raw-poked value 0x${hex(n)} unexpectedly (oracle itself took the raw branch here -- re-check the address)`);
+        }
+    }
+    covered.todrRom = true;
+    covered.todrNonRom = true;
+}
+
+/**
+ * caseTodrStaysStoppedAcrossTicks(bin, scratch, failures)
+ *
+ * Kills a removed "!todrBlow && todrReg !== 0" tick() guard: with TODR raw-poked to 0 ("clock not
+ * running"), run PAST INSTRS_PER_TICK real instructions (so the SHIPPED code's own deterministic
+ * tick model genuinely fires at least once) and assert the RAW register is STILL exactly 0 on
+ * BOTH engines.  This is a real, live, cross-engine comparison -- not merely a JS-only check --
+ * and it needs no timing coordination between the two engines at all: real SIMH's OWN clk_svc
+ * guard (`if (!todr_blow && todr_reg) todr_reg = todr_reg + 1`) ALSO refuses to start a stopped
+ * clock, so the oracle's todr_reg stays 0 regardless of whether it services any real tick in the
+ * (sub-millisecond) real time this file's small step budget takes -- the guard's zero-check, not
+ * tick TIMING, is what both sides are being held to.
+ *
+ * @param {string} bin
+ * @param {string} scratch
+ * @param {Array<string>} failures
+ */
+function caseTodrStaysStoppedAcrossTicks(bin, scratch, failures)
+{
+    let tag = "todr_stopped_survives_many_ticks";
+    let nSteps = INSTRS_PER_TICK * 3 + 5;
+
+    let L = ["set cpu 16m", "reset all", `deposit CLK TODR 0`];
+    for (let i = 0; i < nSteps + 8; i++) L.push(`deposit -b ${hex(R_CODE + i)} ${NOP_BYTE.toString(16)}`);
+    L.push(`deposit PSL 0`, `deposit PC ${hex(R_CODE)}`);
+    for (let s = 0; s < nSteps; s++) L.push("step 1");
+    L.push("examine -h CLK TODR", "exit");
+    let out = runSimh(bin, L.join("\n") + "\n", path.join(scratch, `timerdiff-${tag}.ini`));
+    let m = /^TODR:\s*([0-9A-Fa-f]+)/m.exec(out);
+    if (!m) throw new Error(`timerdiff: case ${tag} -- SIMH did not report CLK TODR; output:\n${out}`);
+    let simhTodrValue = parseInt(m[1], 16) >>> 0;
+
+    let {bus, cpu, clk} = makeMachine();
+    clk.todrReg = 0;
+    primeNopRun(bus, cpu, nSteps);
+    for (let i = 0; i < nSteps; i++) cpu.stepCPU(1);
+
+    if (simhTodrValue !== 0) failures.push(`${tag}: oracle's own raw TODR is ${hex(simhTodrValue)}, not 0 -- test premise broken`);
+    if ((clk.todrReg >>> 0) !== 0) failures.push(`${tag}: JS todrReg=${hex(clk.todrReg)} after ${nSteps} instructions (>= ${INSTRS_PER_TICK * 3} ticks worth) -- stopped-clock guard did not hold`);
+}
+
+/**
+ * caseTodrRate(bin, scratch, failures)
+ *
+ * Kills a mis-scaled wall-clock formula (ms instead of centiseconds, or any other wrong constant)
+ * -- the round-trip band [data,data+2] used elsewhere proves the read is the INVERSE of the write
+ * but cannot see absolute RATE (a scale bug is invisible when elapsed real time is itself under a
+ * millisecond).  This case inserts REAL elapsed time -- SIMH's native `sleep <seconds>` (confirmed
+ * by direct execution: `deposit CLK TODR 100; sleep 0.5; examine CLK TODR` leaves the RAW register
+ * untouched, but a real MTPR/sleep/MFPR round trip through the wall-clock branch measured exactly
+ * 100 + 50 = 150, i.e. the formula is correctly centiseconds-per-real-centisecond) -- matched by an
+ * equal-duration host busy-wait on the JS side.  The expected delta is computed from ACTUALLY
+ * MEASURED elapsed time on each engine independently, with a tolerance wide enough to absorb
+ * ordinary OS scheduling jitter (a few centiseconds) but two-to-four orders of magnitude tighter
+ * than what a 10x/100x scale bug would produce.
+ *
+ * @param {string} bin
+ * @param {string} scratch
+ * @param {Array<string>} failures
+ */
+function caseTodrRate(bin, scratch, failures)
+{
+    let tag = "todr_wallclock_rate";
+    let data = 100;
+    let sleepSec = 0.4;
+
+    /* ---- SIMH side ---- */
+    let writeCode = mtpr(data, MT.TODR);
+    let readCode = mfpr(MT.TODR, 0);
+    let L = ["set cpu 16m", "set cpu simhalt", "reset all", "deposit MAPEN 0"];
+    for (let i = 0; i < writeCode.length; i++) L.push(`deposit -b ${hex(R_CODE + i)} ${writeCode[i].toString(16)}`);
+    for (let i = 0; i < readCode.length; i++) L.push(`deposit -b ${hex(R_CODE + 16 + i)} ${readCode[i].toString(16)}`);
+    L.push(`deposit PSL 0`, `deposit PC ${hex(R_CODE)}`, "step 1", `sleep ${sleepSec}`,
+        `deposit PC ${hex(R_CODE + 16)}`, "step 1", "examine -h R0", "exit");
+    let out = runSimh(bin, L.join("\n") + "\n", path.join(scratch, `timerdiff-${tag}.ini`));
+    let m = /^R0:\s*([0-9A-Fa-f]+)/m.exec(out);
+    if (!m) throw new Error(`timerdiff: case ${tag} -- SIMH did not report R0; output:\n${out}`);
+    let simhR0 = parseInt(m[1], 16) >>> 0;
+    let simhExpectedDelta = Math.round(sleepSec * 100);
+
+    /* ---- JS side: real host busy-wait of the SAME nominal duration, measured actual elapsed ---- */
+    let {bus, cpu, clk} = makeMachine();
+    for (let i = 0; i < writeCode.length; i++) bus.setByte(R_CODE + i, writeCode[i]);
+    cpu.psl = 0;
+    cpu.setPC(R_CODE);
+    cpu.stepCPU(1);
+    let t0 = Date.now();
+    while (Date.now() - t0 < sleepSec * 1000) { /* busy-wait: no instructions retire, no ticks fire */ }
+    let actualMs = Date.now() - t0;
+    for (let i = 0; i < readCode.length; i++) bus.setByte(R_CODE + 16 + i, readCode[i]);
+    cpu.setPC(R_CODE + 16);
+    cpu.stepCPU(1);
+    let jsR0 = cpu.regs[0] >>> 0;
+    let jsExpectedDelta = Math.round(actualMs / 10);
+
+    const TOL = 8;      // centiseconds; generous vs. OS jitter, minuscule vs. any 10x/100x scale bug
+    if (simhR0 < data + simhExpectedDelta - TOL || simhR0 > data + simhExpectedDelta + TOL) {
+        failures.push(`${tag}: SIMH R0=${hex(simhR0)} (=${simhR0 - data} centiseconds elapsed), ` +
+            `expected ~${simhExpectedDelta} (sleep ${sleepSec}s) +/-${TOL}`);
+    }
+    if (jsR0 < data + jsExpectedDelta - TOL || jsR0 > data + jsExpectedDelta + TOL) {
+        failures.push(`${tag}: JS R0=${hex(jsR0)} (=${jsR0 - data} centiseconds elapsed), ` +
+            `expected ~${jsExpectedDelta} (measured ${actualMs}ms busy-wait) +/-${TOL}`);
+    }
+    covered.todrNonRom = true;
+    covered.todrWrite = true;
+}
+
+/**
+ * caseBareTodrAfterReset(bin, scratch, failures)
+ *
+ * pcjsvax-954 veracity finding: clk_reset() (vax_stddev.c:570-588) calls todr_resync() on a
+ * fresh process's FIRST reset, so a BARE MFPR TODR -- no MTPR at all -- is non-zero and BLOW-clear
+ * on real hardware.  clk.js's reset() now reproduces this (see its "POWER-ON RESYNC" doc).  The
+ * absolute computed value can never be bit-matched live (see the file header); what IS graded,
+ * time-independently, on each engine:
+ *
+ *   - BLOW == 0 (the clock is running the moment the process starts, never "battery low")
+ *   - the ROM-context read is >= 0x10000000 and != 0 (resync's formula guarantees this shape)
+ *   - the ROM-context read and the raw register examined directly agree WITHIN ITSELF (self-
+ *     consistency: whatever the engine's own resync produced, ROM-context MFPR reports exactly
+ *     that, unconditionally -- still the same time-independent claim caseRomVsNonRomRawDiscriminator
+ *     makes, just against a LIVE resync value instead of a hand-picked one)
+ *   - the non-ROM read is also != 0 (still running, not accidentally "stopped")
+ *
+ * @param {string} bin
+ * @param {string} scratch
+ * @param {Array<string>} failures
+ */
+function caseBareTodrAfterReset(bin, scratch, failures)
+{
+    let tag = "todr_bare_after_reset";
+    let readCode = mfpr(MT.TODR, 0);
+
+    function probe(execAddr, writeAddr, extraLines) {
+        let L = ["set cpu 16m", "set cpu simhalt", "reset all", "deposit MAPEN 0"];
+        for (let i = 0; i < readCode.length; i++) L.push(`deposit -b ${hex(writeAddr + i)} ${readCode[i].toString(16)}`);
+        L.push(`deposit PSL 0`, `deposit PC ${hex(execAddr)}`, "step 1",
+            "examine -h R0", "examine -h CLK TODR", "examine -h CLK BLOW", "exit");
+        let out = runSimh(bin, L.join("\n") + "\n", path.join(scratch, `timerdiff-${tag}-${extraLines}.ini`));
+        let r0 = /^R0:\s*([0-9A-Fa-f]+)/m.exec(out);
+        let todr = /^TODR:\s*([0-9A-Fa-f]+)/m.exec(out);
+        let blow = /^BLOW:\s*([0-9A-Fa-f]+)/m.exec(out);
+        if (!r0 || !todr || !blow) throw new Error(`timerdiff: case ${tag} -- incomplete SIMH output:\n${out}`);
+        return {r0: parseInt(r0[1], 16) >>> 0, todr: parseInt(todr[1], 16) >>> 0, blow: parseInt(blow[1], 16) & 1};
+    }
+
+    let simhRom = probe(ROM_CODE_ADDR, ROM_CODE_ADDR, "rom");
+    let simhNonRom = probe(R_CODE, R_CODE, "nonrom");
+
+    let jsRom = (() => {
+        let m = makeMachineWithRom();
+        for (let i = 0; i < readCode.length; i++) m.bus.setByteDirect(ROM_CODE_ADDR + i, readCode[i]);
+        m.cpu.setPC(ROM_CODE_ADDR);
+        m.cpu.stepCPU(1);
+        return {r0: m.cpu.regs[0] >>> 0, todr: m.clk.todrReg >>> 0, blow: m.clk.todrBlow & 1};
+    })();
+    let jsNonRom = (() => {
+        let m = makeMachine();
+        for (let i = 0; i < readCode.length; i++) m.bus.setByte(R_CODE + i, readCode[i]);
+        m.cpu.setPC(R_CODE);
+        m.cpu.stepCPU(1);
+        return {r0: m.cpu.regs[0] >>> 0, todr: m.clk.todrReg >>> 0, blow: m.clk.todrBlow & 1};
+    })();
+
+    for (let [label, r] of [["simh ROM", simhRom], ["simh non-ROM", simhNonRom], ["js ROM", jsRom], ["js non-ROM", jsNonRom]]) {
+        if (r.blow !== 0) failures.push(`${tag}: ${label} BLOW=${r.blow}, expected 0 (resync must clear it)`);
+        if (r.r0 === 0) failures.push(`${tag}: ${label} R0=0, expected non-zero after power-on resync`);
+    }
+    if (simhRom.r0 !== simhRom.todr) failures.push(`${tag}: simh ROM R0=${hex(simhRom.r0)} != its own raw TODR=${hex(simhRom.todr)} (self-consistency)`);
+    if (jsRom.r0 !== jsRom.todr) failures.push(`${tag}: js ROM R0=${hex(jsRom.r0)} != its own raw todrReg=${hex(jsRom.todr)} (self-consistency)`);
+    if ((jsRom.r0 >>> 0) < 0x10000000) failures.push(`${tag}: js ROM R0=${hex(jsRom.r0)} below 0x10000000 -- resync's formula shape not reproduced`);
+    if ((simhRom.r0 >>> 0) < 0x10000000) failures.push(`${tag}: simh ROM R0=${hex(simhRom.r0)} below 0x10000000 -- test premise broken`);
+
+    covered.todrRom = true;
+    covered.todrNonRom = true;
+}
+
+/**
  * Outside ROM, nonzero TODR: write-then-immediate-read, graded against the analytically-known
- * band [data, data+1] on EACH ENGINE INDEPENDENTLY -- see the file header for why this is the
+ * band [data, data+2] on EACH ENGINE INDEPENDENTLY -- see the file header for why this is the
  * honest comparison and not a cross-process wall-clock equality.
  */
 function checkTodrRunning(bin, scratch, failures, tag, extraOpts = {})
@@ -470,6 +787,10 @@ function phaseFixed(bin, scratch)
     caseTodrRomContext(bin, scratch, failures);
     checkTodrRunning(bin, scratch, failures, "todr_running_nonrom", {rom: false});
     caseTodrRomMirrorIsNotRom(bin, scratch, failures);
+    caseRomVsNonRomRawDiscriminator(bin, scratch, failures);
+    caseTodrStaysStoppedAcrossTicks(bin, scratch, failures);
+    caseTodrRate(bin, scratch, failures);
+    caseBareTodrAfterReset(bin, scratch, failures);
     caseInterruptDelivered(bin, scratch, failures);
     caseInterruptMasked(bin, scratch, failures);
     return failures;
@@ -632,6 +953,21 @@ const MUTATIONS = {
     "wrong_vector"(clk, cpu) {
         cpu.exc.addInterruptSource(IPL_CLK_ABS, INT_V_CLK, 0xC4);
         return () => { cpu.exc.addInterruptSource(IPL_CLK_ABS, INT_V_CLK, SCB.INTTIM); };
+    },
+    /* ROM_MASK widened to cover the WHOLE mirrored span (ROM_BASE..ROM_BASE+2*ROM_SIZE), the
+       naive "ADDR_IS_ROM-style range check" a port could plausibly reach for instead of the exact
+       0xFFFE0000-equivalent window -- see clk.js's file header "MASK PRECISION" note. */
+    "rom_mask_includes_mirror"() {
+        let orig = ClkVAX.prototype.todrRd;
+        ClkVAX.prototype.todrRd = function() {
+            let pc = (this.exc && typeof this.exc.faultPC === "number") ? (this.exc.faultPC >>> 0) : 0;
+            let widened = pc >= ROM_BASE_CONST && pc < (ROM_BASE_CONST + 2 * ROM_SIZE_CONST);
+            if (widened) return this.todrReg | 0;
+            if (this.todrReg === 0) return 0;
+            let elapsedMs = Date.now() - this.wallBaseMs;
+            return Math.round(elapsedMs / 10) | 0;
+        };
+        return () => { ClkVAX.prototype.todrRd = orig; };
     }
 };
 
@@ -714,6 +1050,26 @@ function selfcheck(bin, scratch)
         let vec = cpu.exc.deviceVector(cpu, IPL_CLK_ABS);
         restore();
         results.push({name: "wrong_vector", caught: vec !== SCB.INTTIM});
+    }
+    {
+        /* JS-only check mirroring caseRomVsNonRomRawDiscriminator()'s live "mirror must NOT read
+           back n" assertion, applied directly to the mutated prototype method. */
+        let restore = MUTATIONS.rom_mask_includes_mirror();
+        let m = makeMachineWithRom();
+        let n = 0x2A;
+        m.clk.todrReg = n;
+        let code = mfpr(MT.TODR, 0);
+        /* Writes go to the PRIMARY half (the mirror's write path is undefined -- true alias, read
+           only, see runFixedCase()'s own writeAddr/execAddr split); PC runs from the MIRROR. */
+        for (let i = 0; i < code.length; i++) m.bus.setByteDirect(ROM_CODE_ADDR + i, code[i]);
+        m.cpu.setPC(ROM_MIRROR_CODE_ADDR);
+        m.cpu.stepCPU(1);
+        let r0 = m.cpu.regs[0] >>> 0;
+        restore();
+        /* CORRECT behavior: the mirror is NOT in ROM_MASK's window, so r0 must NOT equal n.
+           The mutation's bug signature is r0 === n (it wrongly took the raw/ROM branch there) --
+           "caught" means this check actually observed that wrong value. */
+        results.push({name: "rom_mask_includes_mirror", caught: r0 === n});
     }
     let allCaught = results.every((r) => r.caught);
     return {results, allCaught};

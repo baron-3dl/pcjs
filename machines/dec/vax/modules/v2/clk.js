@@ -45,8 +45,8 @@
  * mirror half is NOT treated as "ROM" by this check on real SIMH, even though bus.js's
  * makeRomAliasController() makes the mirror read identical CONTENT.  ROM_MASK below is computed
  * from VAX.PHYSMEM.ROM_SIZE (never hand-transcribed as a literal 0xFFFE0000), and tests/
- * timerdiff.js's selfcheck includes a mutation that widens the check to the whole mirrored span,
- * to prove this precision is actually graded and not incidental.
+ * timerdiff.js's selfcheck ("rom_mask_includes_mirror") widens the check to the whole mirrored
+ * span and confirms that mutation is CAUGHT, so this precision is actually graded, not incidental.
  *
  * ============================================================================
  * THE WALL-CLOCK PATH (todr_rd/todr_wr OUTSIDE rom), AND WHY IT IS NOT THE TIMING MODEL DECISION
@@ -65,19 +65,61 @@
  * independent OS processes to observe the same instant, which they structurally cannot.
  *
  * ============================================================================
+ * POWER-ON RESYNC (todr_resync, vax_stddev.c:537-566) -- MEASURED CORRECTION, veracity re-dispatch
+ * ============================================================================
+ * clk_reset() (570-588) calls todr_resync() the FIRST time a process's clk_unit.filebuf is NULL --
+ * i.e. on every fresh SIMH process's implicit startup reset, not just an explicit `reset all` typed
+ * later.  The earlier version of this file asserted, as a measured fact, that "a fresh process's
+ * clock is STOPPED until something writes it" (todrReg=0, todrBlow=1) -- that is true of the C
+ * globals' STATIC INITIALIZERS and FALSE of the running simulator: measured directly, a bare
+ * `reset all` with NO prior write leaves the real oracle's TODR non-zero and BLOW clear (e.g.
+ * TODR=0x7A8EB365, BLOW=0), because resync() already ran.  resync()'s "not attached" branch (the
+ * VMS-default form, the only one this tree ever exercises -- nothing here uses clk_unit ATTACH) is:
+ *
+ *     base = ((tm_yday*24 + tm_hour)*60 + tm_min)*60 + tm_sec       -- seconds since Jan 1, local time
+ *     todr_wr((base*100) + 0x10000000 + round(tv_nsec/1e7))
+ *
+ * reset() below reproduces this using Date's local-time getters (tm_yday reconstructed the same way
+ * a real localtime() would report it).  This value can NEVER be bit-matched against a live oracle
+ * (both engines compute it from REAL wall-clock time at slightly different instants in slightly
+ * different processes -- see tests/timerdiff.js's file header on why cross-process wall-clock
+ * equality is structurally impossible, and its power-on cases for what IS graded: BLOW=0, the value
+ * is >= 0x10000000 and non-zero, and the ROM/non-ROM readback shapes are self-consistent on each
+ * engine independently).  Leaving this unmodeled was undisclosed, not merely deferred: with no
+ * device this item's own boundary is a mere 30 instructions from the ROM's OWN first bare TODR
+ * read (measured: DBG(33), `MFPR #1B,34(R1)` at PC=0x200401E9) -- the moment a later item's boundary
+ * reaches it, an unmodeled power-on state diverges there for real, not hypothetically.
+ *
+ * ============================================================================
  * WHAT IS DELIBERATELY NOT HERE
  * ============================================================================
  * - SSC T0/T1 (the programmable timers at SSC_BASE+0x100+) -- a DIFFERENT facility, owned by the
  *   countdown item per pcjsvax-954's own constraint.  Not one register here overlaps that scope.
  * - The console UART (CSRS/CSRD/CSTS/CSTD/RXCS/RXDB/TXCS/TXDB) and CADR/MSER/IORESET -- other
  *   MT_* numbers ReadIPR/WriteIPR dispatch to; read()/write() below pass them straight through to
- *   the SAME inert default (0 / dropped write) exc.js used for ALL of IPR_DEVICE before any device
- *   existed, so installing this class changes nothing about registers it does not own.
- * - `sim_rtcn_tick_ack` on an ICCS ack write (data & CSR_DONE) -- a host-timer-calibration hint
- *   with no architectural state (nothing reads it back); omitted, not forgotten.
+ *   the SAME VALUE (0 / dropped write) exc.js already produced for ALL of IPR_DEVICE before any
+ *   device existed.  NOT the same in every respect, though -- see the next paragraph.
+ * - ssc_bto (the SSC bus-timeout register) on a NICR/ICR access -- MEASURED, not assumed identical:
+ *   vax_sysdev.c's ReadIPR/WriteIPR `default:` case (the one NICR/ICR fall into) ALSO sets
+ *   SSCBTO_BTO (`examine sysd bto` goes 0x00000000 -> 0x80000000 across a real MFPR NICR).  exc.js's
+ *   OWN default (no device installed) does not set this bit either -- a pre-existing, documented
+ *   gap in exc.js itself (see its readIPR()/writeIPR() default-case comments), which this item's
+ *   constraint (do not touch exc.js) leaves this file unable to close.  read()/write() below
+ *   therefore reproduce exc.js's PRE-EXISTING value-level behavior for NICR/ICR (0 / dropped) but
+ *   NOT its side-effect-level behavior (no bto bit) -- tests/timerdiff.js measures and reports this
+ *   divergence explicitly rather than silently declaring the passthrough fully "inert".
+ * - `sim_rtcn_tick_ack` on an ICCS ack write (data & CSR_DONE) -- MEASURED CORRECTION: the earlier
+ *   version of this note called it "a host-timer-calibration hint with no architectural state,
+ *   nothing reads it back", which is not accurate.  It calls sim_rtcn_tick_catchup_check(), and
+ *   with sim_catchup_ticks defaulting TRUE that can schedule EXTRA clk_svc invocations -- extra
+ *   SET_INT(CLK) and extra todr_reg increments the CPU genuinely observes on real hardware.  The
+ *   omission is still correct under pcjsvax-954's directed deterministic, instruction-count-driven
+ *   model (there is no "catch-up" concept once ticks are not wall-clock scheduled at all -- see the
+ *   file header above), but the ORIGINAL justification for it was wrong; this is the true one.
  * - TODR's "battery low" / attach-a-TOY-file persistence mode (clk_unit attach/detach, the
  *   OS-Agnostic mode) -- no test in this tree runs offline across process restarts; `todrBlow`
- *   exists only so todr_wr(0)'s "stop the clock" state has somewhere to live and reads back inert.
+ *   exists so todr_wr(0)'s "stop the clock" state has somewhere to live and reads back inert, and
+ *   so resync()'s todr_wr() call (which always writes a non-zero value) clears it exactly once.
  */
 
 import { VAX } from "./defines.js";
@@ -146,13 +188,16 @@ export default class ClkVAX {
     /**
      * reset()
      *
-     * vax_stddev.c clk_reset() (570): clk_csr=0 and CLR_INT(CLK) -- todr_reg/todrBlow are
-     * DELIBERATELY NOT touched here (matching ssc.js's SSCVAX.reset() precedent for ssc_base: a
-     * real KA655's TODR is battery-backed and does not zero on a plain CPU reset).  This class's
-     * reset() therefore only runs from the constructor in every test in this tree (one fresh
-     * instance per machine, exactly like SSCVAX) -- see ssc.js's own reset() doc comment for why
-     * that makes "instance-construction default" and "post-reset value" the same question here,
-     * and why it would stop being harmless the moment something wires this to a reset handler.
+     * vax_stddev.c clk_reset() (570): clk_csr=0 and CLR_INT(CLK) unconditionally.  todr_reg/
+     * todrBlow are DELIBERATELY NOT re-touched on a SECOND reset() call (matching ssc.js's
+     * SSCVAX.reset() precedent for ssc_base: a real KA655's TODR is battery-backed and does not
+     * zero on a plain CPU reset) -- resync() below runs ONLY on the first-ever call, mirroring
+     * clk_reset()'s own `if (clk_unit.filebuf == NULL)` guard (570-588), which is true exactly
+     * once per real SIMH process.  This class's reset() only runs from the constructor in every
+     * test in this tree (one fresh instance per machine, exactly like SSCVAX), so "instance-
+     * construction default" and "post-reset value" are the same question here -- see ssc.js's own
+     * reset() doc comment for why that would stop being harmless the moment something wires this
+     * to a reset handler that could fire MORE than once on a live instance.
      *
      * @this {ClkVAX}
      */
@@ -161,15 +206,42 @@ export default class ClkVAX {
         this.csr = 0;
         if (this.exc) this.exc.clearInterrupt(IPL_CLK_ABS, INT_V_CLK);
         if (this.todrReg === undefined) {
-            /* First-ever construction only (see doc comment above): vax_stddev.c's globals start
-               `todr_reg = 0` and `todr_blow = 1` (vax_stddev.c:100-101) -- a fresh process's
-               clock is STOPPED until something writes it, exactly like a never-set battery clock. */
+            this.wallBaseMs = 0;
             this.todrReg = 0;
             this.todrBlow = 1;
-            this.wallBaseMs = 0;                 // toy_gmtbase's zero-initialized default
+            this.resync();                       // see the file header's "POWER-ON RESYNC" section
         }
         this._instrsSinceTick = 0;
         this.tickCount = 0;
+    }
+
+    /**
+     * resync()
+     *
+     * vax_stddev.c todr_resync() (537-566), "not attached" branch ONLY -- the OS-Agnostic/attached
+     * branch requires a TOY file this tree never creates, so it is not reachable and not ported
+     * (see the file header's "WHAT IS DELIBERATELY NOT HERE").  Reproduces:
+     *
+     *     base = ((tm_yday*24 + tm_hour)*60 + tm_min)*60 + tm_sec
+     *     todr_wr((base*100) + 0x10000000 + round(tv_nsec/1e7))
+     *
+     * using Date's LOCAL-time getters (matching localtime()'s locality) and reconstructing
+     * tm_yday (days since Jan 1, 0-based) the same way, since JS's Date has no direct equivalent.
+     * Routed through todrWr() itself -- not a hand-inlined assignment -- so the wall-clock anchor
+     * (wallBaseMs) ends up in EXACTLY the state a real MTPR of this same value would have left it
+     * in, which is what makes an immediate post-resync non-ROM read round-trip correctly (see
+     * tests/timerdiff.js's power-on cases).
+     *
+     * @this {ClkVAX}
+     */
+    resync()
+    {
+        let now = new Date();
+        let jan1 = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
+        let ydays = Math.floor((now.getTime() - jan1.getTime()) / 86400000);
+        let base = ((ydays * 24 + now.getHours()) * 60 + now.getMinutes()) * 60 + now.getSeconds();
+        let frac = Math.round(now.getMilliseconds() / 10);
+        this.todrWr(((base * 100) + 0x10000000 + frac) | 0);
     }
 
     /**
@@ -177,8 +249,10 @@ export default class ClkVAX {
      *
      * The setIPRDevice(dev) contract exc.js's readIPR()/writeIPR() install against.  Anything
      * that is not ICCS or TODR (including NICR/ICR -- see the file header) passes straight through
-     * to the SAME inert default (0 / dropped write) those numbers already got with no device
-     * installed at all, so wiring this class in changes nothing about a register it does not own.
+     * to the SAME VALUE (0 / dropped write) those numbers already got with no device installed at
+     * all -- but NOT the same SIDE EFFECT: real SIMH also sets ssc_bto here, which this file does
+     * NOT (see the file header's "ssc_bto" paragraph for the measured divergence and why this
+     * item's own constraint leaves it unclosed).
      *
      * @this {ClkVAX}
      * @param {number} prn
@@ -201,9 +275,11 @@ export default class ClkVAX {
         if (prn === MT_ICCS) { this.iccsWr(val); return; }
         if (prn === MT_TODR) { this.todrWr(val); return; }
         /* SSC default for every other off-chip register (NICR, ICR, and everything this file does
-           not own): drop the write.  Real SIMH also sets ssc_bto here; exc.js does not model that
-           for ANY off-chip register yet (a pre-existing, documented gap -- see exc.js's readIPR()/
-           writeIPR() default comments) and this device does not newly introduce it either. */
+           not own): drop the write.  Real SIMH ALSO sets ssc_bto here (measured: MFPR/MTPR NICR
+           flips `examine sysd bto` 0 -> 0x80000000) -- exc.js does not model that for ANY off-chip
+           register yet (a pre-existing, documented gap in exc.js itself, which this item's own
+           constraint -- do not touch exc.js -- leaves unclosed here too).  tests/timerdiff.js
+           measures and reports this divergence explicitly; see the file header. */
     }
 
     /**
