@@ -394,19 +394,29 @@ export default class CPUStateVAX extends Component {
     /**
      * onBusFault(addr, access)
      *
-     * A physical reference outside any RAM/ROM block.  On real hardware, and in SIMH's KA655
-     * model, this becomes a machine check through system-model code (vax_syslist.c) that exc.js
-     * deliberately does not model.  Rather than invent one, stop the machine with a reason that
-     * names the address: a harness then reports "stopped at a non-existent memory reference",
-     * which is a true statement about this machine, instead of diverging silently from SIMH.
+     * A physical reference to an address BusVAX.RESERVED reserves but does not decode (the
+     * KA655 I/O, ROM, register, SSC and Qbus-memory ranges -- see bus.js) -- pcjsvax-446.  This is
+     * how the console ROM discovers hardware: probe an address, and if nothing answers, take a
+     * machine check instead of ending the run.  vax_sysdev.c's ReadReg()/WriteReg() `default:`
+     * case does exactly two things when this happens (:1031-1032, :1071-1072): set the SSC
+     * bus-timeout bit, and raise SCB_MCHK.  Both happen here: busTimeout() is the first (and
+     * hands back the p1 the fault carries), and the thrown VAXFault is the second, reusing
+     * exc.js's existing SCB dispatch (takeFault()'s SCB.MCHK case) rather than a second one.
+     *
+     * `delta` (PC - fault_PC, "how far decode had consumed the faulting instruction") is captured
+     * HERE, before takeFault()'s common preamble resets PC back to fault_PC, and is smuggled to
+     * that case through the VAXFault's p2 slot -- see its doc comment for why it cannot be
+     * recomputed there.
      *
      * @this {CPUStateVAX}
      * @param {number} addr
-     * @param {number} access
+     * @param {number} access one of VAX.ACCESS.* -- VAX.ACCESS.WRITE for a write, otherwise a read
      */
     onBusFault(addr, access)
     {
-        throw new VAXStop(VAXStop.REASON.MCHK, addr >>> 0);
+        let p1 = this.exc.busTimeout(access === VAX.ACCESS.WRITE);
+        let delta = (this.regs[nPC] - this.exc.faultPC) | 0;
+        throw new VAXFault(-SCB.MCHK, p1, delta);
     }
 
     /* --------------------------------------------------------------------------------------- *

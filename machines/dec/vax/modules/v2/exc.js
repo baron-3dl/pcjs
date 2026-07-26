@@ -89,11 +89,15 @@
  * ============================================================================
  * WHAT IS DELIBERATELY NOT HERE
  * ============================================================================
- * - MACHINE CHECK (SCB_MCHK).  machine_check() is per-system-model code in vax_sysdev.c that
- *   builds a CVAX-specific parameter block from the bus error state.  Nothing in the current
- *   machine raises it: bus.js reports non-existent memory as a read of all-ones / a discarded
- *   write and defines.js says mapping that onto a machine check is deliberately left to the CPU
- *   and MMU items, neither of which does it.  takeFault() throws VAXStop rather than pretending.
+ * - MACHINE CHECK (SCB_MCHK) -- PARTIALLY here as of pcjsvax-446.  takeFault()'s SCB.MCHK case
+ *   now reproduces vax_sysdev.c's machine_check() for exactly ONE trigger: a bus fault on a
+ *   physical reference to an address BusVAX.RESERVED reserves but does not decode (a "probe of
+ *   absent hardware"), via cpustate.js's onBusFault() -> busTimeout() -> a thrown VAXFault(-SCB.
+ *   MCHK, ...).  Two things this does NOT cover, deliberately: (a) the REF_P (physical-context)
+ *   half of SIMH's mchk_ref -- see busTimeout()'s doc comment; (b) any OTHER machine-check
+ *   trigger a real KA655 has (parity/ECC error, unaligned reference to I/O space, etc.) --
+ *   none of those exist in this machine yet.  See takeFault()'s SCB.MCHK case for the reproduced
+ *   stack frame, and tests/mchkdiff.js for what is graded against real SIMH.
  * - COMPATIBILITY MODE (PSL<CM>).  A KA655 does not have it: vaxmod_defs.h does not define
  *   CMPM_VAX, so open-simh compiles the "Subset VAX" half of vax_cmode.c in which BadCmPSL()
  *   returns TRUE unconditionally and op_cmode() is a reserved-instruction fault.  badCmPSL() here
@@ -211,6 +215,21 @@ const CVAX_SID = (10 << 24), CVAX_UREV = 6;
 
 const BR_MASK = 0xFFFFFFFC | 0;
 
+/*
+ * SSC bus-timeout register bits (vax_sysdev.c:179-180) and the machine-check "reference" codes
+ * (vaxmod_defs.h:96-97) ReadReg()/WriteReg() report when a physical reference lands on NOTHING --
+ * pcjsvax-446.  REF_V (0, the ordinary "virtual context" data reference every executed LOAD/STORE
+ * makes) is added into MCHK_READ/MCHK_WRITE by SIMH's `if (p1 & 0x80) p1 = p1 + mchk_ref;`; this
+ * file does not add it explicitly because every case this item's differential (mchkdiff.js)
+ * exercises reaches busTimeout() through mmu.readData()/writeData(), which is exactly SIMH's
+ * REF_V path.  The REF_P case (mchk_ref=1) is reached only through readLP()/writeLP() -- an SCB,
+ * PCB or PTE reference landing on non-existent memory, a CPU-misconfiguration scenario this item
+ * does not model or grade; see busTimeout()'s doc comment.
+ */
+const SSCBTO_BTO = 0x80000000 | 0;
+const SSCBTO_RWT = 0x40000000;
+const MCHK_READ = 0x80, MCHK_WRITE = 0x82;
+
 /**
  * @class VAXStop
  *
@@ -239,7 +258,8 @@ VAXStop.REASON = {
     CHMFI:   "CHMx on the interrupt stack",     // STOP_CHMFI
     UIPL:    "undefined interrupt level",       // STOP_UIPL
     CMODE:   "compatibility mode",              // no CMPM_VAX on a KA655
-    MCHK:    "machine check (not modelled)",
+    MCHK:    "machine check (unmodelled trigger)",   // the bus-fault trigger no longer stops here;
+                                                       // see takeFault()'s SCB.MCHK case, pcjsvax-446
     UNKABO:  "unknown abort code"        // STOP_UNKABO
 };
 
@@ -321,6 +341,13 @@ class VAXExc {
         this.intReq = new Int32Array(IPL_HLVL);
         this.iprDevice = null;
         /*
+         * SSC bus-timeout register (vax_sysdev.c:246, `int32 ssc_bto = 0`).  Set by busTimeout()
+         * below; read back by a harness the same way SIMH's console reads it (`examine sysd bto`)
+         * -- see busTimeout()'s doc comment.  Not decoded as a device register: this is state
+         * tracking for the ONE bit this item needs, not the SSC device model IPR_DEVICE defers.
+         */
+        this.sscBto = 0;
+        /*
          * fault_PC (vax_cpu.c:258): the PC of the instruction currently being executed, captured
          * before its opcode is fetched.  The abort handler restores PC to it so the exception
          * frame records the FAULTING instruction, not the middle of it -- which is what makes the
@@ -343,6 +370,33 @@ class VAXExc {
         this.memErr = this.crdErr = this.hltPin = 0;
         this.intReq.fill(0);
         this.faultPC = 0;
+        this.sscBto = 0;                     // vax_sysdev.c:1789, cleared on reset
+    }
+
+    /**
+     * busTimeout(fWrite)
+     *
+     * vax_sysdev.c ReadReg()/WriteReg() `default:` case (:1031-1032, :1071-1072) -- what a KA655
+     * does when a physical reference lands on an address BusVAX.RESERVED reserves but does not
+     * decode: set the SSC bus-timeout bit (both SSCBTO_BTO and SSCBTO_RWT; the plain-IPR default
+     * case, vax_sysdev.c:913/982, sets only SSCBTO_BTO, but that is the MTPR/MFPR path -- a
+     * different mechanism this item does not touch) and hand back the machine-check parameter
+     * (p1) SCB_MCHK's dispatch (below, in takeFault()) needs.
+     *
+     * Called from cpustate.js's onBusFault(), the JS mirror of ReadReg/WriteReg's default branch.
+     * Setting the bit HERE, at fault-detection time rather than inside the SCB_MCHK dispatch
+     * below, matters: SIMH sets ssc_bto and THEN calls MACH_CHECK(), so the bit is set even on the
+     * (unreached by this item's tests) path where in_ie is already set and the dispatch panics
+     * instead of completing -- reproduced by cpustate.js throwing after this runs, not before.
+     *
+     * @this {VAXExc}
+     * @param {boolean} fWrite
+     * @returns {number} MCHK_READ or MCHK_WRITE -- the SCB_MCHK fault's p1
+     */
+    busTimeout(fWrite)
+    {
+        this.sscBto = (this.sscBto | SSCBTO_BTO | SSCBTO_RWT) | 0;
+        return fWrite ? MCHK_WRITE : MCHK_READ;
     }
 
     /**
@@ -608,8 +662,41 @@ class VAXExc {
             }
             break;
 
-        case SCB.MCHK:
-            throw new VAXStop(VAXStop.REASON.MCHK, fault.p1);
+        case SCB.MCHK: {
+            /*
+             * vax_sysdev.c machine_check(p1, opc, cc, delta), pcjsvax-446.  `in_ie` panics exactly
+             * like RESIN/RESAD/RESOP/ARITH above -- machine_check()'s own first line is
+             * `if (in_ie) ABORT (STOP_INIE)`.
+             *
+             * fault.p1 is the MCHK_READ/MCHK_WRITE code busTimeout() returned; fault.p2 carries
+             * `delta` (PC - fault_PC at the moment of the fault, i.e. how far decode had already
+             * consumed the faulting instruction) -- smuggled through the VAXFault because
+             * cpustate.js's onBusFault() is where PC is still live, before takeFault()'s common
+             * preamble (above) resets it to faultPC.
+             *
+             * p2 (the machine-check "address" parameter) is `mmu.mchkVA + 4`, and MUST be read
+             * before intexc() runs: intexc() pushes the old PC/PSL through mmu.writeData(), which
+             * overwrites mchkVA with the PUSH address -- exactly the clobber SIMH's own
+             * `p2 = mchk_va + 4` (vax_sysdev.c:1649) avoids by capturing it before its own call to
+             * intexc().  CADR/MSER (state1's low 16 bits) are SSC/CMCTL device state this file
+             * defers (IPR_DEVICE); mchkdiff.js never writes them, so both sides read 0 there --
+             * see that file's header for the scope note.
+             */
+            if (this.inIE) throw new VAXStop(VAXStop.REASON.INIE, vec);
+            let p1 = fault.p1;
+            let delta = fault.p2;
+            let p2 = (cpu.mmu.mchkVA + 4) | 0;
+            let opc = cpu.decoder.opc;
+            let hsir = 0;
+            for (let i = 0; i < 16; i++) { if ((this.sisr >>> i) & 1) hsir = i; }
+            let st1 = (((opc & 0xFF) << 24) | (hsir << 16)) | 0;      // + CADR/MSER, unmodelled (0)
+            let st2 = (0x00C07000 + (delta & 0xFF)) | 0;
+            this.intexc(cpu, SCB.MCHK, 0, IE.SVE);
+            this.inIE = 1;
+            this.pushParams(cpu, [16, p1, p2, st1, st2]);
+            this.inIE = 0;
+            break;
+        }
 
         default:
             /*
@@ -1337,5 +1424,6 @@ export {
     SISR_MASK, SISR_2, AST_MAX,
     IPL_HLTPIN, IPL_MEMERR, IPL_CRDERR, IPL_HMAX, IPL_HMIN, IPL_SMAX,
     TIR_TRAP, TIR_V_TRAP, TIR_M_TRAP, TRAP_INTOV, TRAP_DIVZRO,
-    CVAX_SID, CVAX_UREV, BR_MASK, ccIIZZ_L
+    CVAX_SID, CVAX_UREV, BR_MASK, ccIIZZ_L,
+    SSCBTO_BTO, SSCBTO_RWT, MCHK_READ, MCHK_WRITE
 };
