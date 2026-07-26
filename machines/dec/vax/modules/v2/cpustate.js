@@ -362,6 +362,23 @@ export default class CPUStateVAX extends Component {
          */
         this.hst = null;
 
+        /*
+         * Optional per-instruction device-service hook, or null (pcjsvax-954).  Mirrors `hst`
+         * immediately above in every structural respect: a test/machine builder wires it in from
+         * outside (this class does not know what a "clock" is), reset() below does NOT touch it
+         * (a device's identity is not CPU state -- see exc.js's intVec[] for the same rule applied
+         * to interrupt sources), and it is called from exactly one place, stepCPU()'s loop.
+         *
+         * TIMING MODEL, DECIDED HERE: real hardware's clk_svc (vax_stddev.c:455) is scheduled by
+         * HOST WALL-CLOCK time (100Hz, sim_rtcn_calb-calibrated) -- which is exactly why
+         * HANDOFF.md 7 records EHKAA's own dispatch counts varying run to run. `clk.tick(cpu)` is
+         * called once per INSTRUCTION RETIRED instead: deterministic and diffable, at the cost of
+         * not corresponding to any fixed amount of real time. modules/v2/clk.js's own throttle
+         * (instructions-per-tick) decides how many calls make one "tick"; this hook just supplies
+         * the count.  See tests/timerdiff.js's determinism proof (run twice, diff).
+         */
+        this.clk = null;
+
         this.decoder = new VAXDecoder(this);
         this.exc = new VAXExc(this);
         this.fpu = new VAXFloat(this);
@@ -870,6 +887,14 @@ export default class CPUStateVAX extends Component {
              * dispatched.  See the `hst` property comment.
              */
             if (this.hst) this.hst.finish(this);
+
+            /*
+             * pcjsvax-954: the device-service hook, once per instruction retired.  Placed here
+             * (top of loop, alongside hst.finish()) rather than after the fetch/execute below, so
+             * a device's tick is attributed to the boundary BETWEEN instructions, never inside
+             * one -- the same reason hst.finish() runs here and not immediately after the body.
+             */
+            if (this.clk) this.clk.tick(this);
 
             /*
              * vax_cpu.c:729-730.  `sim_interval` is charged BEFORE the fetch, and `extra_bytes`
