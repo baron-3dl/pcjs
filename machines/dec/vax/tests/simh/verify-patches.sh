@@ -48,10 +48,32 @@
 #                  0006 specifically -- being the LAST patch in the chain, 0006 has no downstream
 #                  patch whose context would break if it were silently dropped or neutered, so
 #                  nothing about patch-apply mechanics alone can ever catch it.
+#   5. SILENCE-QIO -- pcjsvax-62a's WriteIO trace guard neutered the same way (`if (sim_deb)` ->
+#                  `if (0 && sim_deb)` on the QIOW call in ReadIO/WriteIO's WriteIO, not ReadIO).
+#                  Applies clean, builds clean, EHKAA PASSes -- and devtrace-tally.py must FAIL, by
+#                  name, on QBIOP WRITE and QBCQM WRITE. WriteIO is the single choke point both the
+#                  Qbus I/O-page branch and the Qbus memory-window (CQM) branch share for writes
+#                  (same as 0006's ReadReg/WriteReg being the single choke point for eight
+#                  register-space families at once), so neutering this one guard silently kills
+#                  both new families' write side at once -- measured, not assumed: see
+#                  devtrace-tally.py's module docstring for the QBIOP/QBCQM design rationale.
+#   6. SILENCE-QIO-READIOU -- pcjsvax-62a's ReadIOU guard neutered specifically (the SECOND QIOR
+#                  guard in the patch, ReadIO's own left untouched). Applies clean, builds clean,
+#                  EHKAA PASSes, and -- this is the point -- QBIOP/QBCQM's BOOT-DERIVED floors do
+#                  NOT catch it: a no-disk boot-to->>> never drives an unaligned Qbus access, so
+#                  QBIOP/QBCQM's counts are byte-for-byte identical between the good binary and
+#                  this mutant. Only devtrace-tally.py's deterministic unaligned_probe() (a
+#                  hand-assembled unaligned MOVL, stepped directly, no boot involved) can catch
+#                  this; it must FAIL and name UNALIGNED READ. Found by a veracity re-dispatch
+#                  the same day patch 0006 was extended: the QBIOP/QBCQM floors alone left this
+#                  hole, mutations 6 and 7 are what closed it.
+#   7. SILENCE-QIO-WRITEIOU -- the write-side mirror of mutation 6, neutering the SECOND QIOW
+#                  guard (WriteIOU's, not WriteIO's -- WriteIO's is mutation 5's victim). Same
+#                  invisibility to every boot-derived gate; must FAIL and name UNALIGNED WRITE.
 # Each case is independently asserted; the run fails (non-zero exit) if ANY case is silently
 # tolerated (patch applies when it shouldn't, or the failure isn't attributed to the mutated
 # patch). This assertion does not get cheaper as the mutation count grows -- it is a fixed set of
-# four known failure modes, each checked in full, every run.
+# seven known failure modes, each checked in full, every run.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -174,7 +196,7 @@ run_selfcheck() {
         exit 1
     fi
 
-    echo "=== mutation 1/4: DROP (remove $(basename "${PATCHES[$victim_idx]}") from the chain) ==="
+    echo "=== mutation 1/7: DROP (remove $(basename "${PATCHES[$victim_idx]}") from the chain) ==="
     local -a dropped=()
     for i in "${!PATCHES[@]}"; do
         [[ $i -eq $victim_idx ]] && continue
@@ -193,7 +215,7 @@ run_selfcheck() {
     fi
     echo
 
-    echo "=== mutation 2/4: REORDER (swap $(basename "${PATCHES[$victim_idx]}") and the patch after it) ==="
+    echo "=== mutation 2/7: REORDER (swap $(basename "${PATCHES[$victim_idx]}") and the patch after it) ==="
     local -a reordered=("${PATCHES[@]}")
     if [[ $((victim_idx + 1)) -lt "${#PATCHES[@]}" ]]; then
         local tmp="${reordered[$victim_idx]}"
@@ -208,7 +230,7 @@ run_selfcheck() {
     fi
     echo
 
-    echo "=== mutation 3/4: CORRUPT (perturb a context line inside $(basename "${PATCHES[$victim_idx]}")) ==="
+    echo "=== mutation 3/7: CORRUPT (perturb a context line inside $(basename "${PATCHES[$victim_idx]}")) ==="
     mkdir -p "$scratch/corrupt-patches"
     local corrupted="$scratch/corrupt-patches/$(basename "${PATCHES[$victim_idx]}")"
     # Flip one character in a context line (a line starting with a single space) so the patch's
@@ -244,7 +266,7 @@ run_selfcheck() {
     fi
     echo
 
-    echo "=== mutation 4/4: SILENCE (neuter 0006's WriteReg trace guard -- applies clean, builds"
+    echo "=== mutation 4/7: SILENCE (neuter 0006's WriteReg trace guard -- applies clean, builds"
     echo "    clean, EHKAA PASSes; must be caught by devtrace-tally.py, not by patch mechanics) ==="
     local victim6_idx=-1
     for i in "${!PATCHES[@]}"; do
@@ -326,11 +348,242 @@ PYEOF
     fi
     echo
 
-    if [[ $failures -ne 0 ]]; then
-        echo "SELFCHECK FAILED: $failures/4 mutation(s) were not caught (coverage hole)." >&2
+    echo "=== mutation 5/7: SILENCE-QIO (neuter pcjsvax-62a's WriteIO trace guard -- applies clean,"
+    echo "    builds clean, EHKAA PASSes; must be caught by devtrace-tally.py, not by patch mechanics) ==="
+    mkdir -p "$scratch/silence-qio-patches"
+    local silenced_qio="$scratch/silence-qio-patches/$(basename "${PATCHES[$victim6_idx]}")"
+    # Neuter exactly the WriteIO trace guard (the write-side choke point both new Qbus-I/O-page and
+    # CQM families share) -- a side channel with no bearing on instruction semantics, so nothing
+    # upstream of devtrace-tally.py can see this mutation at all.
+    python3 - "${PATCHES[$victim6_idx]}" "$silenced_qio" <<'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "r", newline="") as f:
+    content = f.read()
+old2 = '+if (sim_deb)                                             /* pcjs-vax: Qbus I/O-page/CQM write trace */'
+n = content.count(old2)
+if n != 2:
+    sys.exit("FATAL(selfcheck): expected exactly two QIOW trace guard lines (WriteIO + WriteIOU), found %d" % n)
+new2 = '+if (0 && sim_deb)                                        /* pcjs-vax: Qbus I/O-page/CQM write trace */'
+# Neuter only the FIRST occurrence (WriteIO, the aligned-write choke point) -- WriteIOU's stays
+# live, proving the mutation targets exactly one function, not a blanket string replace.
+idx = content.find(old2)
+content = content[:idx] + new2 + content[idx + len(old2):]
+with open(dst, "w", newline="") as f:
+    f.write(content)
+PYEOF
+    if cmp -s "${PATCHES[$victim6_idx]}" "$silenced_qio"; then
+        echo "FATAL(selfcheck): silence-qio step was a no-op." >&2
         exit 1
     fi
-    echo "SELFCHECK PASSED: all 4/4 mutations caught and correctly attributed."
+
+    local -a silenced_qio_list=()
+    for i in "${!PATCHES[@]}"; do
+        if [[ $i -eq $victim6_idx ]]; then
+            silenced_qio_list+=("$silenced_qio")
+        else
+            silenced_qio_list+=("${PATCHES[$i]}")
+        fi
+    done
+
+    if ! apply_chain "$scratch/silence-qio" "${silenced_qio_list[@]}" 2>"$scratch/silence-qio-apply.err"; then
+        echo "FATAL(selfcheck): the silenced-qio 0006 variant did not even APPLY cleanly -- the point" >&2
+        echo "                  of this mutation is that it must reach BUILD+RUN to be tested." >&2
+        cat "$scratch/silence-qio-apply.err" >&2
+        exit 1
+    fi
+    echo "silenced-qio variant applied cleanly (expected -- the mutation is semantic, not textual)"
+
+    local silence_qio_buildlog="$scratch/silence-qio-build.log"
+    if ! (cd "$scratch/silence-qio" && make NOASYNCH=1 NONETWORK=1 NOVIDEO=1 -j"$(nproc 2>/dev/null || echo 4)" vax) >"$silence_qio_buildlog" 2>&1; then
+        echo "FATAL(selfcheck): silenced-qio variant failed to build -- cannot test the tally against it." >&2
+        tail -60 "$silence_qio_buildlog" >&2
+        exit 1
+    fi
+    if ! grep -q 'PASSED - MicroVAX 3900 Hardware Core Instruction test EHKAA' "$silence_qio_buildlog"; then
+        echo "FATAL(selfcheck): silenced-qio variant did not report EHKAA PASS -- cannot test the tally against it." >&2
+        exit 1
+    fi
+    echo "silenced-qio variant applies, builds, and passes EHKAA -- exactly as demonstrated: this"
+    echo "mutation is invisible to every OTHER gate in this pipeline."
+
+    local tally_qio_out="$scratch/silence-qio-tally.out"
+    if python3 "$HERE/devtrace-tally.py" --simh "$scratch/silence-qio/BIN/microvax3900" --src "$scratch/silence-qio" >"$tally_qio_out" 2>&1; then
+        echo "COVERAGE HOLE: devtrace-tally.py PASSED against the silenced-qio (WriteIO-neutered) variant. Not caught." >&2
+        cat "$tally_qio_out" >&2
+        failures=$((failures + 1))
+    else
+        if grep -q "QBIOP WRITE" "$tally_qio_out" && grep -q "QBCQM WRITE" "$tally_qio_out"; then
+            echo "caught: devtrace-tally.py FAILED against the silenced-qio variant and named exactly"
+            echo "        the two families the mutation kills (QBIOP/QBCQM WRITE). Good."
+        else
+            echo "caught: devtrace-tally.py FAILED, but did not name both expected families" >&2
+            echo "        (see $tally_qio_out). Reporting fail-open on attribution." >&2
+            cat "$tally_qio_out" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+    echo
+
+    echo "=== mutation 6/7: SILENCE-QIO-READIOU (neuter pcjsvax-62a's ReadIOU guard specifically --"
+    echo "    applies clean, builds clean, EHKAA PASSes, and QBIOP/QBCQM's BOOT-DERIVED floors do"
+    echo "    NOT catch it (a no-disk boot never drives the unaligned path); only the deterministic"
+    echo "    unaligned_probe() in devtrace-tally.py can) ==="
+    mkdir -p "$scratch/silence-readiou-patches"
+    local silenced_readiou="$scratch/silence-readiou-patches/$(basename "${PATCHES[$victim6_idx]}")"
+    # QIOR's trace guard appears twice in the patch: ReadIO's (aligned) then ReadIOU's (unaligned).
+    # Neuter only the SECOND occurrence -- ReadIOU's -- leaving ReadIO's guard live, so this
+    # mutation is invisible to the QBIOP/QBCQM boot-derived floors (which never exercise the
+    # unaligned path) and can only be caught by a probe that drives an unaligned access directly.
+    python3 - "${PATCHES[$victim6_idx]}" "$silenced_readiou" <<'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "r", newline="") as f:
+    content = f.read()
+old2 = '+if (sim_deb)                                             /* pcjs-vax: Qbus I/O-page/CQM read trace */'
+n = content.count(old2)
+if n != 2:
+    sys.exit("FATAL(selfcheck): expected exactly two QIOR trace guard lines (ReadIO + ReadIOU), found %d" % n)
+new2 = '+if (0 && sim_deb)                                        /* pcjs-vax: Qbus I/O-page/CQM read trace */'
+idx1 = content.find(old2)
+idx2 = content.find(old2, idx1 + 1)
+content = content[:idx2] + new2 + content[idx2 + len(old2):]
+with open(dst, "w", newline="") as f:
+    f.write(content)
+PYEOF
+    if cmp -s "${PATCHES[$victim6_idx]}" "$silenced_readiou"; then
+        echo "FATAL(selfcheck): silence-readiou step was a no-op." >&2
+        exit 1
+    fi
+
+    local -a silenced_readiou_list=()
+    for i in "${!PATCHES[@]}"; do
+        if [[ $i -eq $victim6_idx ]]; then
+            silenced_readiou_list+=("$silenced_readiou")
+        else
+            silenced_readiou_list+=("${PATCHES[$i]}")
+        fi
+    done
+
+    if ! apply_chain "$scratch/silence-readiou" "${silenced_readiou_list[@]}" 2>"$scratch/silence-readiou-apply.err"; then
+        echo "FATAL(selfcheck): the silenced-readiou 0006 variant did not even APPLY cleanly." >&2
+        cat "$scratch/silence-readiou-apply.err" >&2
+        exit 1
+    fi
+    echo "silenced-readiou variant applied cleanly (expected -- the mutation is semantic, not textual)"
+
+    local silence_readiou_buildlog="$scratch/silence-readiou-build.log"
+    if ! (cd "$scratch/silence-readiou" && make NOASYNCH=1 NONETWORK=1 NOVIDEO=1 -j"$(nproc 2>/dev/null || echo 4)" vax) >"$silence_readiou_buildlog" 2>&1; then
+        echo "FATAL(selfcheck): silenced-readiou variant failed to build -- cannot test the probe against it." >&2
+        tail -60 "$silence_readiou_buildlog" >&2
+        exit 1
+    fi
+    if ! grep -q 'PASSED - MicroVAX 3900 Hardware Core Instruction test EHKAA' "$silence_readiou_buildlog"; then
+        echo "FATAL(selfcheck): silenced-readiou variant did not report EHKAA PASS -- cannot test the probe against it." >&2
+        exit 1
+    fi
+    echo "silenced-readiou variant applies, builds, and passes EHKAA -- exactly as demonstrated:"
+    echo "this mutation is invisible to every OTHER gate in this pipeline, including the"
+    echo "boot-derived QBIOP/QBCQM floors."
+
+    local tally_readiou_out="$scratch/silence-readiou-tally.out"
+    if python3 "$HERE/devtrace-tally.py" --simh "$scratch/silence-readiou/BIN/microvax3900" --src "$scratch/silence-readiou" >"$tally_readiou_out" 2>&1; then
+        echo "COVERAGE HOLE: devtrace-tally.py PASSED against the silenced-readiou variant. Not caught." >&2
+        cat "$tally_readiou_out" >&2
+        failures=$((failures + 1))
+    else
+        if grep -q "UNALIGNED READ" "$tally_readiou_out"; then
+            echo "caught: devtrace-tally.py's unaligned_probe() FAILED against the silenced-readiou"
+            echo "        variant and named exactly the path the mutation kills (UNALIGNED READ). Good."
+        else
+            echo "caught: devtrace-tally.py FAILED, but did not name UNALIGNED READ" >&2
+            echo "        (see $tally_readiou_out). Reporting fail-open on attribution." >&2
+            cat "$tally_readiou_out" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+    echo
+
+    echo "=== mutation 7/7: SILENCE-QIO-WRITEIOU (neuter pcjsvax-62a's WriteIOU guard specifically --"
+    echo "    same rationale as mutation 6/7, mirrored for the write side) ==="
+    mkdir -p "$scratch/silence-writeiou-patches"
+    local silenced_writeiou="$scratch/silence-writeiou-patches/$(basename "${PATCHES[$victim6_idx]}")"
+    # QIOW's trace guard also appears twice: WriteIO's (aligned, already the mutation 5/7 victim)
+    # then WriteIOU's (unaligned). Neuter only the SECOND occurrence.
+    python3 - "${PATCHES[$victim6_idx]}" "$silenced_writeiou" <<'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "r", newline="") as f:
+    content = f.read()
+old2 = '+if (sim_deb)                                             /* pcjs-vax: Qbus I/O-page/CQM write trace */'
+n = content.count(old2)
+if n != 2:
+    sys.exit("FATAL(selfcheck): expected exactly two QIOW trace guard lines (WriteIO + WriteIOU), found %d" % n)
+new2 = '+if (0 && sim_deb)                                        /* pcjs-vax: Qbus I/O-page/CQM write trace */'
+idx1 = content.find(old2)
+idx2 = content.find(old2, idx1 + 1)
+content = content[:idx2] + new2 + content[idx2 + len(old2):]
+with open(dst, "w", newline="") as f:
+    f.write(content)
+PYEOF
+    if cmp -s "${PATCHES[$victim6_idx]}" "$silenced_writeiou"; then
+        echo "FATAL(selfcheck): silence-writeiou step was a no-op." >&2
+        exit 1
+    fi
+
+    local -a silenced_writeiou_list=()
+    for i in "${!PATCHES[@]}"; do
+        if [[ $i -eq $victim6_idx ]]; then
+            silenced_writeiou_list+=("$silenced_writeiou")
+        else
+            silenced_writeiou_list+=("${PATCHES[$i]}")
+        fi
+    done
+
+    if ! apply_chain "$scratch/silence-writeiou" "${silenced_writeiou_list[@]}" 2>"$scratch/silence-writeiou-apply.err"; then
+        echo "FATAL(selfcheck): the silenced-writeiou 0006 variant did not even APPLY cleanly." >&2
+        cat "$scratch/silence-writeiou-apply.err" >&2
+        exit 1
+    fi
+    echo "silenced-writeiou variant applied cleanly (expected -- the mutation is semantic, not textual)"
+
+    local silence_writeiou_buildlog="$scratch/silence-writeiou-build.log"
+    if ! (cd "$scratch/silence-writeiou" && make NOASYNCH=1 NONETWORK=1 NOVIDEO=1 -j"$(nproc 2>/dev/null || echo 4)" vax) >"$silence_writeiou_buildlog" 2>&1; then
+        echo "FATAL(selfcheck): silenced-writeiou variant failed to build -- cannot test the probe against it." >&2
+        tail -60 "$silence_writeiou_buildlog" >&2
+        exit 1
+    fi
+    if ! grep -q 'PASSED - MicroVAX 3900 Hardware Core Instruction test EHKAA' "$silence_writeiou_buildlog"; then
+        echo "FATAL(selfcheck): silenced-writeiou variant did not report EHKAA PASS -- cannot test the probe against it." >&2
+        exit 1
+    fi
+    echo "silenced-writeiou variant applies, builds, and passes EHKAA -- exactly as demonstrated:"
+    echo "this mutation is invisible to every OTHER gate in this pipeline, including the"
+    echo "boot-derived QBIOP/QBCQM floors."
+
+    local tally_writeiou_out="$scratch/silence-writeiou-tally.out"
+    if python3 "$HERE/devtrace-tally.py" --simh "$scratch/silence-writeiou/BIN/microvax3900" --src "$scratch/silence-writeiou" >"$tally_writeiou_out" 2>&1; then
+        echo "COVERAGE HOLE: devtrace-tally.py PASSED against the silenced-writeiou variant. Not caught." >&2
+        cat "$tally_writeiou_out" >&2
+        failures=$((failures + 1))
+    else
+        if grep -q "UNALIGNED WRITE" "$tally_writeiou_out"; then
+            echo "caught: devtrace-tally.py's unaligned_probe() FAILED against the silenced-writeiou"
+            echo "        variant and named exactly the path the mutation kills (UNALIGNED WRITE). Good."
+        else
+            echo "caught: devtrace-tally.py FAILED, but did not name UNALIGNED WRITE" >&2
+            echo "        (see $tally_writeiou_out). Reporting fail-open on attribution." >&2
+            cat "$tally_writeiou_out" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+    echo
+
+    if [[ $failures -ne 0 ]]; then
+        echo "SELFCHECK FAILED: $failures/7 mutation(s) were not caught (coverage hole)." >&2
+        exit 1
+    fi
+    echo "SELFCHECK PASSED: all 7/7 mutations caught and correctly attributed."
     rm -rf "$scratch"
 }
 
