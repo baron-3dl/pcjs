@@ -1,0 +1,347 @@
+diff --git a/VAX/vax_cpu.c b/VAX/vax_cpu.c
+index 9b61d38..49a7e7d 100644
+--- a/VAX/vax_cpu.c
++++ b/VAX/vax_cpu.c
+@@ -352,6 +352,8 @@ t_stat cpu_set_size (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+ t_stat cpu_set_hist (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+ t_stat cpu_show_hist (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
+ t_stat cpu_show_virt (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
++t_stat cpu_show_mmuop (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
++t_stat cpu_set_mmutrace (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+ t_stat cpu_set_idle (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+ t_stat cpu_show_idle (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
+ t_stat cpu_set_instruction_set (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+@@ -466,6 +468,13 @@ MTAB cpu_mod[] = {
+       &cpu_set_hist, &cpu_show_hist, NULL, "Enable/Display instruction history" },
+     { MTAB_XTD|MTAB_VDV|MTAB_NMO|MTAB_SHP, 0, "VIRTUAL", NULL,
+       NULL, &cpu_show_virt, NULL, "show translation for address arg in KESU mode" },
++    /* pcjs-vax MMU differential-test support; see machines/dec/vax/tests/simh/README.md */
++    { MTAB_XTD|MTAB_VDV|MTAB_NMO|MTAB_SHP|MTAB_NC, 0, "MMUOP", NULL,
++      NULL, &cpu_show_mmuop, NULL, "perform one MMU op: op:va:lnt:mode[:val]" },
++    { MTAB_XTD|MTAB_VDV|MTAB_NC, 1, NULL, "MMUTRACE",
++      &cpu_set_mmutrace, NULL, NULL, "log every MMU operation to a file" },
++    { MTAB_XTD|MTAB_VDV, 0, NULL, "NOMMUTRACE",
++      &cpu_set_mmutrace, NULL, NULL, "stop logging MMU operations" },
+     CPU_MODEL_MODIFIERS  /* Model specific cpu modifiers from vaxXXX_defs.h */
+     CPU_INST_MODIFIERS   /* Model specific cpu instruction modifiers from vaxXXX_defs.h */
+     { 0 }
+@@ -3566,9 +3575,116 @@ else if (sw & SWMASK ('S'))
+ else if (sw & SWMASK ('U'))
+     md = USER;
+ else md = PSL_GETCUR (PSL);
++if (sw & SWMASK ('W'))                                  /* pcjs-vax: probe WRITE access */
++    return ACC_MASK (md) << TLB_V_WACC;
+ return ACC_MASK (md);
+ }
+ 
++/* pcjs-vax MMU differential-test support
++   ---------------------------------------
++   Two additive facilities, both inert unless explicitly used, that let
++   machines/dec/vax/tests/mmudiff.js grade a JavaScript port of vax_mmu.[ch]
++   against this simulator:
++
++   SHOW CPU MMUOP=op:va:lnt:mode[:val]      (colon separated -- SHOW splits on comma)
++        Performs exactly ONE memory-management operation and prints one
++        machine-readable line.  op 0 = Test with read access, 1 = Test with
++        write access, 2 = Read, 3 = Write, 4 = MTPR (va is the value written
++        and the trailing field is the IPR number, so the test can drive the
++        REAL MTPR handler -- and therefore SIMH's own TB-invalidation and
++        set_map_reg rules -- rather than a console register deposit, which
++        bypasses both).  mode 0..3 = K/E/S/U.  Read and
++        Write abort through the CPU's fault path, so this routine owns a
++        setjmp of its own; without it a translation fault would longjmp into
++        a stale sim_instr frame.
++
++   SET CPU MMUTRACE=<file> / SET CPU NOMMUTRACE
++        Opens the sink the PCJS_MMU_T hooks in vax_mmu.[ch] write to.  Those
++        hooks are single NULL tests when the sink is closed.
++
++   Neither changes any instruction semantics. */
++
++t_stat cpu_show_mmuop (FILE *of, UNIT *uptr, int32 val, CONST void *desc)
++{
++const char *cptr = (const char *) desc;
++static volatile int32 op, lnt, md, acc, dat;
++static volatile uint32 va;
++int32 st, abortval, opnd[2];
++unsigned int a_op, a_lnt, a_md, a_va, a_dat;
++int n;
++
++if (cptr == NULL)
++    return SCPE_ARG;
++a_dat = 0;
++n = sscanf (cptr, "%u:%x:%u:%u:%x", &a_op, &a_va, &a_lnt, &a_md, &a_dat);
++if (n < 4)
++    return SCPE_ARG;
++op = (int32) a_op;
++va = (uint32) a_va;
++lnt = (int32) a_lnt;
++md = (int32) (a_md & 3);
++dat = (int32) a_dat;
++if ((lnt != L_BYTE) && (lnt != L_WORD) && (lnt != L_LONG))
++    return SCPE_ARG;
++set_map_reg ();                                         /* refresh dynamic map regs */
++acc = (op == 1) || (op == 3) ? (ACC_MASK (md) << TLB_V_WACC) : ACC_MASK (md);
++
++abortval = setjmp (save_env);                           /* set abort handler */
++if (abortval != 0) {
++    fprintf (of, "MMUOP %d %08X %d %08X abort %d %08X %08X\n",
++        op, va, lnt, acc, abortval, p1, p2);
++    return SCPE_OK;
++    }
++switch (op) {
++
++    case 0:
++    case 1:
++        st = PR_OK;
++        val = Test (va, acc, &st);
++        if (st == PR_OK)
++            fprintf (of, "MMUOP %d %08X %d %08X ok %08X\n", op, va, lnt, acc, val);
++        else fprintf (of, "MMUOP %d %08X %d %08X stat %d\n", op, va, lnt, acc, st);
++        break;
++
++    case 2:
++        val = Read (va, lnt, acc);
++        fprintf (of, "MMUOP %d %08X %d %08X ok %08X\n", op, va, lnt, acc, val);
++        break;
++
++    case 3:
++        Write (va, dat, lnt, acc);
++        fprintf (of, "MMUOP %d %08X %d %08X ok %08X\n", op, va, lnt, acc, dat);
++        break;
++
++    case 4:                                             /* MTPR va -> IPR dat */
++        opnd[0] = (int32) va;
++        opnd[1] = dat;
++        op_mtpr (opnd);
++        fprintf (of, "MMUOP %d %08X %d %08X ok %08X\n", op, va, lnt, acc, dat);
++        break;
++
++    default:
++        return SCPE_ARG;
++        }
++return SCPE_OK;
++}
++
++t_stat cpu_set_mmutrace (UNIT *uptr, int32 val, CONST char *cptr, void *desc)
++{
++if (pcjs_mmu_log != NULL) {
++    fclose (pcjs_mmu_log);
++    pcjs_mmu_log = NULL;
++    }
++if (val == 0)                                           /* NOMMUTRACE */
++    return SCPE_OK;
++if ((cptr == NULL) || (*cptr == 0))
++    return SCPE_ARG;
++pcjs_mmu_log = fopen (cptr, "w");
++if (pcjs_mmu_log == NULL)
++    return SCPE_OPENERR;
++return SCPE_OK;
++}
++
+ /* Set history */
+ 
+ t_stat cpu_set_hist (UNIT *uptr, int32 val, CONST char *cptr, void *desc)
+diff --git a/VAX/vax_mmu.c b/VAX/vax_mmu.c
+index debc293..717a981 100644
+--- a/VAX/vax_mmu.c
++++ b/VAX/vax_mmu.c
+@@ -52,6 +52,7 @@
+ #include "vax_defs.h"
+ #include "vax_mmu.h"
+ #include <setjmp.h>
++#include <stdarg.h>
+ 
+ int32 d_p0br, d_p0lr;                                   /* dynamic copies */
+ int32 d_p1br, d_p1lr;                                   /* altered per ucode */
+@@ -130,6 +131,7 @@ DEVICE tlb_dev = {
+ */
+ 
+ #define MM_ERR(param) { \
++    PCJS_MMU_T (("E %d\n", param)); \
+     if (stat) { \
+         *stat = param; \
+         return zero_pte; \
+@@ -144,6 +146,7 @@ int32 ptidx = (((uint32) va) >> 7) & ~03;
+ int32 tlbpte, ptead, pte, tbi, vpn;
+ static TLBENT zero_pte = { 0, 0 };
+ 
++PCJS_MMU_T (("F %08X %d %08X\n", va, lnt, acc));
+ if (va & VA_S0) {                                       /* system space? */
+     if (ptidx >= d_slr)                                 /* system */
+         MM_ERR (PR_LNV);
+@@ -170,6 +173,7 @@ else {
+         if (ptidx >= d_slr)
+             MM_ERR (PR_PLNV);
+         pte = ReadLP ((d_sbr + ptidx) & PAMASK);        /* get system pte */
++        PCJS_MMU_T (("S %08X %08X\n", (d_sbr + ptidx) & PAMASK, pte));
+ #if defined (VAX_780)
+         if ((pte & PTE_ACC) == 0)                       /* spte ACV? */
+             MM_ERR (PR_PACV);
+@@ -184,6 +188,7 @@ else {
+ #endif
+     }
+ pte = ReadL (ptead);                                    /* read pte */
++PCJS_MMU_T (("P %08X %08X\n", ptead, pte));
+ tlbpte = cvtacc[PTE_GETACC (pte)] |                     /* cvt access */
+     ((pte << VA_N_OFF) & TLB_PFN);                      /* set addr */
+ if ((tlbpte & acc) == 0)                                /* chk access */
+@@ -191,12 +196,15 @@ if ((tlbpte & acc) == 0)                                /* chk access */
+ if ((pte & PTE_V) == 0)                                 /* check valid */
+     MM_ERR (PR_TNV);
+ if (acc & TLB_WACC) {                                   /* write? */
+-    if ((pte & PTE_M) == 0)
++    if ((pte & PTE_M) == 0) {
++        PCJS_MMU_T (("M %08X %08X\n", ptead, pte | PTE_M));
+         WriteL (ptead, pte | PTE_M);
++        }
+     tlbpte = tlbpte | TLB_M;                            /* set M */
+     }
+ vpn = VA_GETVPN (va);
+ tbi = VA_GETTBI (vpn);
++PCJS_MMU_T (("R %08X\n", tlbpte));
+ if ((va & VA_S0) == 0) {                                /* process space? */
+     ptlb[tbi].tag = vpn;                                /* store tlb ent */
+     ptlb[tbi].pte = tlbpte;
+@@ -209,6 +217,17 @@ return stlb[tbi];
+ 
+ /* Utility routines */
+ 
++FILE *pcjs_mmu_log = NULL;                              /* pcjs-vax MMU trace sink */
++
++void pcjs_mmu_trace (const char *fmt, ...)
++{
++va_list ap;
++
++va_start (ap, fmt);
++vfprintf (pcjs_mmu_log, fmt, ap);
++va_end (ap);
++}
++
+ void set_map_reg (void)
+ {
+ d_p0br = P0BR & ~03;
+@@ -217,6 +236,8 @@ d_sbr = (SBR - 0x1000000) & ~03;                        /* VA<31> >> 7 */
+ d_p0lr = (P0LR << 2);
+ d_p1lr = (P1LR << 2) + 0x800000;                        /* VA<30> >> 7 */
+ d_slr = (SLR << 2) + 0x1000000;                         /* VA<31> >> 7 */
++PCJS_MMU_T (("G %08X %08X %08X %08X %08X %08X %d\n",
++    P0BR, P0LR, P1BR, P1LR, SBR, SLR, mapen));
+ }
+ 
+ /* Zap process (0) or whole (1) tb */
+@@ -225,6 +246,7 @@ void zap_tb (int stb)
+ {
+ size_t i;
+ 
++PCJS_MMU_T (("Z %d\n", stb));
+ for (i = 0; i < VA_TBSIZE; i++) {
+     ptlb[i].tag = ptlb[i].pte = -1;
+     if (stb)
+@@ -238,6 +260,7 @@ void zap_tb_ent (uint32 va)
+ {
+ int32 tbi = VA_GETTBI (VA_GETVPN (va));
+ 
++PCJS_MMU_T (("Y %08X\n", va));
+ if (va & VA_S0)
+     stlb[tbi].tag = stlb[tbi].pte = -1;
+ else ptlb[tbi].tag = ptlb[tbi].pte = -1;
+diff --git a/VAX/vax_mmu.h b/VAX/vax_mmu.h
+index 809bb66..d9c5cb3 100644
+--- a/VAX/vax_mmu.h
++++ b/VAX/vax_mmu.h
+@@ -68,6 +68,15 @@ static const int32 insert[4] = {
+     0x00000000, 0x000000FF, 0x0000FFFF, 0x00FFFFFF
+     };
+ 
++/* pcjs-vax MMU differential-test trace (additive; inert unless armed with
++   SET CPU MMUTRACE=<file>).  Every hook below is a single statement that
++   expands to nothing but a NULL test when the log is closed, so the stock
++   simulator's timing and semantics are unchanged. */
++
++extern FILE *pcjs_mmu_log;
++extern void pcjs_mmu_trace (const char *fmt, ...);
++#define PCJS_MMU_T(args) do { if (pcjs_mmu_log) pcjs_mmu_trace args; } while (0)
++
+ extern void zap_tb (int stb);
+ extern void zap_tb_ent (uint32 va);
+ extern t_bool chk_tb_ent (uint32 va);
+@@ -123,6 +132,7 @@ int32 pa1, bo, sc, wl, wh;
+ TLBENT xpte;
+ 
+ mchk_va = va;
++PCJS_MMU_T (("O R %08X %d %08X %d\n", va, lnt, acc, mapen));
+ if (mapen) {                                            /* mapping on? */
+     vpn = VA_GETVPN (va);                               /* get vpn, offset */
+     off = VA_GETOFF (va);
+@@ -137,6 +147,7 @@ else {
+     pa = va & PAMASK;
+     off = 0;
+     }
++PCJS_MMU_T (("A %08X\n", pa));
+ if ((pa & (lnt - 1)) == 0) {                            /* aligned? */
+     if (lnt >= L_LONG)                                  /* long, quad? */
+         return ReadL (pa);
+@@ -155,6 +166,7 @@ if (mapen && ((uint32)(off + lnt) > VA_PAGSIZE)) {      /* cross page? */
+     }
+ else
+     pa1 = ((pa + 4) & PAMASK) & ~03;                   /* not cross page */
++PCJS_MMU_T (("B %08X\n", pa1));
+ bo = pa & 3;
+ if (lnt >= L_LONG) {                                    /* lw unaligned? */
+     sc = bo << 3;
+@@ -189,6 +201,7 @@ int32 pa1, bo, sc;
+ TLBENT xpte;
+ 
+ mchk_va = va;
++PCJS_MMU_T (("O W %08X %d %08X %d\n", va, lnt, acc, mapen));
+ if (mapen) {
+     vpn = VA_GETVPN (va);
+     off = VA_GETOFF (va);
+@@ -203,6 +216,7 @@ else {
+     pa = va & PAMASK;
+     off = 0;
+     }
++PCJS_MMU_T (("A %08X\n", pa));
+ if ((pa & (lnt - 1)) == 0) {                            /* aligned? */
+     if (lnt >= L_LONG)                                  /* long, quad? */
+         WriteL (pa, val);
+@@ -225,6 +239,7 @@ if (mapen && ((uint32)(off + lnt) > VA_PAGSIZE)) {
+     }
+ else
+     pa1 = ((pa + 4) & PAMASK) & ~03;
++PCJS_MMU_T (("B %08X\n", pa1));
+ bo = pa & 3;
+ if (lnt >= L_LONG) {
+     sc = bo << 3;
+@@ -248,19 +263,27 @@ int32 vpn, off, tbi;
+ TLBENT xpte;
+ 
+ *status = PR_OK;                                        /* assume ok */
++PCJS_MMU_T (("O T %08X %d %08X %d\n", va, L_BYTE, acc, mapen));
+ if (mapen) {                                            /* mapping on? */
+     vpn = VA_GETVPN (va);                               /* get vpn, off */
+     off = VA_GETOFF (va);
+     tbi = VA_GETTBI (vpn);
+     xpte = (va & VA_S0)? stlb[tbi]: ptlb[tbi];          /* access tlb */
+-    if ((xpte.pte & acc) && (xpte.tag == vpn))          /* TB hit, acc ok? */ 
++    if ((xpte.pte & acc) && (xpte.tag == vpn)) {        /* TB hit, acc ok? */ 
++        PCJS_MMU_T (("A %08X\n", (xpte.pte & TLB_PFN) | off));
+         return (xpte.pte & TLB_PFN) | off;
++        }
+     xpte = fill (va, L_BYTE, acc, status);              /* fill TB */
+-    if (*status == PR_OK)
++    if (*status == PR_OK) {
++        PCJS_MMU_T (("A %08X\n", (xpte.pte & TLB_PFN) | off));
+         return (xpte.pte & TLB_PFN) | off;
+-    else
++        }
++    else {
++        PCJS_MMU_T (("X %d\n", *status));
+         return -1;
++        }
+     }
++PCJS_MMU_T (("A %08X\n", va & PAMASK));
+ return va & PAMASK;                                     /* ret phys addr */
+ }
+ 
