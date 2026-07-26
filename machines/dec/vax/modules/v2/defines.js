@@ -167,6 +167,24 @@ VAX.ACCESS.WRITE_WORD = VAX.ACCESS.WRITE | VAX.ACCESS.WORD;
 VAX.ACCESS.WRITE_LONG = VAX.ACCESS.WRITE | VAX.ACCESS.LONG;
 VAX.ACCESS.WRITE_QUAD = VAX.ACCESS.WRITE | VAX.ACCESS.QUAD;
 
+/**
+ * isQbusAddr(addr)
+ *
+ * ADDR_IS_IO(x) || ADDR_IS_CQM(x) (vaxmod_defs.h:234, :229) -- true when a physical reference
+ * lands in the Qbus I/O page or the CQBIC's Qbus-memory window, the two ranges a KA655 routes
+ * through vax_io.c's ReadQb()/WriteQb() rather than vax_sysdev.c's ReadReg()/WriteReg().  Shared
+ * by cpustate.js's onBusFault() (pcjsvax-446/pcjsvax-d22) and mmu.js's writeL()/writeU()
+ * (pcjsvax-d22), so the range check cannot drift between the two call sites.
+ *
+ * @param {number} addr
+ * @returns {boolean}
+ */
+VAX.isQbusAddr = function(addr) {
+    let a = addr >>> 0;
+    return (a >= VAX.PHYSMEM.IOPAGE_BASE && a < VAX.PHYSMEM.IOPAGE_BASE + VAX.PHYSMEM.IOPAGE_LENGTH) ||
+           (a >= VAX.PHYSMEM.CQM_BASE && a < VAX.PHYSMEM.CQM_BASE + VAX.PHYSMEM.CQM_LENGTH);
+};
+
 globals.window['VAXjs'] = globals.window['VAXjs'] || {};
 
 export { APPCLASS, APPNAME, APPVERSION, COMPILED, COPYRIGHT, CSSCLASS, DEBUG, DEBUGGER, LICENSE, MAXDEBUG, PRIVATE, RS232, SITEURL, TYPEDARRAYS, VAX, globals };
