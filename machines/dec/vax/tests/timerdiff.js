@@ -408,13 +408,21 @@ function caseNicrIcrInert(bin, scratch, failures)
         let {js, simh} = runFixedCase(bin, scratch, tag, code, {steps: 2});
         checkExact(failures, tag, js.R0, simh.R0, "R0 (must read back 0, not the written value)");
         /*
-         * MEASURED, DISCLOSED DIVERGENCE (not graded as a failure): vax_sysdev.c's ReadIPR/
-         * WriteIPR `default:` case -- the one NICR/ICR fall into -- ALSO sets SSCBTO_BTO
-         * (`examine sysd bto` measured 0x00000000 -> 0x80000000 across a real MFPR NICR).  exc.js's
-         * OWN default (readIPR()/writeIPR() with no device installed) does not set this bit either
-         * -- a pre-existing gap in exc.js itself (see its own default-case comments), and this
-         * item's constraint (do not touch exc.js) leaves this file unable to close it.  Reported
-         * by name so the gap is visible in every run, not silently absent from what gets checked.
+         * PINNED, MEASURED DIVERGENCE (pcjsvax-b4b): vax_sysdev.c's ReadIPR/WriteIPR `default:`
+         * case -- the one NICR/ICR fall into -- ALSO sets SSCBTO_BTO (`examine sysd bto` measured
+         * 0x00000000 -> 0x80000000 across a real MFPR NICR).  exc.js's OWN default (readIPR()/
+         * writeIPR() with no device installed) does not set this bit -- a pre-existing gap in
+         * exc.js itself, which this item's constraint (do not touch exc.js) leaves this file
+         * unable to close; pcjsvax-b4b owns the fix (exc.js's default case must set
+         * sscBto |= SSCBTO_BTO -- BTO only, NOT BTO|RWT, distinct from busTimeout() -- per
+         * vax_sysdev.c:913/982).
+         *
+         * ASSERTED, not merely printed: a plain report has no owner, no expiry, and is not a
+         * tripwire -- a later exc.js change would silently relabel a NEW value "(match)" with
+         * nothing failing.  Pinning the CURRENTLY-MEASURED divergence (simh=BTO set, js=BTO clear)
+         * means the day exc.js changes -- pcjsvax-b4b landing, or anything else touching the
+         * default case -- this assertion goes RED and forces a re-decision, rather than silently
+         * drifting to a new, unnoticed "measured" value.
          */
         let btoOut = runSimh(bin, [
             "set cpu 16m", "set cpu simhalt", "reset all", "deposit MAPEN 0",
@@ -435,8 +443,13 @@ function caseNicrIcrInert(bin, scratch, failures)
             cpu.stepCPU(1);
             return cpu.exc.sscBto >>> 0;
         })();
-        console.log(`  [disclosed, not graded] ${tag}: sysd BTO after -- simh=${hex(simhBtoAfter)} js=${hex(jsBtoAfter)} ` +
-            (simhBtoAfter !== jsBtoAfter ? "(KNOWN DIVERGENCE -- exc.js pre-existing gap, out of this item's scope)" : "(match)"));
+        if (simhBtoAfter !== 0x80000000) {
+            failures.push(`${tag}: pcjsvax-b4b pin broken -- SIMH sysd BTO after MFPR ${prn}=${hex(simhBtoAfter)}, expected 0x80000000 (the measured baseline this pin tracks)`);
+        }
+        if (jsBtoAfter !== 0x00000000) {
+            failures.push(`${tag}: pcjsvax-b4b pin broken -- JS sscBto after MFPR ${prn}=${hex(jsBtoAfter)}, expected 0x00000000. ` +
+                `If exc.js's default IPR case now sets sscBto (pcjsvax-b4b landed), update this pin to assert equality instead.`);
+        }
     }
     covered.nicrIcrInert = true;
 }
@@ -597,10 +610,18 @@ function caseTodrStaysStoppedAcrossTicks(bin, scratch, failures)
  * by direct execution: `deposit CLK TODR 100; sleep 0.5; examine CLK TODR` leaves the RAW register
  * untouched, but a real MTPR/sleep/MFPR round trip through the wall-clock branch measured exactly
  * 100 + 50 = 150, i.e. the formula is correctly centiseconds-per-real-centisecond) -- matched by an
- * equal-duration host busy-wait on the JS side.  The expected delta is computed from ACTUALLY
- * MEASURED elapsed time on each engine independently, with a tolerance wide enough to absorb
- * ordinary OS scheduling jitter (a few centiseconds) but two-to-four orders of magnitude tighter
- * than what a 10x/100x scale bug would produce.
+ * equal-duration host busy-wait on the JS side.  MEASURED CORRECTION (veracity re-dispatch round
+ * 2): this doc comment previously claimed the expected delta is "computed from ACTUALLY MEASURED
+ * elapsed time on each engine independently" -- true of the JS half (actualMs, from Date.now()
+ * before/after the busy-wait) but FALSE of the SIMH half, where simhExpectedDelta is a FIXED
+ * NOMINAL (`sleepSec * 100`), not a measurement -- `sleep` is not instrumented to report back how
+ * long it actually blocked.  The tolerance (see TOL below) is generous enough to cover that
+ * nominal-vs-actual gap for `sleep` too (measured directly: 130 real SIMH samples across idle,
+ * loaded and heavily-loaded regimes, max observed drift 2 centiseconds against an 8-centisecond
+ * tolerance -- and only ONE direction is reachable, since `sleep` can only overshoot its argument,
+ * never undershoot it).  See caseTodrOverflowBoundary() below for a boundary probe that grades
+ * this same RATE bit-exact with zero elapsed time and zero tolerance, if a fully deterministic
+ * check is preferred to this one; both are kept, as this one is also sound.
  *
  * @param {string} bin
  * @param {string} scratch
@@ -624,7 +645,7 @@ function caseTodrRate(bin, scratch, failures)
     let m = /^R0:\s*([0-9A-Fa-f]+)/m.exec(out);
     if (!m) throw new Error(`timerdiff: case ${tag} -- SIMH did not report R0; output:\n${out}`);
     let simhR0 = parseInt(m[1], 16) >>> 0;
-    let simhExpectedDelta = Math.round(sleepSec * 100);
+    let simhExpectedDelta = Math.round(sleepSec * 100);   // NOMINAL, not measured -- see the file header
 
     /* ---- JS side: real host busy-wait of the SAME nominal duration, measured actual elapsed ---- */
     let {bus, cpu, clk} = makeMachine();
@@ -655,13 +676,67 @@ function caseTodrRate(bin, scratch, failures)
 }
 
 /**
+ * caseTodrOverflowBoundary(bin, scratch, failures)
+ *
+ * pcjsvax-954 veracity finding, round 2: todr_rd()'s TOY_MAX_SECS overflow branch (vax_stddev.c:
+ * 490-494) was entirely UNPORTED and undisclosed in the first two rounds of this file -- neither
+ * phase reaches it (phase 2 sends full-range randoms only through the ROM raw context, and caps
+ * non-ROM randoms at 5000).  Measured live, cross-engine:
+ *
+ *     MTPR 0xFFFFFF9F,TODR ; MFPR TODR,R0   -> R0=0xFFFFFF9F  (below the threshold: unchanged)
+ *     MTPR 0xFFFFFFA0,TODR ; MFPR TODR,R0   -> R0=0x00000000  (AT the threshold: register zeroed)
+ *
+ * 0xFFFFFFA0 = TOY_MAX_SECS * 100 -- a PURE FUNCTION of the centiseconds-per-second constant (see
+ * clk.js's TOY_MAX_SECS doc comment), so this is not an arbitrary large value: it is the exact
+ * boundary the overflow branch fires at, one centisecond above the value that must NOT overflow.
+ *
+ * MEASURED, NOT ASSUMED (round 2, second pass): 0xFFFFFFA0 EXACTLY is a real-time RACE on the live
+ * oracle, not a stable boundary -- five back-to-back probes of the identical MTPR/sleep-free
+ * write-then-immediate-read gave R0 = 0/0xFFFFFFA0/0/0xFFFFFFA0/0, roughly evenly split.  This is
+ * NOT this file inventing tolerance where none is needed: `sim_timespec_diff`'s tv_sec/tv_nsec
+ * borrow arithmetic makes the reconstructed elapsed-seconds value sensitive to sub-millisecond
+ * scheduling noise EXACTLY when the true elapsed time sits within about a millisecond of a whole
+ * second -- which is unavoidably true when the written value's OWN fractional part is designed to
+ * land tv_sec precisely on TOY_MAX_SECS.  0xFFFFFFA1 (one centisecond further in) does not have
+ * this problem -- measured stable at 0x00000000 across 3 probes on the live oracle AND 3 probes on
+ * this port -- so it is used as the "at/past threshold" value instead of the mathematically exact
+ * 0xFFFFFFA0.  It is still bit-exact, zero-sleep, effectively zero-tolerance (see below), and still
+ * strictly stronger than caseTodrRate()'s banded check: a millisecond-scaled implementation could
+ * never reach a value this large within a 32-bit register at all (it would need ~100x more range,
+ * itself unrepresentable), so a 10x/100x rate bug that happened to dodge caseTodrRate()'s tolerance
+ * would still show up here as "0xFFFFFFA1 read back unchanged instead of 0" or "0xFFFFFF9F read
+ * back as 0".  The boundary decision only depends on which side of TOY_MAX_SECS the near-instant
+ * round trip lands on, which write-then-immediate-read (see the file header) puts on the correct
+ * side by construction for both chosen values -- comfortably more than the sub-millisecond noise
+ * that makes the EXACT boundary value alone unsafe to assert on.
+ *
+ * @param {string} bin
+ * @param {string} scratch
+ * @param {Array<string>} failures
+ */
+function caseTodrOverflowBoundary(bin, scratch, failures)
+{
+    const BELOW = 0xFFFFFF9F, AT = 0xFFFFFFA1;     // NOT the mathematically exact 0xFFFFFFA0 -- see above
+    for (let [label, val, expect] of [["below_threshold", BELOW, BELOW], ["at_threshold", AT, 0]]) {
+        let tag = `todr_overflow_${label}`;
+        let code = asm(mtpr(val, MT.TODR), mfpr(MT.TODR, 0));
+        let {js, simh} = runFixedCase(bin, scratch, tag, code, {steps: 2, rom: false});
+        if ((js.R0 >>> 0) !== (expect >>> 0)) failures.push(`${tag}: JS R0=${hex(js.R0)}, expected ${hex(expect)}`);
+        if ((simh.R0 >>> 0) !== (expect >>> 0)) failures.push(`${tag}: SIMH R0=${hex(simh.R0)}, expected ${hex(expect)}`);
+    }
+    covered.todrNonRom = true;
+    covered.todrWrite = true;
+}
+
+/**
  * caseBareTodrAfterReset(bin, scratch, failures)
  *
  * pcjsvax-954 veracity finding: clk_reset() (vax_stddev.c:570-588) calls todr_resync() on a
  * fresh process's FIRST reset, so a BARE MFPR TODR -- no MTPR at all -- is non-zero and BLOW-clear
  * on real hardware.  clk.js's reset() now reproduces this (see its "POWER-ON RESYNC" doc).  The
- * absolute computed value can never be bit-matched live (see the file header); what IS graded,
- * time-independently, on each engine:
+ * EXACT computed value can never be bit-matched live (both engines resync from the real host
+ * clock at slightly different instants in slightly different processes); what IS graded, on each
+ * engine:
  *
  *   - BLOW == 0 (the clock is running the moment the process starts, never "battery low")
  *   - the ROM-context read is >= 0x10000000 and != 0 (resync's formula guarantees this shape)
@@ -670,6 +745,18 @@ function caseTodrRate(bin, scratch, failures)
  *     that, unconditionally -- still the same time-independent claim caseRomVsNonRomRawDiscriminator
  *     makes, just against a LIVE resync value instead of a hand-picked one)
  *   - the non-ROM read is also != 0 (still running, not accidentally "stopped")
+ *   - MEASURED CORRECTION (veracity re-dispatch round 2): a BOUNDED cross-engine delta -- NOT
+ *     bit-exact equality, but |simhRom.r0 - jsRom.r0| < DELTA_TOL -- IS available and was left
+ *     ungraded in the first version, on the (correct but incomplete) grounds that EXACT agreement
+ *     is impossible.  The two engines' resync anchors differ only by real process-start skew
+ *     (measured directly: 80 centiseconds between two back-to-back invocations); DELTA_TOL=500cs
+ *     (5 real seconds) is generous against that skew and astronomically tighter than the class of
+ *     bug this catches -- the round-1 DST day-count bug this same round fixed in clk.js's
+ *     resync() diverged by 8,640,000 centiseconds (24 hours) and would have sailed through the
+ *     shape checks above (still !=0, still >=0x10000000, still self-consistent) while failing
+ *     THIS assertion by four orders of magnitude.  This is the same "genuine impossibility used to
+ *     justify a weaker check than what is actually available" pattern the round-1 review caught
+ *     elsewhere on this item -- fixed here rather than repeated.
  *
  * @param {string} bin
  * @param {string} scratch
@@ -719,6 +806,17 @@ function caseBareTodrAfterReset(bin, scratch, failures)
     if (jsRom.r0 !== jsRom.todr) failures.push(`${tag}: js ROM R0=${hex(jsRom.r0)} != its own raw todrReg=${hex(jsRom.todr)} (self-consistency)`);
     if ((jsRom.r0 >>> 0) < 0x10000000) failures.push(`${tag}: js ROM R0=${hex(jsRom.r0)} below 0x10000000 -- resync's formula shape not reproduced`);
     if ((simhRom.r0 >>> 0) < 0x10000000) failures.push(`${tag}: simh ROM R0=${hex(simhRom.r0)} below 0x10000000 -- test premise broken`);
+
+    /* Bounded cross-engine delta -- see the doc comment above for why 500cs is generous against
+       measured process-start skew (~80cs) yet would have caught the round-1 DST day-count bug
+       (8,640,000cs) by four orders of magnitude. */
+    const DELTA_TOL = 500;
+    let delta = Math.abs((simhRom.r0 >>> 0) - (jsRom.r0 >>> 0));
+    if (delta > DELTA_TOL) {
+        failures.push(`${tag}: |simh ROM R0 - js ROM R0| = ${delta} centiseconds, exceeds ${DELTA_TOL} ` +
+            `(simh=${hex(simhRom.r0)} js=${hex(jsRom.r0)}) -- power-on resync anchors have diverged ` +
+            `far beyond ordinary process-start skew`);
+    }
 
     covered.todrRom = true;
     covered.todrNonRom = true;
@@ -790,6 +888,7 @@ function phaseFixed(bin, scratch)
     caseRomVsNonRomRawDiscriminator(bin, scratch, failures);
     caseTodrStaysStoppedAcrossTicks(bin, scratch, failures);
     caseTodrRate(bin, scratch, failures);
+    caseTodrOverflowBoundary(bin, scratch, failures);
     caseBareTodrAfterReset(bin, scratch, failures);
     caseInterruptDelivered(bin, scratch, failures);
     caseInterruptMasked(bin, scratch, failures);

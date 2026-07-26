@@ -158,6 +158,45 @@ const ROM_TAG = (ROM_BASE & ROM_MASK) >>> 0;
 const INSTRS_PER_TICK = 200;
 
 /**
+ * TOY_MAX_SECS (vax_stddev.c:487, `#define TOY_MAX_SECS (0x40000000/25)`) -- computed, not
+ * transcribed, so it stays tied to the source constant.  todr_rd()'s overflow branch (491-494,
+ * see todrRd() below) zeroes the register once the reconstructed elapsed seconds reach this --
+ * TOY_MAX_SECS*100 = 0xFFFFFFA0 centiseconds, a PURE FUNCTION of the centiseconds-per-second
+ * constant and therefore a near-zero-tolerance cross-engine RATE probe (see tests/timerdiff.js's
+ * caseTodrOverflowBoundary()) that a millisecond-scaled implementation could never even reach
+ * within a 32-bit register, so a value 100x too large everywhere else would silently make it pass,
+ * not fail -- documented explicitly on that case, not left implicit.  MEASURED: the mathematically
+ * EXACT boundary value (0xFFFFFFA0) is itself a real-time race on live SIMH (five identical probes
+ * split roughly evenly between 0 and unchanged) -- caseTodrOverflowBoundary() therefore grades
+ * 0xFFFFFFA1 (one centisecond further in, empirically stable) as its "past threshold" value rather
+ * than 0xFFFFFFA0 itself; see that case's own doc comment for the measurement.
+ */
+const TOY_MAX_SECS = Math.floor(0x40000000 / 25);
+
+/**
+ * dayOfYear(date)
+ *
+ * `date`'s tm_yday equivalent (days since Jan 1, 0-based) via LOCAL CALENDAR components -- NOT
+ * `(date - jan1) / 86400000`, which is wrong across a DST transition (see resync()'s doc comment
+ * for the measured divergence).  A plain days-per-month table, leap-year-aware; immune to DST by
+ * construction because it never subtracts two absolute instants.
+ *
+ * @param {Date} date
+ * @returns {number}
+ */
+function dayOfYear(date)
+{
+    const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let y = date.getFullYear();
+    let leap = (y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0));
+    let doy = date.getDate() - 1;
+    for (let m = 0; m < date.getMonth(); m++) {
+        doy += DAYS_IN_MONTH[m] + ((m === 1 && leap) ? 1 : 0);
+    }
+    return doy;
+}
+
+/**
  * @class ClkVAX
  */
 export default class ClkVAX {
@@ -232,13 +271,23 @@ export default class ClkVAX {
      * in, which is what makes an immediate post-resync non-ROM read round-trip correctly (see
      * tests/timerdiff.js's power-on cases).
      *
+     * MEASURED CORRECTION (veracity re-dispatch, round 2): an earlier version computed tm_yday as
+     * `floor((now - midnightJan1) / 86400000)` -- a RAW MILLISECOND division, which is wrong the
+     * instant a DST transition falls between Jan 1 and `now`: a spring-forward day is 23 real
+     * hours, not 24, so dividing by a flat 86,400,000 undercounts by one for every local instant
+     * from 00:00 to 00:59 on each such day.  Measured: at 2026-03-09 00:30 America/New_York (a
+     * spring-forward-affected date), the ms-division form gave yday=66 where C's localtime()-based
+     * tm_yday is 67 -- an 8,640,000-centisecond (24-hour) divergence invisible on this host (UTC
+     * has no DST) but live the moment this runs anywhere DST applies.  dayOfYear() below instead
+     * walks the LOCAL CALENDAR (year/month/date getters plus a leap-year-aware days-per-month
+     * table), which is what tm_yday actually is -- a count of calendar days, not a duration.
+     *
      * @this {ClkVAX}
      */
     resync()
     {
         let now = new Date();
-        let jan1 = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
-        let ydays = Math.floor((now.getTime() - jan1.getTime()) / 86400000);
+        let ydays = dayOfYear(now);
         let base = ((ydays * 24 + now.getHours()) * 60 + now.getMinutes()) * 60 + now.getSeconds();
         let frac = Math.round(now.getMilliseconds() / 10);
         this.todrWr(((base * 100) + 0x10000000 + frac) | 0);
@@ -315,12 +364,19 @@ export default class ClkVAX {
     /**
      * todrRd()
      *
-     * vax_stddev.c:471-501.  Three branches, in SIMH's own order:
+     * vax_stddev.c:471-501.  FOUR branches, in SIMH's own order (MEASURED CORRECTION, veracity
+     * re-dispatch round 2: the overflow branch below was missing entirely from the first version
+     * of this port, undisclosed):
      *
      *   1. fault_PC inside the PRIMARY ROM window (NOT the mirror -- see ROM_MASK) -> the RAW
      *      counted register, unconditionally.  THE gotcha; see the file header.
      *   2. todrReg === 0 ("clock not running") -> 0, without ever touching the wall clock.
-     *   3. Otherwise: elapsed real time since the anchor todrWr() last recorded, in centiseconds,
+     *   3. Elapsed real time since the anchor >= TOY_MAX_SECS (vax_stddev.c:490-494) -> the
+     *      register is ZEROED (`return todr_reg = 0` in the original is an assignment, not just a
+     *      return -- reproduced here as an actual write to `this.todrReg`, not merely a return
+     *      value) and 0 is returned.  Bit-exact, zero-tolerance cross-engine boundary: see
+     *      TOY_MAX_SECS's own doc comment and tests/timerdiff.js's caseTodrOverflowBoundary().
+     *   4. Otherwise: elapsed real time since the anchor todrWr() last recorded, in centiseconds,
      *      rounded to the nearest tick exactly as `(nsec + 5e6) / 1e7` rounds in the original.
      *
      * `this.exc.faultPC` is exc.js's own field (cpustate.js maintains it every instruction, and
@@ -335,6 +391,7 @@ export default class ClkVAX {
         if (((pc & ROM_MASK) >>> 0) === ROM_TAG) return this.todrReg | 0;
         if (this.todrReg === 0) return 0;
         let elapsedMs = Date.now() - this.wallBaseMs;
+        if (elapsedMs / 1000 >= TOY_MAX_SECS) { this.todrReg = 0; return 0; }
         return Math.round(elapsedMs / 10) | 0;
     }
 
@@ -342,26 +399,36 @@ export default class ClkVAX {
      * todrWr(data)
      *
      * vax_stddev.c:503-533.  `data` is interpreted as a centisecond count (matching what
-     * todrRd()'s branch 3 returns) and anchored against the REAL host clock right now:
+     * todrRd()'s branch 4 returns) and anchored against the REAL host clock right now:
      * `wallBaseMs = now - data*10`, so a read an instant later reconstructs `data` back out (see
      * tests/timerdiff.js's file header for why write-then-immediate-read is the only cross-engine
      * comparison this branch can honestly make).  data===0 is "stop the clock" (vax_stddev.c's
      * `else` branch: both toy_gmtbase fields go to 0) -- todrRd()'s branch 2 then short-circuits
      * before ever consulting wallBaseMs again.
      *
+     * MEASURED BUG, caught by tests/timerdiff.js's overflow-boundary case (round 2): `data * 10`
+     * MUST use the UNSIGNED magnitude.  The first version wrote `data = data | 0` (sign-extending
+     * to a NEGATIVE int32 for any value >= 0x80000000) and then multiplied THAT by 10 -- exactly
+     * the "arithmetic on a signed int32" hazard HANDOFF.md 7 names.  TODR is architecturally an
+     * UNSIGNED 32-bit counter; `data >>> 0` is the magnitude the real centisecond count actually
+     * is, and is what must be scaled to milliseconds.  `this.todrReg` itself is still stored via
+     * plain `| 0` (an ordinary int32 BIT PATTERN, consistent with every other register field in
+     * this tree -- see defines.js's masking-is-sign-agnostic rule) since nothing downstream ever
+     * does arithmetic on it directly except tick()'s `+1`, which is sign-agnostic by construction.
+     *
      * @this {ClkVAX}
      * @param {number} data
      */
     todrWr(data)
     {
-        data = data | 0;
-        if (data !== 0) {
+        let magnitude = data >>> 0;
+        if (magnitude !== 0) {
             this.todrBlow = 0;
-            this.wallBaseMs = Date.now() - (data * 10);
+            this.wallBaseMs = Date.now() - (magnitude * 10);
         } else {
             this.wallBaseMs = 0;
         }
-        this.todrReg = data;
+        this.todrReg = data | 0;
     }
 
     /**
