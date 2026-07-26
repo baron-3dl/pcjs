@@ -409,6 +409,36 @@ Two details are load-bearing here too:
   across two patch files for no benefit; `verify-patches.sh` derives the patch list from disk, not
   from a hand-maintained count, so extending 0006 in place costs nothing there either.
 
+### A second veracity pass found a narrower gap: the boot-derived floors only prove the ALIGNED half
+
+The patch above hooks all four functions — `ReadIO`/`WriteIO` (aligned) and `ReadIOU`/`WriteIOU`
+(unaligned) — from the start. `devtrace-tally.py`'s QBIOP/QBCQM floors, however, are derived from a
+real `ka655x.bin` boot to `>>>`, and that boot's own Qbus traffic is entirely aligned — it never
+straddles a word or longword boundary. A mutation that silences only `ReadIOU`'s guard (or only
+`WriteIOU`'s), leaving `ReadIO`/`WriteIO` untouched, applies clean, builds clean, passes EHKAA, and
+produces QBIOP/QBCQM counts **byte-for-byte identical** to the unmutated binary — the boot-derived
+floors cannot see it, by construction, no matter how long the boot runs.
+
+`devtrace-tally.py` closes this with `unaligned_probe()`: after the boot-derived tally, it derives
+an I/O-page device's CSR address from the binary's own `SHOW RL` output (never hand-typed), deposits
+two hand-assembled `MOVL` instructions targeting one byte off that address (`MOVL @#<csr+1>,R0` and
+`MOVL R0,@#<csr+1>`), and steps them directly — no boot, no wall-clock dependency. A longword access
+one byte off alignment is exactly the "tribyte" case `ReadIOU`/`WriteIOU`'s own header comments
+describe; it produces a `QIOR`/`QIOW` record with `size=00000003`, a value `ReadIO`/`WriteIO` can
+never emit (their `lnt` is restricted to `L_BYTE`/`L_WORD`/`L_LONG`/`L_QUAD` = 1/2/4/8 by every call
+site). That makes a `size=00000003` record at the probed address unfakeable proof the unaligned path
+specifically fired. `verify-patches.sh --selfcheck` gained two more mutations (6 and 7) that silence
+`ReadIOU`'s and `WriteIOU`'s guards respectively and assert this probe — and only this probe — catches
+each one, by name (`UNALIGNED READ` / `UNALIGNED WRITE`).
+
+One development hazard worth recording here: driving the CPU directly via `DEPOSIT`/`STEP` (rather
+than `BOOT CPU`) on a freshly-started simulator process collides with SIMH's own one-time clock
+precalibration self-test (`sim_timer_precalibrate_execution_rate()`, wired in by `cpu_reset()`),
+which deposits **its own** throwaway code at physical `0x100`-`0x10D` and runs it on the *first*
+`GO`/`STEP`/`RUN` of any session — consuming the requested step count instead of the caller's own
+setup if not absorbed first. `unaligned_probe()` issues one throwaway `step 1` before touching
+anything else for exactly this reason; see its docstring.
+
 ## Upstream-drift hazards, per patch
 
 What each patch hangs off of — check these first on a rebase; if any of them moved or changed

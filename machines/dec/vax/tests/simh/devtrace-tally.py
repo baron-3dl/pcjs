@@ -38,6 +38,34 @@ in this patch) and the CQM Qbus-memory window (heavy traffic from the console's 
 setup). Both are measured nonzero in BOTH directions on a real boot (see README.md "What 0006
 adds"), which is what QBIOP/QBCQM's floors below require.
 
+SECOND veracity re-dispatch (2026-07-26, same day): the QBIOP/QBCQM boot-derived floors above cover
+only two of the FOUR hooks pcjsvax-62a's patch actually added -- ReadIO and WriteIO (the ALIGNED
+Qbus path). ReadIOU and WriteIOU (the UNALIGNED path -- reached whenever a Qbus access straddles a
+word/longword boundary, e.g. a longword read starting at an odd address) had NO coverage assertion
+anywhere. Proven by construction: a mutation silencing only ReadIOU's guard, and a separate one
+silencing only WriteIOU's guard, each apply clean, build clean, pass EHKAA, and PASSED this tally at
+exit 0 -- because the no-disk boot-to->>> never enters the unaligned path at all (QBIOP/QBCQM's
+byte-for-byte counts are IDENTICAL between the good binary and both mutants). A boot-derived floor
+cannot close this: requiring ">0 unaligned events" from the boot would be exactly the false-floor /
+rule-11 trap this file already avoids for the per-device families, one level up again.
+
+The fix (`unaligned_probe()` below) is a short, DETERMINISTIC, non-boot probe run on the same
+binary after the boot-derived tally: derive an I/O-page device's CSR address programmatically (by
+running `SHOW RL` against the binary under test and parsing its own reported address range -- never
+hand-typed, standing rule 5), hand-assemble two `MOVL` instructions (`MOVL @#<csr+1>,R0` and
+`MOVL R0,@#<csr+1>` -- deliberately misaligned by one byte) into scratch RAM, deposit PC/PSL, and
+step exactly two instructions. A longword access starting one byte off a word boundary is exactly
+the case ReadIOU's/WriteIOU's own header comments describe (their "tribyte" case): it produces one
+QIOR/QIOW record with `size=00000003`, a value ReadIO/WriteIO can NEVER emit (their `lnt` parameter
+is restricted to L_BYTE/L_WORD/L_LONG/L_QUAD = 1/2/4/8 by every call site in vax_mmu.h -- see
+ReadIO's/WriteIO's own doc comments in vax_io.c). A `size=00000003` record at the probed address is
+therefore unambiguous, unfakeable proof that ReadIOU/WriteIOU specifically fired, not merely that
+SOME Qbus access happened. Missing either one exits non-zero and names exactly which path (read or
+write) produced nothing -- see `unaligned_probe()`'s own docstring for the precalibration hazard
+this probe has to route around (SIMH deposits and runs a one-time clock-precalibration self-test at
+addresses 0x100-0x10D on the FIRST GO/STEP/RUN of any session, which would otherwise clobber this
+probe's own PC/PSL setup if not absorbed first).
+
 Two independent things are derived, not remembered, and for two different reasons:
 
   - The physical-address / IPR-number VALUES that identify each family are parsed out of the
@@ -205,6 +233,135 @@ def boot_and_capture(simh_bin, runlimit, timeout):
 
 
 # ---------------------------------------------------------------------------------------------
+# pcjsvax-62a veracity re-dispatch: deterministic unaligned-Qbus-access probe.
+#
+# The boot-derived QBIOP/QBCQM floors above never exercise ReadIOU/WriteIOU (the boot's own I/O
+# traffic is entirely aligned), so they cannot prove those two hooks are alive. This probe drives
+# one genuinely unaligned access directly, deterministically, with no dependency on ROM behavior,
+# wall-clock timing, or run length.
+# ---------------------------------------------------------------------------------------------
+_SHOW_DEV_TEMPLATE = "set console notelnet\nshow {dev}\nexit\n"
+_DEV_ADDR_RE = re.compile(r'address=([0-9A-Fa-f]+)-[0-9A-Fa-f]+')
+
+
+def get_device_csr_base(simh_bin, dev, timeout):
+    """Derive dev's Qbus CSR base address by parsing the BINARY'S OWN `SHOW <dev>` output --
+    never hand-typed (standing rule 5). The autoconfigured address is assigned at runtime by
+    build_dib_tab()/auto_config() and could shift if the device list or configuration changes."""
+    inifd, inipath = tempfile.mkstemp(prefix="pcjs-devtrace-show-", suffix=".ini")
+    with os.fdopen(inifd, "w") as f:
+        f.write(_SHOW_DEV_TEMPLATE.format(dev=dev))
+    try:
+        proc = subprocess.run([simh_bin, inipath], capture_output=True, text=True, timeout=timeout)
+    finally:
+        os.unlink(inipath)
+    m = _DEV_ADDR_RE.search(proc.stdout)
+    if not m:
+        raise SystemExit(
+            "FATAL: could not parse a Qbus address out of `SHOW %s` -- device disabled, renamed, "
+            "or SIMH's SHOW format changed. Output was:\n%s" % (dev, proc.stdout))
+    return int(m.group(1), 16)
+
+
+def _movl_absolute_bytes(csr_addr):
+    """Hand-assemble two VAX MOVL instructions targeting csr_addr+1 (one byte off any word/
+    longword boundary, so every access against it is unaligned by construction):
+
+        MOVL @#<csr_addr+1>,R0    D0 9F <addr LE32> 50
+        MOVL R0,@#<csr_addr+1>    D0 50 9F <addr LE32>
+
+    Opcode 0xD0 (MOVL) and the addressing-mode nibbles (0x9_ autoincrement-deferred/absolute,
+    0x5_ register-direct) are fixed VAX architecture constants frozen since DEC's original VAX
+    Architecture Reference Manual -- not project-specific data subject to rebase drift the way a
+    device's CSR address is. Verified empirically against this exact patched binary: SIMH's own
+    `EXAMINE -M` disassembles these bytes back as `MOVL @#<addr>,R0` / `MOVL R0,@#<addr>`, and
+    stepping them produces exactly the QIOR/QIOW records this probe asserts on.
+
+    A longword access one byte off alignment is precisely the "tribyte" case ReadIOU's and
+    WriteIOU's own header comments describe (see vax_io.c) -- it cannot be satisfied by a single
+    aligned Qbus word access, so the CPU's own unaligned-access path (ReadU/WriteU in vax_mmu.h)
+    is the only way either instruction can complete, regardless of what this patch does or does
+    not instrument. That is what makes the resulting `size=00000003` record unfakeable proof of
+    the unaligned path specifically, not merely of some Qbus access having happened.
+    """
+    addr = csr_addr + 1
+    addr_le = list(addr.to_bytes(4, "little"))
+    read_instr = [0xD0, 0x9F] + addr_le + [0x50]           # MOVL @#addr,R0
+    write_instr = [0xD0, 0x50, 0x9F] + addr_le             # MOVL R0,@#addr
+    return read_instr + write_instr, addr
+
+
+_PROBE_BASE = 0x1000  # scratch RAM, well clear of the 0x100-0x10D precalibration scratch code
+
+_UNALIGNED_PROBE_TEMPLATE = """\
+set console notelnet
+step 1
+set cpu debug=EXCTRACE
+set sysd debug=DEVTRACE
+set debug -n {logfile}
+{deposits}
+deposit PC {base:X}
+deposit PSL 0
+step 2
+examine PC
+exit
+"""
+
+
+def unaligned_probe(simh_bin, csr_addr, timeout):
+    """Deposit two hand-assembled unaligned MOVL instructions at _PROBE_BASE, step exactly two
+    instructions, and report whether a QIOR and a QIOW record with size=00000003 (tribyte -- see
+    _movl_absolute_bytes' docstring) appeared at csr_addr+1.
+
+    The leading `step 1` (before any of our own deposits) is required and load-bearing: SIMH's
+    generic clock-precalibration self-test (sim_timer_precalibrate_execution_rate(), wired in via
+    cpu_reset()'s `sim_clock_precalibrate_commands`) deposits ITS OWN throwaway code at physical
+    addresses 0x100-0x10D and runs it on the FIRST GO/STEP/RUN of any process, regardless of what
+    the caller asked for. Skipping this absorption step does not corrupt our deposits (they land
+    at _PROBE_BASE = 0x1000, nowhere near 0x100-0x10D) -- it corrupts the *step count*: without
+    it, the requested `step 2` is consumed by (part of) the precalibration loop instead of our
+    instructions, and PC never reaches 0x1000 at all. This was found and fixed by direct execution
+    trace instrumentation of get_istr()/ReadLP() during this item's own development -- see the
+    module docstring's veracity-re-dispatch note.
+
+    Returns (read_ok: bool, write_ok: bool, raw_log: str).
+    """
+    instr_bytes, unaligned_addr = _movl_absolute_bytes(csr_addr)
+    deposit_lines = "\n".join(
+        "deposit -b %X %X" % (_PROBE_BASE + i, b) for i, b in enumerate(instr_bytes))
+
+    logfd, logpath = tempfile.mkstemp(prefix="pcjs-unaligned-probe-", suffix=".log")
+    os.close(logfd)
+    inifd, inipath = tempfile.mkstemp(prefix="pcjs-unaligned-probe-", suffix=".ini")
+    with os.fdopen(inifd, "w") as f:
+        f.write(_UNALIGNED_PROBE_TEMPLATE.format(
+            logfile=logpath, deposits=deposit_lines, base=_PROBE_BASE))
+    try:
+        try:
+            proc = subprocess.run([simh_bin, inipath], capture_output=True, text=True,
+                                   timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise SystemExit(
+                "FATAL: unaligned-probe run of %s did not return within %ds -- hung. Cannot "
+                "assert ReadIOU/WriteIOU coverage." % (simh_bin, timeout))
+        expected_end_pc = "%08X" % (_PROBE_BASE + len(instr_bytes))
+        if expected_end_pc not in proc.stdout:
+            raise SystemExit(
+                "FATAL: unaligned probe did not complete both instructions -- expected PC=%s "
+                "after `step 2`, not found in output:\n%s" % (expected_end_pc, proc.stdout))
+        with open(logpath, "r", errors="replace") as f:
+            raw_log = f.read()
+    finally:
+        os.unlink(inipath)
+        if os.path.exists(logpath):
+            os.unlink(logpath)
+
+    read_needle = "QIOR %08X 00000003" % unaligned_addr
+    write_needle = "QIOW %08X 00000003" % unaligned_addr
+    return (read_needle in raw_log, write_needle in raw_log, raw_log)
+
+
+# ---------------------------------------------------------------------------------------------
 # Tally the log.
 # ---------------------------------------------------------------------------------------------
 _RECORD_TYPES = ("IPRR", "IPRW", "REGR", "REGW", "QIOR", "QIOW")
@@ -352,6 +509,23 @@ def main():
     print("  %-10s count=%-9d (required=%-5s)" % ("INTD", intd_count, True))
     if intd_count == 0:
         violations.append("INTD")
+
+    # pcjsvax-62a veracity re-dispatch: QBIOP/QBCQM above only prove ReadIO/WriteIO (the ALIGNED
+    # Qbus path) are alive -- the boot never drives an unaligned access, so it cannot prove
+    # ReadIOU/WriteIOU. A short, deterministic, non-boot probe closes that: see unaligned_probe()'s
+    # docstring and this file's module docstring for why a boot-derived floor cannot do this job.
+    csr_addr = get_device_csr_base(args.simh, "RL", args.timeout)
+    unaligned_read_ok, unaligned_write_ok, unaligned_raw_log = unaligned_probe(
+        args.simh, csr_addr, args.timeout)
+    print("  %-10s read=%-10s (required=%-5s) write=%-10s (required=%-5s)  [probed @ RL CSR+1 = "
+          "%08X]" % ("UNALIGNED", unaligned_read_ok, True, unaligned_write_ok, True, csr_addr + 1))
+    if not unaligned_read_ok:
+        violations.append("UNALIGNED READ")
+    if not unaligned_write_ok:
+        violations.append("UNALIGNED WRITE")
+    if args.keep_log:
+        with open(args.keep_log + ".unaligned-probe", "w") as f:
+            f.write(unaligned_raw_log)
 
     if violations:
         sys.stderr.write(
