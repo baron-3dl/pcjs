@@ -59,6 +59,8 @@
  *                            build (same search cpudiff.js uses)
  *        --rom PATH         default $PCJS_VAX_REPO/open-simh/VAX/ka655x.bin
  *        --max-steps N       JS step ceiling before giving up on ever finding a boundary
+ *        --ssc-base-cases N  randomized SSC base register mask cases (default 40, floor 8)
+ *        --seed S            PRNG seed for --ssc-base-cases, printed on failure so it reproduces
  *        --selfcheck         prove the differential detects deliberate defects
  */
 
@@ -79,6 +81,11 @@ import SSCVAX from "../modules/v2/ssc.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const MEMSIZE = 0x01000000;                 // 16MB, same default every other differential uses
+
+/* Enforced floor for --ssc-base-cases (standing rule: coverage assertions FAIL the run and do not
+   scale down with case count).  4 fixed boundary values (0, all-ones, exactly SSCBASE_RW, exactly
+   SSCBASE_MBO) plus at least 4 genuinely random ones -- see verifySscBaseRandom(). */
+const SSC_BASE_CASES_FLOOR = 8;
 
 function hex(v, n = 8) { return (v >>> 0).toString(16).toUpperCase().padStart(n, "0"); }
 
@@ -371,6 +378,102 @@ function probeSimhBackedAt(simh, opts, addr, fWrite)
     let m = /^PC:\s*([0-9A-Fa-f]+)/m.exec(out);
     if (!m) throw new Error("romdiff: boundary probe produced no PC readback; SIMH said:\n" + out);
     return (parseInt(m[1], 16) >>> 0) !== R_HANDLER;
+}
+
+/** Same mulberry32 PRNG every VAX differential in this tree uses (busdiff.js, mchkdiff.js, ...),
+    duplicated rather than imported because none of them share a utility module -- see those files. */
+function mulberry32(a)
+{
+    return function() {
+        a |= 0; a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+/**
+ * verifySscBaseRandom(simh, opts, seed, n)
+ *
+ * pcjsvax-320's REAL-WORKLOAD phase (the boot trace above) stores exactly ONE value into
+ * SSCBASE -- 0x20140000 -- which already satisfies SSCBASE_RW/SSCBASE_MBO exactly (it IS a valid
+ * base address), so the AND/OR mask this file transcribes from vax_sysdev.c's ssc_wr() `case 0x00`
+ * is STRUCTURALLY UNTESTED by that run alone: a transcription bug in either mask (e.g. a swapped
+ * hex digit in SSCBASE_RW) that only misbehaves on OTHER bit patterns would pass the real-workload
+ * phase silently.  This is exactly the class of bug the project's standing rule about randomized
+ * phases exists to catch (see docs/design/vax-on-pcjs.md's "uniform random address pools" lesson,
+ * applied here to register VALUES rather than addresses).
+ *
+ * Driven through a REAL instruction round trip on the live oracle -- `MOVL S^#val,@#SSCBASE` then
+ * `MOVL @#SSCBASE,R0`, examined via R0 -- the same "only an actual instruction reproduces the real
+ * access path" reasoning probeSimhBackedAt() is built on (deposit/examine of a NAMED register like
+ * `sysd base` bypasses ssc_wr()'s masking entirely and was confirmed, by direct probe, to read back
+ * whatever was deposited UNMASKED -- exactly the false-negative this function exists to avoid).
+ * Compared against a bare `new SSCVAX()` instance's own writeReg()/readReg() -- not the whole bus --
+ * because the mask formula is what is under test, not the address decode (romdiff's PHASE 1 trace
+ * comparison already proves the address decode).
+ *
+ * Batched into ONE SIMH invocation (mchkdiff.js's runBatch() convention): each case is independent
+ * via `reset all`, so a fault or bad value in one case cannot contaminate another.
+ *
+ * @param {string} simh
+ * @param {Object} opts
+ * @param {number} seed
+ * @param {number} n
+ * @returns {Array.<string>} problems (empty if none)
+ */
+function verifySscBaseRandom(simh, opts, seed, n)
+{
+    let rnd = mulberry32(seed);
+    let opcMOVL = OPCODES.indexOf("MOVL");
+    if (opcMOVL < 0) throw new Error("romdiff.js: MOVL not found in drom.js OPCODES");
+    const CODE = 0x00104000;
+    const SSCBASE = VAX.PHYSMEM.SSC_BASE >>> 0;
+    const MARK = "SSCBASERND";
+
+    /* A few boundary-interesting values FIRST (all-zero, all-one, exactly SSCBASE_RW, exactly
+       SSCBASE_MBO), THEN n-4 uniform random longwords -- covers both the deliberately-chosen edges
+       and the general case, same shape as every other randomized phase in this tree. */
+    let vals = [0x00000000, 0xFFFFFFFF | 0, 0x1FFFFC00, 0x20000000 | 0];
+    for (let i = vals.length; i < n; i++) vals.push((rnd() * 0x100000000) >>> 0);
+
+    let lines = ["set cpu 16m", "set cpu simhalt"];
+    for (let i = 0; i < vals.length; i++) {
+        let v = vals[i] >>> 0;
+        lines.push(`echo ${MARK}${i}`, "reset all");
+        let instr = [
+            opcMOVL & 0xFF, 0x8F, v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF,
+                            0x9F, SSCBASE & 0xFF, (SSCBASE >>> 8) & 0xFF, (SSCBASE >>> 16) & 0xFF, (SSCBASE >>> 24) & 0xFF,
+            opcMOVL & 0xFF, 0x9F, SSCBASE & 0xFF, (SSCBASE >>> 8) & 0xFF, (SSCBASE >>> 16) & 0xFF, (SSCBASE >>> 24) & 0xFF,
+                            0x50                                              // R0, direct (MODE.GRN | 0)
+        ];
+        for (let k = 0; k < instr.length; k++) lines.push(`deposit -b ${hex(CODE + k)} ${instr[k].toString(16)}`);
+        lines.push(`deposit PSL 0`, `deposit PC ${hex(CODE)}`, "step 2", "examine -h R0");
+    }
+    lines.push("exit", "");
+    let out = runSimh(simh, lines.join("\n"), path.join(opts.scratch, "romdiff-sscbase-random.ini"));
+
+    let problems = [];
+    let marks = [...out.matchAll(new RegExp(MARK + "(\\d+)", "g"))].map((m) => +m[1]);
+    let r0s = [...out.matchAll(/^R0:\s*([0-9A-Fa-f]+)/gm)].map((m) => parseInt(m[1], 16) >>> 0);
+    if (marks.length !== vals.length || r0s.length !== vals.length) {
+        problems.push(`SSC-BASE-RANDOM: expected ${vals.length} cases, SIMH produced ${marks.length} ` +
+            `markers and ${r0s.length} R0 readbacks -- some case did not reach comparison; SIMH said:\n` +
+            out.slice(0, 2000));
+        return problems;
+    }
+    let ssc = new SSCVAX();
+    for (let i = 0; i < vals.length; i++) {
+        ssc.reset();
+        ssc.writeReg(0x00, vals[i] | 0);
+        let want = ssc.readReg(0x00) >>> 0;
+        let got = r0s[i] >>> 0;
+        if (got !== want) {
+            problems.push(`SSC-BASE-RANDOM: case ${i} val=0x${hex(vals[i])} -- SIMH readback=0x${hex(got)}, ` +
+                `SSCVAX readback=0x${hex(want)}`);
+        }
+    }
+    return problems;
 }
 
 /**
@@ -997,6 +1100,21 @@ function main()
                 `services (ssc_rd/ssc_wr -- backed end-to-end, same category as CDG) but this bus does ` +
                 `not decode yet.  See the next device item, which will move this boundary forward.`);
         }
+    }
+
+    /* ---- PHASE 1b: the SSC base register mask, RANDOMIZED against the real oracle ----
+       See verifySscBaseRandom()'s doc comment for why the trace above cannot exercise this on its
+       own: the ROM stores exactly ONE value (0x20140000), which already satisfies the mask, so a
+       transcription bug in SSCBASE_RW/SSCBASE_MBO would pass the real-workload phase silently. */
+    let sscCases = +getArg("--ssc-base-cases", 40);
+    if (sscCases < SSC_BASE_CASES_FLOOR) {
+        problems.push(`--ssc-base-cases ${sscCases} is below the enforced floor (${SSC_BASE_CASES_FLOOR}); ` +
+            `this run would under-cover the SSC base register's mask formula and must not be allowed to pass.`);
+    } else {
+        let sscProblems = verifySscBaseRandom(simh, opts, +getArg("--seed", 0xB16B00B5), sscCases);
+        console.log(`\nSSC BASE REGISTER MASK (randomized, ${sscCases} cases, real oracle): ` +
+            `${sscProblems.length ? "DIVERGED" : "MATCH"}`);
+        for (let p of sscProblems) problems.push(p);
     }
 
     /* ---- PHASE 2: the mirror ---- */
