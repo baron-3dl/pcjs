@@ -97,7 +97,7 @@ import { CONTROL_OPCODES } from "./control.js";
 import { STRQ_OPCODES } from "./strq.js";
 import VAXFloat from "./fpa.js";
 import VAXExc, {
-    VAXStop, EXC_OPCODES, SCB, PSL_FPD, PSL_TP, PSW_T, PSW_IV, PSW_FU, PSW_DV, MCHK_READ, MCHK_WRITE
+    VAXStop, EXC_OPCODES, SCB, PSL_FPD, PSL_TP, PSW_T, PSW_IV, PSW_FU, PSW_DV, MCHK_READ
 } from "./exc.js";
 
 const L_BYTE = 1, L_WORD = 2, L_LONG = 4;
@@ -420,27 +420,36 @@ export default class CPUStateVAX extends Component {
      * machine check instead of ending the run.
      *
      * TWO DIFFERENT SIMH MECHANISMS LAND HERE, and they must be told apart (veracity re-dispatch,
-     * pcjsvax-446):
+     * pcjsvax-446; the Qbus branch completed by pcjsvax-d22):
      *
      *   - vax_sysdev.c's ReadReg()/WriteReg() `default:` case (:1031-1032, :1071-1072) -- reached
      *     for CDG/REG-gap/SSC/NVR addresses -- sets the SSC bus-timeout bit AND raises SCB_MCHK.
      *   - vax_io.c's ReadQb()/WriteQb() (reached instead for IOPAGE/CQM addresses, via
-     *     ADDR_IS_IO()/ADDR_IS_CQM(): a KA655 routes Qbus I/O-page and Qbus-memory references
-     *     through the CQBIC, not ReadReg/WriteReg) calls `cq_merr()` (a CQBIC DSER/MEAR error
-     *     register this item does not model -- see pcjsvax-d22) and, for READS ONLY, the SAME
-     *     MACH_CHECK() -- but it NEVER touches ssc_bto.  WRITES there don't even reach MACH_CHECK
-     *     synchronously: WriteQb's unbacked case sets a DEFERRED `mem_err` flag and returns
-     *     normally, which this item does not reproduce (see pcjsvax-d22); a write fault here is
-     *     therefore graded only through the READ half, never the write half, of those two ranges.
+     *     VAX.isQbusAddr() == ADDR_IS_IO()/ADDR_IS_CQM(): a KA655 routes Qbus I/O-page and
+     *     Qbus-memory references through the CQBIC, not ReadReg/WriteReg) calls `cq_merr()`
+     *     (exc.js's cqMerr() -- the CQBIC's DSER/MEAR error registers, pcjsvax-d22) on BOTH
+     *     directions, and NEVER touches ssc_bto -- but the two directions then diverge completely:
+     *     READS take the SAME MACH_CHECK() the register-space branch does; WRITES do not reach
+     *     MACH_CHECK() at all.  WriteQb's unbacked case sets a DEFERRED `mem_err` flag (exc.js's
+     *     `this.exc.memErr`) and returns NORMALLY -- there is nothing to store into, so the write
+     *     is silently discarded and the instruction completes and PC simply advances, exactly as
+     *     if it had succeeded.  The deferred mem_err is delivered LATER, at the next instruction
+     *     boundary where IPL permits, through the ALREADY-existing generic interrupt seam
+     *     (evalInt()/getVector()'s `lvl === IPL_MEMERR` case, addInterruptSource()'s neighbor --
+     *     see exc.js's file header) -- installed against, not rebuilt, by pcjsvax-d22.
      *
-     * Suppressing busTimeout() for an ADDR_IS_IO/ADDR_IS_CQM address is therefore correct, not
-     * incidental: setting ssc_bto there would be a genuine divergence from real SIMH (measured
-     * directly; tests/mchkdiff.js grades exactly this).
+     * Suppressing busTimeout() for a Qbus address is therefore correct, not incidental: setting
+     * ssc_bto there would be a genuine divergence from real SIMH (measured directly;
+     * tests/mchkdiff.js grades exactly this).  cqMerr()'s LST (lost-error) bit for a Qbus WRITE
+     * depends on how many 16-bit Qbus cycles the reference took, which is why mmu.js's writeL()/
+     * writeU() -- not this method -- decide how many times onBusFault() (and therefore cqMerr())
+     * fires for a single write; see their doc comments.
      *
      * `delta` (PC - fault_PC, "how far decode had consumed the faulting instruction") is captured
      * HERE, before takeFault()'s common preamble resets PC back to fault_PC, and is smuggled to
      * exc.js's SCB.MCHK case through the VAXFault's p2 slot -- see its doc comment for why it
-     * cannot be recomputed there.
+     * cannot be recomputed there.  A deferred write never reaches takeFault() at all, so `delta`
+     * is irrelevant there -- nothing is thrown.
      *
      * @this {CPUStateVAX}
      * @param {number} addr
@@ -450,10 +459,16 @@ export default class CPUStateVAX extends Component {
     {
         let a = addr >>> 0;
         let fWrite = access === VAX.ACCESS.WRITE;
-        let fQbus =
-            (a >= VAX.PHYSMEM.IOPAGE_BASE && a < VAX.PHYSMEM.IOPAGE_BASE + VAX.PHYSMEM.IOPAGE_LENGTH) ||
-            (a >= VAX.PHYSMEM.CQM_BASE && a < VAX.PHYSMEM.CQM_BASE + VAX.PHYSMEM.CQM_LENGTH);
-        let p1 = fQbus ? (fWrite ? MCHK_WRITE : MCHK_READ) : this.exc.busTimeout(fWrite);
+        if (VAX.isQbusAddr(a)) {
+            this.exc.cqMerr(a);
+            if (fWrite) {
+                this.exc.memErr = 1;      // deferred -- no synchronous exception; PC just advances
+                return;
+            }
+            let delta = (this.regs[nPC] - this.exc.faultPC) | 0;
+            throw new VAXFault(-SCB.MCHK, MCHK_READ, delta);
+        }
+        let p1 = this.exc.busTimeout(fWrite);
         let delta = (this.regs[nPC] - this.exc.faultPC) | 0;
         throw new VAXFault(-SCB.MCHK, p1, delta);
     }
