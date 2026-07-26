@@ -18,11 +18,45 @@ As of `pcjsvax-e49`, the **entire Base Instruction Group is implemented** — al
 `IG_BASE`/`IG_BSGFL`/`IG_BSDFL`. `tests/base_group_residual.js` is the re-runnable computation that
 proves it and fails on any drift; do not hand-enumerate.
 
-Still missing: packed-decimal/CIS (`IG_PACKD`/`IG_EMONL` — required for the EHKAA gate, see
-`pcjsvax-bc3`), devices, and **the CPU loop** (`sim_instr()`'s fetch/dispatch/trap loop —
-`pcjsvax-c05`). Every differential in `tests/` currently drives `decode()` and each module's own
+Still missing: devices, **the CPU loop** (`sim_instr()`'s fetch/dispatch/trap loop —
+`pcjsvax-c05`), and the **emulated-instruction exception** — see immediately below. Every
+differential in `tests/` currently drives `decode()` and each module's own
 `execute` directly, one instruction at a time, because nothing yet wires the five execution modules
 — `cpu.js`, `control.js`, `fpa.js`, `strq.js`, `exc.js` — into a single dispatcher.
+
+### Packed decimal / CIS is NOT missing — this machine must not implement it
+
+Read `tests/cis_group_scope.js` before writing a line of packed-decimal code, and run it.  It is
+the re-runnable computation that settles the question, the same way `tests/base_group_residual.js`
+settles the Base Instruction Group's, and it reports four independent measurements against a real
+executed `microvax3900`.  The short form:
+
+* `SHOW CPU -V` on the binary reports the Packed-Decimal-String, Extended-Accuracy and
+  Emulated-Only groups as **"Emulating"**, not "Implementing".  In SIMH's vocabulary that means
+  the simulator does *not* execute them — it hands them to the operating system.
+* EHKAA issues **23** CIS opcodes across **52** instances and executes **zero** of them.  Cross-
+  referenced against SIMH's own `EMULFAULT` and `INTEXC` debug categories, every instance takes
+  the emulated-instruction exception (`cpu_emulate_exception()`, a 48-byte operand frame through
+  `SCB_EMULATE` 0xC8 or an 8-byte frame through `SCB_EMULFPD` 0xCC), a reserved-instruction fault
+  (`EMODH`/`POLYH`, which `vax_cpu.c` routes to `op_octa()`, which faults when `VAX_EXTAC` is
+  absent — so they need **no H_float here at all**), or — one deliberately-constructed case — an
+  ACV, because the emulate frame's own stack write-probe faults on an inaccessible executive-mode
+  stack.
+* Turning CIS on does not merely fail to help: `SET CPU INSTRUCTION=PACKED;EMULATED` makes EHKAA
+  **stop reaching its PASS halt**.  `=EXTENDED` breaks it too.  EHKAA is testing the emulation
+  trap, not the arithmetic.
+
+So `vax_cis.c` and `vax_octa.c` are correctly absent from this port, `strq.js`'s file header was
+right to call them "not deferred, not missing, simply not applicable", and what the EHKAA gate
+actually needs is the thing `exc.js`'s header lists as deliberately absent: **the CIS/octaword
+emulation traps**.  That is ~30 lines (`vax_cpu.c:3255-3295`), plus `CVTPL`'s operand fixup, plus
+two SCB vectors — not 1,659 lines of decimal arithmetic.
+
+The reason this went unnoticed for so long is worth keeping: `cpu_emulate_exception()` never calls
+`intexc()`, so it emits **nothing** in the `INTEXC` debug category — the exact log
+`docs/reference/ehkaa-profile.md` §5 built its 25-vector list from.  0xC8 and 0xCC are missing from
+that list because the instrument could not see them, not because they were never taken.  §6 and §8
+of that profile are wrong as written; `tests/cis_group_scope.js` is the correction.
 
 ### Read this before writing any VAX code
 
@@ -414,6 +448,19 @@ timer-driven tests whose iteration count depends on host wall-clock time per sim
 *unpatched* simulator does the same thing given any comparably chatty debug category.  `excdiff.js`
 therefore asserts the vector and IPR SETS as equalities and the event COUNT as a floor; see
 `tests/simh/README.md` for the measurement.
+
+Two computations carry no fixtures and no hand-maintained lists; they re-derive a scope from the
+same tables the code itself reads, and fail on drift:
+
+    node machines/dec/vax/tests/base_group_residual.js --check-carveouts
+    node machines/dec/vax/tests/cis_group_scope.js --check
+    node machines/dec/vax/tests/cis_group_scope.js --selfcheck   # two mutations, both must be caught
+
+`cis_group_scope.js` also runs EHKAA three times (~30s) and keeps a 145MB instruction history;
+`--keep DIR` caches it between runs.  Its `--selfcheck` mutations are the measurement path itself:
+one reconfigures SIMH to execute CIS natively (the computation must then report `executed`
+instances), one disables the `sim_debug` run-collapse expansion in its own parser (it must then
+report `unresolved` instances).  A surviving mutation means the computation proves nothing.
 
 The decode ROM in `modules/v2/drom.js` is **generated**, not transcribed, from Open SIMH's
 `vax_sys.c` and `vax_defs.h`:
