@@ -89,15 +89,18 @@
  * ============================================================================
  * WHAT IS DELIBERATELY NOT HERE
  * ============================================================================
- * - MACHINE CHECK (SCB_MCHK) -- PARTIALLY here as of pcjsvax-446.  takeFault()'s SCB.MCHK case
- *   now reproduces vax_sysdev.c's machine_check() for exactly ONE trigger: a bus fault on a
- *   physical reference to an address BusVAX.RESERVED reserves but does not decode (a "probe of
- *   absent hardware"), via cpustate.js's onBusFault() -> busTimeout() -> a thrown VAXFault(-SCB.
- *   MCHK, ...).  Two things this does NOT cover, deliberately: (a) the REF_P (physical-context)
- *   half of SIMH's mchk_ref -- see busTimeout()'s doc comment; (b) any OTHER machine-check
- *   trigger a real KA655 has (parity/ECC error, unaligned reference to I/O space, etc.) --
- *   none of those exist in this machine yet.  See takeFault()'s SCB.MCHK case for the reproduced
- *   stack frame, and tests/mchkdiff.js for what is graded against real SIMH.
+ * - MACHINE CHECK (SCB_MCHK) -- PARTIALLY here as of pcjsvax-446/pcjsvax-d22.  takeFault()'s
+ *   SCB.MCHK case reproduces vax_sysdev.c's machine_check() for a bus fault on a physical
+ *   reference to an address BusVAX.RESERVED reserves but does not decode (a "probe of absent
+ *   hardware"), via cpustate.js's onBusFault(), which now splits on TWO SIMH mechanisms: the
+ *   register-space default case (-> busTimeout() -> a thrown VAXFault(-SCB.MCHK, ...), pcjsvax-446)
+ *   and the Qbus/CQBIC path (ADDR_IS_IO()/ADDR_IS_CQM() -> cqMerr() and, for reads only, the SAME
+ *   thrown VAXFault; writes take NO synchronous exception at all -- see onBusFault()'s and
+ *   cqMerr()'s doc comments, pcjsvax-d22).  Two things this does NOT cover, deliberately: (a) the
+ *   REF_P (physical-context) half of SIMH's mchk_ref -- see busTimeout()'s doc comment; (b) any
+ *   OTHER machine-check trigger a real KA655 has (parity/ECC error, etc.) -- none of those exist
+ *   in this machine yet.  See takeFault()'s SCB.MCHK case for the reproduced stack frame, and
+ *   tests/mchkdiff.js / tests/cqmerrdiff.js for what is graded against real SIMH.
  * - COMPATIBILITY MODE (PSL<CM>).  A KA655 does not have it: vaxmod_defs.h does not define
  *   CMPM_VAX, so open-simh compiles the "Subset VAX" half of vax_cmode.c in which BadCmPSL()
  *   returns TRUE unconditionally and op_cmode() is a reserved-instruction fault.  badCmPSL() here
@@ -255,6 +258,40 @@ const SSCBTO_BTO = 0x80000000 | 0;
 const SSCBTO_RWT = 0x40000000;
 const MCHK_READ = 0x80, MCHK_WRITE = 0x82;
 
+/*
+ * CQBIC master-error state (vax_io.c:67-80, :118-119) -- cq_merr()'s target, pcjsvax-d22.  DSER
+ * (DMA system error register) and MEAR (master error address register) are the CQBIC's own record
+ * of an unbacked Qbus reference; unlike ssc_bto (a single bit this file already tracks), these are
+ * NOT decoded as addressable registers here (that is pcjsvax-69a's job, decoding the CQBIC's
+ * register window) -- they are internal state, read back by a harness the same way SIMH's console
+ * does (`examine qba dser`, `examine qba mear`), exactly the precedent busTimeout()'s doc comment
+ * set for sscBto.
+ *
+ *   CQDSER_MNX (0x80)  "master NXM" -- set on EVERY unbacked Qbus reference, read or write.
+ *   CQDSER_LST (0x08)  "lost error" -- set when a SECOND unbacked reference lands while DSER
+ *                      already shows an unresolved error (CQDSER_ERR_MASK != 0).  A single aligned
+ *                      BYTE or WORD reference is one Qbus cycle (never sets LST); an aligned LONG
+ *                      write is genuinely TWO 16-bit Qbus cycles (vax_io.c's WriteIO, L_LONG case)
+ *                      and always shows LST on a virgin DSER -- mirrored here by mmu.js's writeL()
+ *                      issuing two word writes for a Qbus address (see its doc comment) rather than
+ *                      by this method being called twice from one call site.
+ *   CQMEAR_MASK (13 bits, vax_io.c:80), VA_V_VPN (9, vax_defs.h:260) -- MEAR latches the Qbus PAGE
+ *                      of the failing address, `(pa >> 9) & 0x1FFF`; VA_V_VPN is redefined locally
+ *                      (not imported from mmu.js) because pulling in mmu.js's module-private
+ *                      constant would be a needless coupling for one shift amount both files copy
+ *                      from the same SIMH header line.
+ *
+ * NOT MODELLED: CQDSER_MPE/CQDSER_TMO/CQDSER_SNX (parity, Qbus-grant timeout, slave NXM) -- no
+ * trigger for any of those exists in this machine.  The W1C (write-one-to-clear) semantics of a
+ * real PROGRAM write to DSER -- nothing here ever writes it back -- same disclosed gap sscBto's
+ * doc comment already carries for the identical reason.
+ */
+const CQDSER_MNX = 0x80;
+const CQDSER_LST = 0x08;
+const CQDSER_ERR_MASK = 0xA5;                   // MNX | MPE | TMO | SNX (vax_io.c:75)
+const CQMEAR_MASK = 0x1FFF;
+const CQ_VA_V_VPN = 9;
+
 /**
  * @class VAXStop
  *
@@ -382,6 +419,15 @@ class VAXExc {
          */
         this.sscBto = 0;
         /*
+         * CQBIC master-error state (cq_dser/cq_mear, vax_io.c:118-119) -- see cqMerr()'s doc
+         * comment.  Unlike sscBto, `reset all` DOES clear these (qba_reset(), vax_io.c:749:
+         * `cq_dser = cq_mear = cq_sear = cq_ipc = 0`) -- measured directly, no special per-case
+         * handling needed the way mchkdiff.js's `deposit sysd bto 0` works around ssc_bto's
+         * stickiness.
+         */
+        this.cqDser = 0;
+        this.cqMear = 0;
+        /*
          * fault_PC (vax_cpu.c:258): the PC of the instruction currently being executed, captured
          * before its opcode is fetched.  The abort handler restores PC to it so the exception
          * frame records the FAULTING instruction, not the middle of it -- which is what makes the
@@ -421,6 +467,26 @@ class VAXExc {
          * (nothing here ever writes it back) and accumulation across MORE than two faults.
          */
         this.sscBto = 0;
+        this.cqDser = 0;
+        this.cqMear = 0;
+    }
+
+    /**
+     * cqMerr(addr)
+     *
+     * vax_io.c:709, cq_merr() -- "set master error".  Called by cpustate.js's onBusFault() for
+     * EVERY unbacked ADDR_IS_IO()/ADDR_IS_CQM() reference (pcjsvax-d22), on both the read path
+     * (before the synchronous machine check) and the write path (before the deferred mem_err).
+     * See the CQDSER_* constants' doc comment above for what is and is not reproduced.
+     *
+     * @this {VAXExc}
+     * @param {number} addr the full physical address that faulted
+     */
+    cqMerr(addr)
+    {
+        if (this.cqDser & CQDSER_ERR_MASK) this.cqDser = (this.cqDser | CQDSER_LST) | 0;
+        this.cqDser = (this.cqDser | CQDSER_MNX) | 0;
+        this.cqMear = ((addr >>> CQ_VA_V_VPN) & CQMEAR_MASK) | 0;
     }
 
     /**

@@ -969,12 +969,32 @@ export default class MMUVAX {
     /**
      * writeL(pa, val)
      *
+     * SIMH's WriteL (vax_mmu.h:397) branches on ADDR_IS_IO(pa): ordinary memory is one `M[pa>>2]
+     * = val`, but a Qbus reference goes through WriteIO(pa,val,L_LONG), which is NOT one op --
+     * `vax_io.c`'s WriteIO splits an aligned longword into TWO 16-bit Qbus cycles,
+     * `WriteQb(pa,...)` then `WriteQb(pa+2,...)`.  For an UNBACKED Qbus longword that matters
+     * observably (pcjsvax-d22): each cycle independently reaches cpustate.js's onBusFault(), so a
+     * genuine aligned-long Qbus write calls cqMerr() TWICE, and the second call is where DSER's
+     * LST (lost-error) bit gets set (measured directly against the real oracle -- a virgin DSER
+     * shows 0x88, not 0x80, after exactly this instruction).  Splitting into two setWord() calls
+     * here is what reproduces that for free, without threading a size parameter through
+     * onBusFault(): each setWord() that lands on nothing calls the SAME fault path a standalone
+     * word write would.  A backed Qbus longword (a real device model, when one lands here) sees
+     * two word-sized register writes instead of one long-sized one -- which is exactly the real
+     * Qbus wire protocol; nothing decodes REG_BASE via writeL() today, so this is currently
+     * unobservable outside the CQBIC probe this item grades.
+     *
      * @this {MMUVAX}
      * @param {number} pa
      * @param {number} val
      */
     writeL(pa, val)
     {
+        if (VAX.isQbusAddr(pa)) {
+            this.bus.setWord(pa, val & 0xFFFF);
+            this.bus.setWord((pa + 2) >>> 0, (val >>> 16) & 0xFFFF);
+            return;
+        }
         this.bus.setLong(pa & ~0x03, val);
     }
 
@@ -995,16 +1015,60 @@ export default class MMUVAX {
     /**
      * writeU(pa, val, lnt)
      *
-     * WriteU() (vax_mmu.h:441) -- merge 1..3 bytes into the longword containing pa.  A
-     * read-modify-write, because the Bus has no sub-longword merge primitive that takes a length.
+     * WriteU() (vax_mmu.h:436) -- merge 1..3 bytes into the longword containing pa.  For ordinary
+     * memory that is a read-modify-write, because the Bus has no sub-longword merge primitive that
+     * takes a length.  SIMH's OWN WriteU branches on ADDR_IS_IO(pa) exactly like WriteL does (see
+     * its doc comment): a Qbus reference does NOT read-modify-write at all -- it goes to
+     * WriteIOU(pa,val,lnt) (vax_io.c:358), which issues DIRECT byte/word Qbus cycles from `val`
+     * (already right-justified), with NO preceding read.
+     *
+     * This is not a cosmetic difference for an UNBACKED Qbus address (pcjsvax-d22): the ordinary
+     * RAM path's `this.bus.getLong(addr)` is itself a READ, and a read to nothing throws a
+     * SYNCHRONOUS machine check (cpustate.js's onBusFault(), fQbus branch) -- so before this fix,
+     * EVERY unaligned Qbus write synchronously machine-checked via the read half of a
+     * read-modify-write that real hardware never performs, misreporting a WRITE as if it were a
+     * READ that faulted.  Measured directly: real SIMH takes no exception at all for an unaligned
+     * write to an unbacked Qbus address (matching the aligned case), so the deferred-write path
+     * is unreachable here without this branch.
+     *
+     * The op-count mirrors WriteIOU's own switch on `lnt` and `pa & 1` exactly, so cqMerr()'s LST
+     * bit (set by a SECOND unbacked reference landing on an unresolved error) comes out right for
+     * every alignment, the same way writeL()'s two-word split does for the aligned-long case --
+     * see cqMerr()'s doc comment in exc.js.
      *
      * @this {MMUVAX}
      * @param {number} pa
-     * @param {number} val
-     * @param {number} lnt 0..3 (lnt 0 masks to nothing and leaves memory untouched, matching SIMH)
+     * @param {number} val right-justified: bits 0..(lnt*8-1) are the ones to write
+     * @param {number} lnt 1, 2 or 3 (0 is possible for the high fragment of a longword at bo == 0,
+     *                    which cannot occur, since bo == 0 is the aligned path)
      */
     writeU(pa, val, lnt)
     {
+        if (VAX.isQbusAddr(pa)) {
+            switch (lnt) {
+            case 1:
+                this.bus.setByte(pa, val & 0xFF);
+                break;
+            case 2:
+                if (pa & 1) {
+                    this.bus.setByte(pa, val & 0xFF);
+                    this.bus.setByte((pa + 1) >>> 0, (val >>> 8) & 0xFF);
+                } else {
+                    this.bus.setWord(pa, val & 0xFFFF);
+                }
+                break;
+            case 3:
+                if (pa & 1) {
+                    this.bus.setByte(pa, val & 0xFF);
+                    this.bus.setWord((pa + 1) >>> 0, (val >>> 8) & 0xFFFF);
+                } else {
+                    this.bus.setWord(pa, val & 0xFFFF);
+                    this.bus.setByte((pa + 2) >>> 0, (val >>> 16) & 0xFF);
+                }
+                break;
+            }
+            return;
+        }
         let addr = pa & ~0x03;
         let sc = (pa & 3) << 3;
         let mask = INSERT[lnt] << sc;
