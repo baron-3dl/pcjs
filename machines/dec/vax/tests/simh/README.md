@@ -314,6 +314,16 @@ Two details are load-bearing:
   `op_mtpr`/`op_mfpr`'s `default:` case → `WriteIPR`/`ReadIPR`, which `IPRR`/`IPRW` already covers
   completely. Adding a second, device-local trace would duplicate the same events under a different
   name.
+* **0006's `WriteReg` hunk is not strictly additive-only — it drops two trailing spaces from an
+  existing context line.** The pristine line `p->write (pa, val, lnt);  ` (note the trailing
+  whitespace, inherited the same way 0003's did — see the CRLF hazard entry below) becomes
+  `p->write (pa, val, lnt);` with no trailing whitespace once the new trace line is inserted above
+  it. Keeping the trailing spaces would trip `git apply`'s whitespace check on a context line that
+  is unrelated to this patch's own additions, which done condition 5 (zero whitespace warnings)
+  does not allow; dropping them is the smaller deviation and is judged the correct tradeoff. A
+  rebase that regenerates this hunk from a fresh diff should expect this one line to show as
+  changed context, not pure addition, and should not "fix" it back to preserve the trailing
+  whitespace.
 
 ## Upstream-drift hazards, per patch
 
