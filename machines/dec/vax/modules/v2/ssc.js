@@ -62,19 +62,41 @@
  * the same mechanism that named THIS item's own starting point (SSC+0x0).
  *
  * ============================================================================
- * WHAT IS NOT MODELLED: cross-register unaligned access
+ * WHAT IS NOT MODELLED: unaligned access that spans TWO adjacent register-space longwords
  * ============================================================================
- * vax_mmu.h's ReadB/ReadW (and WriteB/WriteW) compute the FULL longword value of the containing
- * register (ssc_rd()'s `rg = (pa - SSCBASE) >> 2` truncates any misalignment WITHIN a longword to
- * the same rg, so this is exactly what real hardware does too) and then shift/mask a single byte
- * or word out of -- or into -- IT ALONE.  There is no code path, on real SIMH or here, that
- * stitches two ADJACENT registers together for an unaligned reference; unlike ordinary RAM, which
- * permits exactly that (memory.js's readWordMemory/readLongMemory).  Reproduced faithfully for the
- * single-register case; a reference straddling two SSC registers is not exercised by anything
- * tests/romdiff.js, tests/mchkdiff.js or tests/busdiff.js drives (none of them address SSCBASE at
- * all except romdiff.js, and only at the aligned base register), and is not modelled -- if a later
- * item's workload ever needs it, extend readByte()/readWord()/writeByte()/writeWord() below rather
- * than assuming the RAM-style stitch applies to a register file.
+ * CORRECTED (pcjsvax-320 veracity re-dispatch) -- the previous version of this section claimed
+ * "no code path, on real SIMH or here, stitches two adjacent registers together for an unaligned
+ * reference."  That is FALSE for every case except a byte access and a word access at offset 1,
+ * and it was recorded here as a premise, not measured -- exactly the failure mode HANDOFF.md's §7
+ * exists to name.  MEASURED directly against the real oracle (SSC+0x0C = 0, SSC+0x10 = 0x5A5A5A5A):
+ *
+ *     MOVB @#2014000F        -> one longword only (register 0x0C)      claim HOLDS for bytes
+ *     MOVW @#2014000F        -> 0x5A00                                 STITCHED across 0x0C/0x10
+ *     MOVL @#2014000D        -> 0x5A000000                             STITCHED across 0x0C/0x10
+ *
+ * vax_mmu.h's `Read()` (the dispatcher every actual instruction goes through, NOT ReadB/ReadW/ReadL
+ * directly) routes a WORD at an offset congruent to 3 mod 4, and ANY unaligned LONGWORD, through
+ * `wl = ReadU(pa, ...)` and `wh = ReadU(pa1, ...)` where `pa1 = ((pa + 4) & PAMASK) & ~03` -- TWO
+ * INDEPENDENT `ReadRegU()`/`ssc_rd()` calls against TWO DIFFERENT `rg` values, then stitched exactly
+ * as memory.js's readWordMemory()/readLongMemory() stitch two RAM longwords.  ReadB/ReadW/ReadL
+ * (single-longword, no stitch) are the ALIGNED fast path only; `Read()` picks between them and the
+ * unaligned/stitching path by alignment, the same branch bus.js's getWord()/getLong() already make
+ * for ordinary RAM.
+ *
+ * So the accurate claim is: BYTE accesses, and WORD accesses at offset 0/1/2 (i.e. not crossing a
+ * longword boundary), stay within ONE register, exactly as readByte()/readWord() below compute them
+ * -- but a WORD at offset 3 or an UNALIGNED LONGWORD genuinely reads (or writes) two ADJACENT
+ * register-space longwords and combines them, which readWord()/readLong()/writeWord()/writeLong()
+ * below do NOT do (each only ever touches the ONE register `addr`'s rg resolves to).
+ *
+ * This is NOT mis-graded by anything in scope today: the only address this item's decode ever sees
+ * exercised is the aligned base register (tests/romdiff.js), and mchkdiff.js/busdiff.js never probe
+ * inside SSC_BASE at all -- see the file header's "WHAT HAPPENS TO EVERYTHING ELSE" section. It IS
+ * a real gap in the MODEL for whichever later item decodes enough adjacent SSC registers that a
+ * cross-longword unaligned reference becomes reachable; that item must extend readWord()/readLong()
+ * /writeWord()/writeLong() to do the two-lookup stitch above (or reproduce Read()/Write()'s wl/wh
+ * split exactly, including which side's fault wins if one of the two longwords is undecoded -- not
+ * measured here) rather than inherit this file's now-corrected claim that no register ever needs it.
  */
 
 import { VAX } from "./defines.js";
@@ -107,9 +129,17 @@ export default class SSCVAX {
     /**
      * reset()
      *
-     * vax_sysdev.c's global initializers (`int32 ssc_base = SSCBASE;`, vax_sysdev.c:244) and
-     * sysd_powerup() (vax_sysdev.c:1787, `ssc_base = SSCBASE`) agree on the same value, so one
-     * reset() serves both "cold" and "power-up" for the one register this file models.
+     * CORRECTED (pcjsvax-320 veracity re-dispatch): this models `sysd_powerup()`
+     * (vax_sysdev.c:1787, `ssc_base = SSCBASE`), NOT `sysd_reset()` -- MEASURED directly, SIMH's
+     * own `reset all` does NOT touch `ssc_base` at all (it is untouched by sysd_reset(), the same
+     * way pcjsvax-446 already found `ssc_bto` untouched by it).  Harmless today because this
+     * class's reset() is called ONLY from the constructor -- every test builds a fresh SSCVAX per
+     * machine, so "the value a brand-new instance starts with" and "the value after a cold power-up"
+     * are the same question here -- and nothing wires it to BusVAX.addResetHandler().  It would
+     * NOT be harmless if a later item did that: calling this reset() in response to a plain
+     * `reset all`-equivalent would incorrectly re-zero state SIMH's own reset leaves alone, exactly
+     * the exc.js/sscBto divergence class pcjsvax-446 found and fixed.  Whoever wires a reset handler
+     * here must first decide whether it should fire at all for a non-power-cycle reset.
      *
      * @this {SSCVAX}
      */

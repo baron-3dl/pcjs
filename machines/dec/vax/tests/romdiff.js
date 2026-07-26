@@ -44,11 +44,11 @@
  *             A prior version of this check used the magic byte and was vacuous for exactly that
  *             reason (caught by an adversarial veracity review); see verifyMirrorJS()'s header.
  *
- *   SELFCHECK --selfcheck injects eight deliberate defects into the SHIPPED code path (two distinct
+ *   SELFCHECK --selfcheck injects NINE deliberate defects into the SHIPPED code path (two distinct
  *             ROM-mirror failure modes -- reads garbage, and reads a stale load-time snapshot --
  *             CPUStateVAX.boot()'s magic byte / PSL, the ROM's read-only enforcement, the SSC base
- *             register's decode and its mask, and BoundaryAccounting's off-by-one) and fails if any
- *             one of them is not caught.
+ *             register's decode and its mask, BoundaryAccounting's off-by-one, and
+ *             BoundaryRequired's enforcement) and fails if any one of them is not caught.
  *
  * WHY THE SIMH SIDE USES A REAL `BOOT CPU`, BOUNDED BY A BREAKPOINT, NOT A HAND-BUILT DEPOSIT
  * ---------------------------------------------------------------------------------------------
@@ -232,6 +232,43 @@ const BoundaryAccounting = {
     compute(records, finalizedPartial) {
         let comparableRecords = finalizedPartial ? records - 1 : records;
         return {comparableRecords, instrNum: comparableRecords + 1};
+    }
+};
+
+/**
+ * BoundaryRequired.check(js, boundary)
+ *
+ * pcjsvax-320 VERACITY FINDING A -- a run that stops (js.stop truthy) but never produces a named
+ * boundary must FAIL, not exit clean.  Before this fix it did not: main()'s only stop-related
+ * check was `!js.stop`, so either of these regressions passed silently, having produced NO named
+ * stopping point at all -- exactly the artifact done condition 1 requires:
+ *
+ *   - js.firstFaultAddr === null: the stop happened for some OTHER reason than a bus fault (this
+ *     item's boundary-detection instrumentation never armed at all).
+ *   - js.firstFaultAddr is set, but probeSimhBackedAt() returned false: the first fault's address
+ *     is ALSO absent on the real oracle (both machines correctly agree nothing exists there) --
+ *     which is the CORRECT outcome for a genuinely-absent address, but is indistinguishable, with
+ *     no check at all, from a REGRESSION that computes a WRONG effective address that just happens
+ *     to land on a different, genuinely-absent one.
+ *
+ * A plain object property (not a bare function) so selfcheck() can patch it the same way it
+ * patches BoundaryAccounting.compute() above.
+ *
+ * @param {Object} js as returned by runRomJS()
+ * @param {?Object} boundary as computed in main(), or null
+ * @returns {?string} a problem string, or null if a boundary was produced (or the run never stopped)
+ */
+const BoundaryRequired = {
+    check(js, boundary) {
+        if (!js.stop || boundary) return null;
+        if (js.firstFaultAddr === null) {
+            return `the JS machine stopped (${js.stop.reason}) without ever recording a bus fault -- ` +
+                `no address to probe, so no boundary can be named; this item's whole point is to name one`;
+        }
+        return `the JS machine's first bus fault touched ${nameAddress(js.firstFaultAddr)}, which the real ` +
+            `oracle ALSO does not service (both machines agree nothing exists there) -- a regression computing ` +
+            `a WRONG effective address that happens to land on a genuinely absent one would exit clean here ` +
+            `otherwise; this item's whole point is to name a boundary, so a run that produces none is not a pass`;
     }
 };
 
@@ -853,6 +890,15 @@ const MUTATIONS = {
             return {comparableRecords, instrNum: comparableRecords + 1};
         };
         return () => { BoundaryAccounting.compute = orig; };
+    },
+    /* pcjsvax-320 VERACITY FINDING A: BoundaryRequired.check() stops enforcing the invariant
+       entirely -- a stop with no named boundary (no fault recorded at all, OR the first fault's
+       address is ALSO absent on the real oracle) would exit clean again, exactly the regression
+       this fix closes. */
+    "boundary-required-not-enforced": (cpu, bus) => {
+        let orig = BoundaryRequired.check;
+        BoundaryRequired.check = () => null;
+        return () => { BoundaryRequired.check = orig; };
     }
 };
 
@@ -863,7 +909,7 @@ const MUTATIONS = {
  * full SIMH trace run -- see the file's test_decisions in the item's report for why: none of these
  * is a subtle multi-instruction timing bug (that is what cpudiff.js's own --selfcheck already
  * proves this loop can catch); each is directly observable as a single readback or a single pure-
- * function call, and re-invoking SIMH eight more times would cost real wall-clock time for no
+ * function call, and re-invoking SIMH nine more times would cost real wall-clock time for no
  * additional detection power.
  *
  * @param {Uint8Array} romBytes
@@ -958,6 +1004,22 @@ function selfcheck(romBytes, opts, magicByte)
                         caught = true;
                         how = `BoundaryAccounting.compute(2, false) = ${JSON.stringify(got)}, expected ` +
                             `{comparableRecords: 2, instrNum: 3}`;
+                    }
+                } else if (name === "boundary-required-not-enforced") {
+                    /*
+                     * Pure-function check with synthetic `js` objects, mirroring the coordinator's
+                     * two live-injection shapes exactly: (1) a stop with NO fault ever recorded, and
+                     * (2) a stop whose first fault IS recorded but landed on an address the real
+                     * oracle also does not service (boundary === null either way).  The unmutated
+                     * function must flag BOTH as problems; the mutation always returns null.
+                     */
+                    let r1 = BoundaryRequired.check({stop: {reason: "synthetic"}, firstFaultAddr: null}, null);
+                    let r2 = BoundaryRequired.check({stop: {reason: "synthetic"}, firstFaultAddr: 0x20090000}, null);
+                    if (r1 === null || r2 === null) {
+                        caught = true;
+                        how = `BoundaryRequired.check() returned null (no problem) for a stop with no named ` +
+                            `boundary -- r1(no fault recorded)=${JSON.stringify(r1)}, ` +
+                            `r2(fault also absent on real oracle)=${JSON.stringify(r2)}`;
                     }
                 }
             } finally {
@@ -1062,6 +1124,10 @@ function main()
                 boundary = {addr: js.firstFaultAddr, fWrite, instrPC: js.firstFaultPC};
             }
         }
+        /* VERACITY FINDING A: a stop that never yields a named boundary is a FAILURE, not a quiet
+           pass -- see BoundaryRequired.check()'s doc comment. */
+        let boundaryProblem = BoundaryRequired.check(js, boundary);
+        if (boundaryProblem) problems.push(boundaryProblem);
         let breakAddr = boundary ? boundary.instrPC : js.pc;
         let simhTrace = captureSimhTrace(simh, opts, breakAddr);
         /*
