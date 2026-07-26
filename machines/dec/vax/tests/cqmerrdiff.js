@@ -751,6 +751,94 @@ function verifyDeferredDelivery(simh, scratch, addr)
 }
 
 /* ------------------------------------------------------------------------------------------- *
+ * Calibration ASSERTIONS -- the excluded set is REPORTED by name above; that alone is not          *
+ * enough, and a veracity pass measured why: nExcludedBacked lived only in the stats object and a    *
+ * printf, nothing require()d it, so a targeted one-line error in expectedWriteOps() (the ORACLE-    *
+ * side formula, not the code under test -- see calibrate()'s "GENUINE TRAP" note) grew the           *
+ * excluded set 11x (14 -> 152 -> 307), silently dropped over a hundred write probes -- this item's   *
+ * headline observable -- and the run still reported PASS with comfortable floor margin, because      *
+ * the coverage floors below measure the GRADED pool, not the exclusions, and a shrunk pool can        *
+ * still clear them.  Two committed checks close this, mirroring mchkdiff.js's EXPECTED_CALIBRATION:  *
+ *                                                                                                     *
+ *   ENUMERATED leaves are fully deterministic -- candidatesFor() never varies with --seed -- so       *
+ *   their confirmed/backed counts, per range and per direction, are committed EXACTLY below and       *
+ *   asserted in BOTH directions: too many exclusions (a formula regression) and too few (the           *
+ *   formula becoming too permissive, silently grading a leaf it should have excluded) both fail.       *
+ *   RANDOMIZED leaves vary with --seed and --cases by design (see the file header), so an exact        *
+ *   count is not meaningful; measured across 8 seeds at --cases 300 the excluded RATE stayed in         *
+ *   0.39%-1.17%.  A ceiling with 4x that slack (5%) comfortably passes every measured baseline and      *
+ *   fails both injected-bug rates from the veracity pass (13.9% and 28%).                                *
+ * ------------------------------------------------------------------------------------------- */
+
+const EXPECTED_ENUM_CALIBRATION = {
+    IOPAGE: {confirmed: {read: 80, write: 76}, backed: {read: 0, write: 4}},
+    CQM:    {confirmed: {read: 80, write: 76}, backed: {read: 0, write: 4}}
+};
+
+/**
+ * assertEnumCalibration(enumLeaves, cal)
+ *
+ * @param {Array<Object>} enumLeaves
+ * @param {Object} cal as returned by calibrate()
+ * @returns {Array.<string>} mismatches (empty means calibration matches the committed numbers)
+ */
+function assertEnumCalibration(enumLeaves, cal)
+{
+    let counts = {};
+    for (let r of RANGES) counts[r.name] = {confirmed: {read: 0, write: 0}, backed: {read: 0, write: 0}};
+    for (let l of enumLeaves) {
+        let k = leafKey(l);
+        let c = counts[l.range];
+        if (cal.confirmedRead.has(k)) c.confirmed.read++; else c.backed.read++;
+        if (cal.confirmedWrite.has(k)) c.confirmed.write++; else c.backed.write++;
+    }
+    let bad = [];
+    for (let r of RANGES) {
+        let exp = EXPECTED_ENUM_CALIBRATION[r.name];
+        if (!exp) { bad.push(`CALIBRATION: range "${r.name}" has no EXPECTED_ENUM_CALIBRATION entry`); continue; }
+        for (let dir of ["read", "write"]) {
+            let got = counts[r.name];
+            if (got.confirmed[dir] !== exp.confirmed[dir]) {
+                bad.push(`CALIBRATION: ${r.name} enumerated confirmed.${dir} = ${got.confirmed[dir]}, expected ${exp.confirmed[dir]}`);
+            }
+            if (got.backed[dir] !== exp.backed[dir]) {
+                bad.push(`CALIBRATION: ${r.name} enumerated backed.${dir} = ${got.backed[dir]}, expected ${exp.backed[dir]}`);
+            }
+        }
+    }
+    return bad;
+}
+
+/* Measured 0.39%-1.17% across seeds {0xC0FFEE,1,2,3,4,5,42,999999} at --cases 300; the veracity
+   pass's two injected-bug scenarios measured 13.9% and 28% -- 5% sits with slack above every real
+   baseline and well below both injected failures. */
+const MAX_RANDOM_BACKED_RATE = 0.05;
+
+/**
+ * assertRandomCalibration(randLeavesAll, cal, enumKeySet)
+ *
+ * @param {Array<Object>} randLeavesAll
+ * @param {Object} cal as returned by calibrate()
+ * @param {Set<string>} enumKeySet leafKey()s already counted by assertEnumCalibration -- excludes
+ *        them from the random-pool rate so the two assertions never double-count the same leaf
+ * @returns {Array.<string>}
+ */
+function assertRandomCalibration(randLeavesAll, cal, enumKeySet)
+{
+    let randomBacked = cal.backed.filter((b) => !enumKeySet.has(leafKey(b)));
+    let totalPairs = randLeavesAll.length * 2;
+    if (!totalPairs) return [];
+    let rate = randomBacked.length / totalPairs;
+    if (rate > MAX_RANDOM_BACKED_RATE) {
+        return [`CALIBRATION: randomized-pool excluded rate ${(rate * 100).toFixed(2)}% ` +
+            `(${randomBacked.length}/${totalPairs}) exceeds the ${(MAX_RANDOM_BACKED_RATE * 100).toFixed(0)}% ` +
+            `ceiling -- a formula regression (expectedMear/expectedWriteOps) or an implementation bug ` +
+            `may be silently draining the graded pool`];
+    }
+    return [];
+}
+
+/* ------------------------------------------------------------------------------------------- *
  * Coverage floors -- FAIL the run, do NOT scale down with case count                              *
  * ------------------------------------------------------------------------------------------- */
 
@@ -905,6 +993,11 @@ function runPhase(simh, scratch, opts, label)
         calibrationReport.push(`CALIBRATION: leaf 0x${hex(l.addr)} size=${l.size} (${l.fWrite ? "write" : "read"}) did not reach comparison`);
     }
 
+    /* The excluded set above is DISCLOSED (reported by name); these two calls are what ASSERTS it,
+       so a formula regression that inflates or hollows out the excluded set fails the run instead
+       of the excluded set quietly absorbing the loss -- see the doc comment above these functions. */
+    let calMismatch = assertEnumCalibration(enumLeaves, cal).concat(assertRandomCalibration(randLeavesAll, cal, enumKeySet));
+
     let {cases: enumCases, nextIndex} = leavesToCases(0, enumLeaves, dirsFor);
     let randCases = [];
     {
@@ -930,7 +1023,7 @@ function runPhase(simh, scratch, opts, label)
         nUnaligned: 0, nWriteMaskedByIPL: 0, nExcludedBacked: cal.backed.length
     };
     let addrsSeen = new Set();
-    let failures = [];
+    let failures = calMismatch.slice();
     let notReached = [];
     const BATCH = 60;
     for (let start = 0; start < cases.length; start += BATCH) {
@@ -1056,4 +1149,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) == path.resolve(fileURLToPa
     main();
 }
 
-export { RANGES, ENUM_ADDRS, makeMachine, runCaseJS };
+export {
+    RANGES, ENUM_ADDRS, makeMachine, runCaseJS, calibrate, enumeratedLeaves, randomLeaves, leafKey,
+    expectedMear, expectedWriteOps
+};
