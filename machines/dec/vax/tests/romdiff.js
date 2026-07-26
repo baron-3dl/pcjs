@@ -25,13 +25,18 @@
  *
  *   MIRROR    The upper half of the ROM (VAX.PHYSMEM.ROM_BASE + ROM_SIZE .. +ROM_LENGTH) must read
  *             back exactly what the lower half holds, at several offsets including the boundary,
- *             on BOTH sides -- and it must keep doing so after the one write this ROM ever
- *             receives (the boot-time magic byte), proving true aliasing rather than a load-time
- *             copy that could go stale.
+ *             on BOTH sides -- and it must keep tracking a DISTINCT sentinel byte written directly
+ *             into the primary after construction, proving true (live) aliasing rather than a
+ *             load-time copy that could go stale.  NOT the boot-time magic byte: ka655x.bin
+ *             already ships 0x02 at offset 4 and the measured magic byte is also 2, so re-writing
+ *             it proves nothing -- a snapshot taken at load time would show the identical value.
+ *             A prior version of this check used the magic byte and was vacuous for exactly that
+ *             reason (caught by an adversarial veracity review); see verifyMirrorJS()'s header.
  *
- *   SELFCHECK --selfcheck injects four deliberate defects into the SHIPPED code path (BusVAX's ROM
- *             mirror aliasing, CPUStateVAX.boot()'s magic byte / PSL, and the ROM's read-only
- *             enforcement) and fails if any one of them is not caught.
+ *   SELFCHECK --selfcheck injects five deliberate defects into the SHIPPED code path (two distinct
+ *             ROM-mirror failure modes -- reads garbage, and reads a stale load-time snapshot --
+ *             plus CPUStateVAX.boot()'s magic byte / PSL, and the ROM's read-only enforcement) and
+ *             fails if any one of them is not caught.
  *
  * WHY THE SIMH SIDE USES A REAL `BOOT CPU`, BOUNDED BY A BREAKPOINT, NOT A HAND-BUILT DEPOSIT
  * ---------------------------------------------------------------------------------------------
@@ -356,14 +361,31 @@ function compareTraces(jsPath, simhPath, unavailable, opts)
  * ------------------------------------------------------------------------------------------- */
 
 /**
- * verifyMirrorJS(romBytes, opts)
+ * verifyMirrorJS(romBytes, opts, magicByte)
  *
  * Checks the mirror against the PRIMARY half on THIS machine, at several offsets including both
- * boundaries, before AND after the one write the ROM ever receives (the boot-time magic byte) --
- * proving the mirror tracks a live write rather than a load-time snapshot.
+ * boundaries, before AND after a write.
+ *
+ * CORRECTED (post-dispatch veracity review): the ORIGINAL version of this function proved
+ * liveness by calling `cpu.boot(magicByte)` and checking that the mirror picked up the magic
+ * byte at +4.  That check is VACUOUS as shipped: ka655x.bin already ships 0x02 at offset 4, and
+ * the measured magic byte is ALSO 2 (see cpustate.js's ROM_MAGIC_BYTE comment), so boot() writes
+ * the SAME value that was already there.  A load-time snapshot-copy mirror (one array per half,
+ * copied once from the file, never re-read) passes that check identically to a genuinely live
+ * alias -- there is nothing to distinguish them, because nothing actually changed.  This was
+ * caught by an adversarial re-run that built exactly that snapshot-copy mirror and confirmed it
+ * passed.  The magic-byte-after-boot check below is kept as an ordinary integration assertion
+ * (boot() really does write what it claims), but it is NOT what proves the mirror is live.
+ *
+ * The actual liveness proof is the DISTINCT SENTINEL below: a byte written directly via
+ * setByteDirect(), chosen to differ from whatever is already at that offset (so the check cannot
+ * degenerate the same way), with the mirror required to track it and the original content
+ * restored afterward.  This is the same technique the "magic-byte-not-written" selfcheck mutation
+ * already uses to get an observable divergence; it just was not applied here.
  *
  * @param {Uint8Array} romBytes
  * @param {Object} opts
+ * @param {number} magicByte
  * @returns {Array.<string>} problems (empty if none)
  */
 function verifyMirrorJS(romBytes, opts, magicByte)
@@ -377,14 +399,38 @@ function verifyMirrorJS(romBytes, opts, magicByte)
         let primary = bus.getByte((base + off) >>> 0);
         let mirror = bus.getByte((base + size + off) >>> 0);
         if (primary !== mirror) {
-            problems.push(`mirror BEFORE boot at +0x${off.toString(16)}: primary=0x${hex(primary, 2)} mirror=0x${hex(mirror, 2)}`);
+            problems.push(`mirror BEFORE any write at +0x${off.toString(16)}: primary=0x${hex(primary, 2)} mirror=0x${hex(mirror, 2)}`);
         }
         if (primary !== romBytes[off]) {
             problems.push(`primary at +0x${off.toString(16)} is 0x${hex(primary, 2)}, expected the ROM file's own 0x${hex(romBytes[off], 2)}`);
         }
     }
-    /* Now write the one byte the machine ever writes into its own ROM, and require the mirror to
-       track it -- a load-time COPY would still pass every check above and only fail here. */
+
+    /*
+     * THE LIVENESS PROOF.  A byte guaranteed to actually CHANGE, at an offset the boot sequence
+     * never touches (so it cannot collide with the magic-byte check below), written through the
+     * same Direct accessor boot() itself uses.  If the primary and its ORIGINAL content happen to
+     * already equal 0x37, use 0x5A instead -- the whole point is that the write is observable.
+     */
+    let sentinelOff = 0x40;
+    let sentinelAddr = (base + sentinelOff) >>> 0;
+    let before = bus.getByte(sentinelAddr);
+    let sentinel = (before === 0x37) ? 0x5A : 0x37;
+    bus.setByteDirect(sentinelAddr, sentinel);
+    let primarySentinel = bus.getByte(sentinelAddr);
+    let mirrorSentinel = bus.getByte((base + size + sentinelOff) >>> 0);
+    if (primarySentinel !== sentinel) {
+        problems.push(`primary +0x${sentinelOff.toString(16)} after a direct sentinel write is 0x${hex(primarySentinel, 2)}, expected 0x${hex(sentinel, 2)}`);
+    }
+    if (mirrorSentinel !== sentinel) {
+        problems.push(`mirror +0x${sentinelOff.toString(16)} after a direct sentinel write to the PRIMARY is 0x${hex(mirrorSentinel, 2)}, expected it to track 0x${hex(sentinel, 2)} -- ` +
+            `the mirror is a load-time COPY, not a live alias (this is exactly the check a snapshot-copy mirror fails and the magic-byte check above cannot distinguish)`);
+    }
+    bus.setByteDirect(sentinelAddr, before);                  // restore -- this function must not leave the machine dirty
+
+    /* Ordinary integration check: boot() really does write what it claims.  NOT a liveness proof
+       on its own (see the file-header note above) -- ka655x.bin already ships 0x02 at +4 and the
+       measured magic byte is also 2, so this can pass even against a snapshot-copy mirror. */
     cpu.reset();
     cpu.boot(magicByte);
     let primary4 = bus.getByte((base + 4) >>> 0);
@@ -393,7 +439,7 @@ function verifyMirrorJS(romBytes, opts, magicByte)
         problems.push(`primary +4 after boot() is 0x${hex(primary4, 2)}, expected the magic byte 0x${hex(magicByte, 2)}`);
     }
     if (mirror4 !== magicByte) {
-        problems.push(`mirror +4 after boot() is 0x${hex(mirror4, 2)}, expected it to track the primary's magic byte 0x${hex(magicByte, 2)} -- the mirror is not truly aliased`);
+        problems.push(`mirror +4 after boot() is 0x${hex(mirror4, 2)}, expected it to track the primary's magic byte 0x${hex(magicByte, 2)}`);
     }
     return problems;
 }
@@ -441,17 +487,53 @@ function verifyMirrorSimh(simh, opts, breakAddr)
  * MUTATIONS -- one function each, applied to the SHIPPED objects (BusVAX.makeRomAliasController,
  * CPUStateVAX.prototype.boot, MemoryVAX write-protection), returning an undo closure.  Every one
  * of these is the named-mutation list done condition 5 requires, at minimum.
+ *
+ * TWO mirror mutations, deliberately, not one, after a veracity review found the first one alone
+ * was not distinguishing what it claimed to: "mirror-not-aliased" (a ZERO-FILLED buffer) is only
+ * caught because 0x00 happens to differ from whatever byte is really there -- it proves "the
+ * mirror reads garbage", not "the mirror is a stale copy".  "mirror-stale-copy" (a genuine
+ * snapshot, `Int32Array.from(block.adw)`, taken at construction time) is what actually exercises
+ * the failure mode this item's commit message claims to guard against: a mirror that read
+ * correctly at load time and then silently stopped tracking the primary.  Both are checked with a
+ * DISTINCT SENTINEL write (see below), never with the boot-time magic byte -- ka655x.bin already
+ * ships 0x02 at offset 4 and the measured magic byte is ALSO 2, so a check keyed on that offset
+ * cannot distinguish a live alias from a snapshot that merely happened to copy the right value
+ * once.
  */
 const MUTATIONS = {
     /* The mirror aliases nothing: each mirror block gets its OWN zero-filled buffer instead of the
-       primary block's array.  A load-time copy could still pass every read-only check; only the
-       live-aliasing assertion in verifyMirrorJS (the post-boot magic-byte check) catches this. */
+       primary block's array. */
     "mirror-not-aliased": (cpu, bus) => {
         let orig = BusVAX.makeRomAliasController;
         BusVAX.makeRomAliasController = function() {
             let fake = new Int32Array(VAX.PHYSMEM.ROM_SIZE >> 2);
             return {
                 getControllerBuffer() { return [fake, 0]; },
+                getControllerAccess() {
+                    return [
+                        MemoryVAX.prototype.readByteMemory, undefined,
+                        MemoryVAX.prototype.readWordMemory, undefined,
+                        MemoryVAX.prototype.readLongMemory, undefined
+                    ];
+                }
+            };
+        };
+        return () => { BusVAX.makeRomAliasController = orig; };
+    },
+    /* The mirror is a load-time SNAPSHOT of the primary -- correct at the moment addRom() builds
+       it (the copy is taken after the ROM file's bytes are already loaded into the primary), but
+       frozen from then on.  Every check that only reads INITIAL content, or that re-writes a value
+       already present, passes this identically to a true alias; only a write of something NEW,
+       read back through the mirror, can tell them apart. */
+    "mirror-stale-copy": (cpu, bus) => {
+        let orig = BusVAX.makeRomAliasController;
+        BusVAX.makeRomAliasController = function(busArg) {
+            return {
+                getControllerBuffer(addr) {
+                    let primaryAddr = ((addr >>> 0) - VAX.PHYSMEM.ROM_SIZE) >>> 0;
+                    let block = busArg.aMemBlocks[primaryAddr >>> busArg.nBlockShift];
+                    return [Int32Array.from(block.adw), 0];      // a COPY, not a reference
+                },
                 getControllerAccess() {
                     return [
                         MemoryVAX.prototype.readByteMemory, undefined,
@@ -499,9 +581,9 @@ const MUTATIONS = {
  *
  * Every mutation is checked with a FAST, DETERMINISTIC, structural assertion rather than a second
  * full SIMH trace run -- see the file's test_decisions in the item's report for why: none of these
- * four is a subtle multi-instruction timing bug (that is what cpudiff.js's own --selfcheck already
+ * five is a subtle multi-instruction timing bug (that is what cpudiff.js's own --selfcheck already
  * proves this loop can catch); each is directly observable as a single readback, and re-invoking
- * SIMH four more times would cost real wall-clock time for no additional detection power.
+ * SIMH five more times would cost real wall-clock time for no additional detection power.
  *
  * @param {Uint8Array} romBytes
  * @param {Object} opts
@@ -511,13 +593,13 @@ function selfcheck(romBytes, opts, magicByte)
 {
     console.log("\nSELFCHECK -- each mutation must be caught\n");
     /*
-     * "mirror-not-aliased" patches BusVAX.makeRomAliasController, which addRom() only CONSULTS at
-     * construction time -- so unlike the other three (which patch CPUStateVAX.prototype.boot or an
-     * already-built block, both of which take effect at the later CALL), it must be applied BEFORE
-     * makeMachine() builds the bus, or the mutation silently never engages and "SURVIVED" would be
-     * a false negative rather than a real coverage hole.
+     * Both mirror mutations patch BusVAX.makeRomAliasController, which addRom() only CONSULTS at
+     * construction time -- so unlike the other two (which patch CPUStateVAX.prototype.boot or an
+     * already-built block, both of which take effect at the later CALL), they must be applied
+     * BEFORE makeMachine() builds the bus, or the mutation silently never engages and "SURVIVED"
+     * would be a false negative rather than a real coverage hole.
      */
-    let PRE_MACHINE = new Set(["mirror-not-aliased"]);
+    let PRE_MACHINE = new Set(["mirror-not-aliased", "mirror-stale-copy"]);
     let survived = [];
     for (let name of Object.keys(MUTATIONS)) {
         let caught = false, how = "";
@@ -531,12 +613,25 @@ function selfcheck(romBytes, opts, magicByte)
                 undo = MUTATIONS[name](cpu, bus);
             }
             try {
-                if (name === "mirror-not-aliased") {
-                    cpu.reset();
-                    cpu.boot(magicByte);
+                if (name === "mirror-not-aliased" || name === "mirror-stale-copy") {
+                    /*
+                     * A DISTINCT SENTINEL, never the boot-time magic byte: ka655x.bin already
+                     * ships 0x02 at offset 4 and the measured magic byte is also 2, so a check
+                     * keyed there cannot tell a live alias from a snapshot that merely copied the
+                     * right value once (this is exactly the vacuity a veracity review found in an
+                     * earlier version of this file).
+                     */
                     let base = VAX.PHYSMEM.ROM_BASE >>> 0, size = VAX.PHYSMEM.ROM_SIZE;
-                    let p = bus.getByte((base + 4) >>> 0), m = bus.getByte((base + size + 4) >>> 0);
-                    if (p !== m) { caught = true; how = `mirror +4 = 0x${hex(m, 2)}, primary +4 = 0x${hex(p, 2)}`; }
+                    let addr = (base + 0x40) >>> 0;
+                    let before = bus.getByte(addr);
+                    let sentinel = (before === 0x37) ? 0x5A : 0x37;
+                    bus.setByteDirect(addr, sentinel);
+                    let m = bus.getByte((base + size + 0x40) >>> 0);
+                    if (m !== sentinel) {
+                        caught = true;
+                        how = `mirror +0x40 = 0x${hex(m, 2)} after a direct sentinel write of 0x${hex(sentinel, 2)} to the primary`;
+                    }
+                    bus.setByteDirect(addr, before);
                 } else if (name === "magic-byte-not-written" || name === "wrong-boot-psl") {
                     cpu.reset();
                     cpu.boot(0x37);
