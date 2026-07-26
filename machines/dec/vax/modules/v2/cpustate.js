@@ -104,6 +104,19 @@ const PSL_IPL1F = 0x1F << 16;
 const AST_MAX = 4;                          // vax_cpu.c cpu_reset(): ASTLVL = 4
 
 /**
+ * The console ROM's model-detection byte, written to ROMBASE+4 before execution (vax_sysdev.c
+ * cpu_boot():1729 -- `rom_wr_B (ROMBASE+4, sys_model ? 1 : 2)`).  MEASURED, not assumed
+ * (pcjsvax-223): `examine MODEL` against a stock `microvax3900` SIMH binary -- the exact oracle
+ * this machine is graded against -- returns 0, even though the binary's name and this project's
+ * stated target are both "MicroVAX 3900".  vax_sysdev.c:1859 prints sys_model=0 as "VAXserver
+ * 3900 (KA655)", not "MicroVAX" -- the naming is misleading, the bit value is what the ROM reads.
+ * So sys_model=0 on the actual oracle, and the byte this ROM needs is 2, not 1.
+ * tests/romdiff.js RE-DERIVES this from a live SIMH `examine MODEL` rather than trusting this
+ * comment, and fails loudly if the oracle's default ever changes.
+ */
+const ROM_MAGIC_BYTE = 2;
+
+/**
  * The opcodes vax_cpu.c routes to `op_cis()` (vax_cpu.c:3138-3147).  On this CPU model every one
  * of them lands in `cpu_emulate_exception()`.  Written as MNEMONICS and resolved through
  * drom.js's OPCODES for the same reason every other table here is: an opcode NUMBER transcribed by
@@ -651,6 +664,37 @@ export default class CPUStateVAX extends Component {
         }
     }
 
+    /**
+     * boot(magicByte = ROM_MAGIC_BYTE)
+     *
+     * vax_sysdev.c `cpu_boot()` (1714-1732), MINUS `sysd_powerup()`'s device-register clears
+     * (CMCTL, SSC timer/address-match registers, `ka_cacr`): no such devices are modeled yet
+     * (pcjsvax-223's constraints exclude them; that is the boundary the differential is built to
+     * find), and on a machine that has only ever seen reset() -- never actually run -- those
+     * registers don't exist to need clearing, so the omission is a no-op here, not a divergence.
+     * See docs item pcjsvax-223 for the full accounting.
+     *
+     * NOT `cpu_reset()`: PC is NOT set to ROMBASE by reset (vax_cpu.c:3323-3349 confirms it), only
+     * by this.  Call reset() first for a clean register file; boot() itself touches only PC, PSL
+     * and the ROM's own magic byte, exactly as cpu_boot() does.
+     *
+     * The magic byte is written through the bus's DIRECT accessor.  The ROM is genuinely read-only
+     * to the EXECUTING machine (BusVAX.addRom() makes normal writes fault), but this one byte is
+     * written BEFORE execution starts, which is what real hardware's cpu_boot() does too -- a
+     * boot-time console action, not a bus write the running program could ever issue.  Modeling it
+     * any other way (e.g. leaving the ROM permanently writable) would be dishonest about the
+     * ordering.
+     *
+     * @this {CPUStateVAX}
+     * @param {number} [magicByte]
+     */
+    boot(magicByte = ROM_MAGIC_BYTE)
+    {
+        this.setPC(VAX.PHYSMEM.ROM_BASE);
+        this.psl = (PSL_IS | PSL_IPL1F) >>> 0;
+        this.bus.setByteDirect((VAX.PHYSMEM.ROM_BASE + 4) >>> 0, magicByte & 0xFF);
+    }
+
     /* --------------------------------------------------------------------------------------- *
      * Dispatch                                                                                  *
      * --------------------------------------------------------------------------------------- */
@@ -871,5 +915,6 @@ export default class CPUStateVAX extends Component {
 CPUStateVAX.DISPATCH = DISPATCH;
 CPUStateVAX.DISPATCH_OWNER = DISPATCH_OWNER;
 CPUStateVAX.CIS_EMULATED = CIS_EMULATED;
+CPUStateVAX.ROM_MAGIC_BYTE = ROM_MAGIC_BYTE;
 
-export { CPUStateVAX, DISPATCH, DISPATCH_OWNER, CIS_EMULATED, VAXStop, VAXFault };
+export { CPUStateVAX, DISPATCH, DISPATCH_OWNER, CIS_EMULATED, VAXStop, VAXFault, ROM_MAGIC_BYTE };
