@@ -1,0 +1,181 @@
+diff --git a/VAX/vax_cpu.c b/VAX/vax_cpu.c
+index d52b4b4..4cbce67 100644
+--- a/VAX/vax_cpu.c
++++ b/VAX/vax_cpu.c
+@@ -493,6 +493,7 @@ DEBTAB cpu_deb[] = {
+     { "CMODFAULT", LOG_CPU_FAULT_CMODE, "cmode fault activities" },
+     { "MCHKFAULT", LOG_CPU_FAULT_MCHK,  "machine check fault activities" },
+     { "EMULFAULT", LOG_CPU_FAULT_EMUL,  "instruction emulation fault activities" },
++    { "EXCTRACE",  LOG_CPU_X,           "machine-readable exception/IPR state trace" },
+     { NULL, 0 }
+     };
+ 
+diff --git a/VAX/vax_cpu1.c b/VAX/vax_cpu1.c
+index 0adb355..eaf4d07 100644
+--- a/VAX/vax_cpu1.c
++++ b/VAX/vax_cpu1.c
+@@ -1081,6 +1081,26 @@ return (R[0]? 0: CC_Z);
+ 
+ /* Operating system interfaces */
+ 
++/* pcjs-vax differential support (patch 0005).
++
++   exc_trace_state() formats the complete privileged-register state as one blank-separated,
++   fixed-width hex field list, so a differential harness can reconstruct the exact machine state
++   at every exception dispatch, REI, CHMx and MTPR/MFPR without re-deriving it.  Purely additive:
++   it is only ever called from a sim_debug() under the new EXCTRACE (LOG_CPU_X) category, and no
++   instruction semantics anywhere in this file are changed.
++
++   Field order (17):  KSP ESP SSP USP IS SCBB PCBB ASTLVL SISR MAPEN P0BR P0LR P1BR P1LR SBR SLR PME
++*/
++
++#define PCJS_TRACING    (sim_deb && (cpu_dev.dctrl & LOG_CPU_X))
++
++static void exc_trace_state (char *buf)
++{
++sprintf (buf, "%08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X",
++    KSP, ESP, SSP, USP, IS, SCBB, PCBB, ASTLVL, SISR, mapen,
++    P0BR, P0LR, P1BR, P1LR, SBR, SLR, pme);
++}
++
+ /* Interrupt or exception
+ 
+         vec     =       SCB vector (bit<0> = interrupt in Qbus mode)
+@@ -1099,10 +1119,17 @@ int32 oldsp = SP;
+ int32 newpsl;
+ int32 newpc;
+ int32 acc;
++char pcjs_st[256];
++int32 pcjs_scbpa = (SCBB + vec) & (PAMASK & ~3);
+ 
++if (PCJS_TRACING) {                                     /* pcjs-vax: entry state */
++    exc_trace_state (pcjs_st);
++    sim_debug (LOG_CPU_X, &cpu_dev, "EXCA %08X %d %08X %08X %08X %08X %08X %s\n",
++        vec, ei, ipl, oldpsl, PC, oldsp, trpirq, pcjs_st);
++    }
+ in_ie = 1;                                              /* flag int/exc */
+ CLR_TRAPS;                                              /* clear traps */
+-newpc = ReadLP ((SCBB + vec) & (PAMASK & ~3));          /* read new PC */
++newpc = ReadLP (pcjs_scbpa);                            /* read new PC */
+ if (ei == IE_SVE)                                       /* severe? on istk */
+     newpc = newpc | 1;
+ if (newpc & 2)                                          /* bad flags? */
+@@ -1134,6 +1161,11 @@ else
+ sim_debug (LOG_CPU_I, &cpu_dev, "PC=%08x, PSL=%08x, SP=%08x, VEC=%08x, nPSL=%08x, nSP=%08x ",
+              PC, oldpsl, oldsp, vec, PSL, SP);
+ sim_debug_bits(LOG_CPU_I, &cpu_dev, cpu_psl_bits, oldpsl, PSL, 1);
++if (PCJS_TRACING) {                                     /* pcjs-vax: computed new state */
++    exc_trace_state (pcjs_st);
++    sim_debug (LOG_CPU_X, &cpu_dev, "EXCB %08X %08X %08X %08X %08X %s\n",
++        pcjs_scbpa, newpc, PSL, SP, trpirq, pcjs_st);
++    }
+ acc = ACC_MASK (KERN);                                  /* new mode is kernel */
+ Write (SP - 4, oldpsl, L_LONG, WA);                     /* push old PSL */
+ Write (SP - 8, PC, L_LONG, WA);                         /* push old PC */
+@@ -1154,7 +1186,13 @@ int32 mode = opc & PSL_M_MODE;
+ int32 cur = PSL_GETCUR (PSL);
+ int32 tsp, newpc, acc;
+ int32 sta;
++char pcjs_st[256];
+ 
++if (PCJS_TRACING) {                                     /* pcjs-vax: entry state */
++    exc_trace_state (pcjs_st);
++    sim_debug (LOG_CPU_X, &cpu_dev, "CHMA %08X %08X %08X %08X %08X %s\n",
++        opc, opnd[0], PSL | cc, PC, SP, pcjs_st);
++    }
+ if (PSL & PSL_IS)
+     ABORT (STOP_CHMFI);
+ newpc = ReadLP ((SCBB + SCB_CHMK + (mode << 2)) & PAMASK);
+@@ -1177,6 +1215,10 @@ Write (tsp - 4, PSL | cc, L_LONG, WA);                  /* push PSL */
+ SP = tsp - 12;                                          /* set new stk */
+ PSL = (mode << PSL_V_CUR) | (PSL & PSL_IPL) |           /* set new PSL */
+     (cur << PSL_V_PRV);                                 /* IPL unchanged */
++if (PCJS_TRACING) {                                     /* pcjs-vax: computed new state */
++    exc_trace_state (pcjs_st);
++    sim_debug (LOG_CPU_X, &cpu_dev, "CHMB %08X %08X %08X %s\n", newpc, PSL, SP, pcjs_st);
++    }
+ JUMP_ALWAYS (newpc & ~03);                              /* set new PC */
+ return 0;                                               /* cc = 0 */
+ }
+@@ -1214,7 +1256,13 @@ int32 newpsl = Read (SP + 4, L_LONG, RA);
+ int32 newcur = PSL_GETCUR (newpsl);
+ int32 oldcur = PSL_GETCUR (PSL);
+ int32 newipl, i;
++char pcjs_st[256];
+ 
++if (PCJS_TRACING) {                                     /* pcjs-vax: entry state */
++    exc_trace_state (pcjs_st);
++    sim_debug (LOG_CPU_X, &cpu_dev, "REIA %08X %08X %08X %08X %08X %s\n",
++        PSL, SP, newpc, newpsl, trpirq, pcjs_st);
++    }
+ if ((newpsl & PSL_MBZ) ||                               /* rule 8 */
+     (newcur < oldcur))                                  /* rule 1 */
+     REI_RSVD_FAULT("rule 8 or rule 1");
+@@ -1256,6 +1304,10 @@ else {
+         SISR = SISR | SISR_2;
+         }
+     }
++if (PCJS_TRACING) {                                     /* pcjs-vax: resulting state */
++    exc_trace_state (pcjs_st);
++    sim_debug (LOG_CPU_X, &cpu_dev, "REIB %08X %08X %08X %08X %s\n", PSL, SP, newpc, trpirq, pcjs_st);
++    }
+ JUMP_ALWAYS (newpc);                                    /* set new PC */
+ return newpsl & CC_MASK;                                /* set new cc */
+ }
+@@ -1429,7 +1481,12 @@ int32 op_mtpr (int32 *opnd)
+ uint32 val = (uint32)opnd[0];
+ uint32 prn = (uint32)opnd[1];
+ int32 cc;
++char pcjs_st[256];
+ 
++if (PCJS_TRACING) {                                     /* pcjs-vax: entry state */
++    exc_trace_state (pcjs_st);
++    sim_debug (LOG_CPU_X, &cpu_dev, "MTPA %08X %08X %08X %08X %08X %s\n", prn, val, PSL, SP, trpirq, pcjs_st);
++    }
+ if (PSL & PSL_CUR)                                      /* must be kernel */
+     RSVD_INST_FAULT(MTPR);
+ if (prn > MT_MAX)                                       /* reg# > max? fault */
+@@ -1553,6 +1610,10 @@ switch (prn) {                                          /* case on reg # */
+         break;
+         }
+ 
++if (PCJS_TRACING) {                                     /* pcjs-vax: resulting state */
++    exc_trace_state (pcjs_st);
++    sim_debug (LOG_CPU_X, &cpu_dev, "MTPB %08X %08X %08X %08X %s\n", cc, PSL, SP, trpirq, pcjs_st);
++    }
+ return cc;
+ }
+ 
+@@ -1560,7 +1621,12 @@ int32 op_mfpr (int32 *opnd)
+ {
+ uint32 prn = (uint32)opnd[0];
+ int32 val;
++char pcjs_st[256];
+ 
++if (PCJS_TRACING) {                                     /* pcjs-vax: entry state */
++    exc_trace_state (pcjs_st);
++    sim_debug (LOG_CPU_X, &cpu_dev, "MFPA %08X %08X %08X %s\n", prn, PSL, SP, pcjs_st);
++    }
+ if (PSL & PSL_CUR)                                      /* must be kernel */
+     RSVD_INST_FAULT(MFPR);
+ if (prn > MT_MAX)                                       /* reg# > max? fault */
+@@ -1642,5 +1708,7 @@ switch (prn) {                                          /* case on reg# */
+         break;
+         }
+ 
++if (PCJS_TRACING)                                       /* pcjs-vax: value read */
++    sim_debug (LOG_CPU_X, &cpu_dev, "MFPB %08X\n", val);
+ return val;
+ }
+diff --git a/VAX/vax_defs.h b/VAX/vax_defs.h
+index 0a490e3..d99786b 100644
+--- a/VAX/vax_defs.h
++++ b/VAX/vax_defs.h
+@@ -120,6 +120,7 @@ extern jmp_buf save_env;
+ #define LOG_CPU_FAULT_CMODE 0x040                       /* cmode faults */
+ #define LOG_CPU_FAULT_MCHK  0x080                       /* machine check faults */
+ #define LOG_CPU_FAULT_EMUL  0x100                       /* emulated instruction fault */
++#define LOG_CPU_X           0x200                       /* pcjs-vax exception/IPR trace */
+ 
+ /* Recovery queue */
+ 

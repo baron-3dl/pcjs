@@ -57,7 +57,9 @@
  *   it is dispatched to OS software emulation, not executed by the CPU at all, exactly like packed
  *   decimal.  decode.js's checkInstructionGroup() comment documents this same exclusion.
  * - BICPSW/BISPSW/MOVPSL.  These manipulate the PSW directly; they are not branch, jump, call, or
- *   stack instructions, and belong with pcjsvax-e49's privileged/PSW-adjacent scope.
+ *   stack instructions.  They live in cpu.js (verified: they are in its IMPLEMENTED table and are
+ *   graded by intdiff.js).  An earlier version of this note assigned them to pcjsvax-e49; that was
+ *   wrong, and pcjsvax-e49 owns SCB dispatch and MTPR/MFPR (modules/v2/exc.js) instead.
  * ============================================================================
  */
 
