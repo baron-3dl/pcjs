@@ -109,6 +109,35 @@ const PSW_T = 0x10, PSL_TP = 1 << 30;
 const nSP = 14, nPC = 15;
 
 /* ------------------------------------------------------------------------------------------- *
+ * DEFERRED ARITHMETIC TRAPS -- vax_defs.h:302-309, 676-677                                       *
+ *                                                                                                *
+ * An integer overflow or a divide by zero does NOT fault: the instruction completes and stores    *
+ * its result, and a trap is REQUESTED that the CPU loop delivers at the top of the NEXT           *
+ * instruction.  `trpirq` is SIMH's own variable and is the convention fpa.js and strq.js already   *
+ * follow; cpustate.js publishes it (delegating to exc.js, which drains it) so all four modules     *
+ * write ONE place.                                                                                *
+ *                                                                                                *
+ * Setting CC<V> without requesting the trap -- which is what this file did before pcjsvax-c05,    *
+ * and correctly so, because a single-instruction differential cannot observe a dispatch that has  *
+ * not happened yet -- is invisible until a real program runs.  EHKAA's integer-overflow test at   *
+ * 80013524 is exactly that program: it arms PSW<IV>, executes `ADDL3 7FFFFFFF,1,dst`, and expects  *
+ * to arrive in its SCB_ARITH handler.  Without the request the machine walks off the end of the   *
+ * test into a HALT.                                                                               *
+ *                                                                                                *
+ * NOTE the asymmetry, which is SIMH's and is easy to "tidy" into a bug: overflow is conditional   *
+ * on PSW<IV>, divide-by-zero is UNCONDITIONAL.                                                    *
+ * ------------------------------------------------------------------------------------------- */
+const PSW_IV = 0x20;
+const PSL_M_IPL = 0x1F;
+const TIR_V_TRAP = 5;
+const TRAP_INTOV = 1 << TIR_V_TRAP, TRAP_DIVZRO = 2 << TIR_V_TRAP;
+
+/** vax_defs.h:676 `INTOV`. */
+function intov(cpu) { if (cpu.psl & PSW_IV) cpu.trpirq = (cpu.trpirq & PSL_M_IPL) | TRAP_INTOV; }
+/** vax_defs.h:309 `SET_TRAP (TRAP_DIVZRO)`. */
+function divzro(cpu) { cpu.trpirq = (cpu.trpirq & PSL_M_IPL) | TRAP_DIVZRO; }
+
+/* ------------------------------------------------------------------------------------------- *
  * Sign-extension, matching vax_defs.h SXTB/SXTW.  Byte/word operands arrive zero-extended        *
  * (decode.js's contract); these produce the signed int32 SIMH's macros produce.                  *
  * ------------------------------------------------------------------------------------------- */
@@ -488,46 +517,46 @@ function ccIIZP_W(r, cc) { r &= WMASK; return (r & WSIGN) ? (CC_N | (cc & CC_C))
 function ccIIZP_L(r, cc) { return (r & LSIGN) ? (CC_N | (cc & CC_C)) : (r === 0 ? (CC_Z | (cc & CC_C)) : (cc & CC_C)); }
 function ccIIZP_Q(rl, rh, cc) { return (rh & LSIGN) ? (CC_N | (cc & CC_C)) : ((rl === 0 && rh === 0) ? (CC_Z | (cc & CC_C)) : (cc & CC_C)); }
 
-function ccAdd_B(r, s1, s2)
+function ccAdd_B(cpu, r, s1, s2)
 {
     let cc = ccIIZZ_B(r);
-    if (((~s1 ^ s2) & (s1 ^ r)) & BSIGN) cc |= CC_V;
+    if (((~s1 ^ s2) & (s1 ^ r)) & BSIGN) { cc |= CC_V; intov(cpu); }
     if ((r >>> 0) < (s2 >>> 0)) cc |= CC_C;
     return cc;
 }
-function ccAdd_W(r, s1, s2)
+function ccAdd_W(cpu, r, s1, s2)
 {
     let cc = ccIIZZ_W(r);
-    if (((~s1 ^ s2) & (s1 ^ r)) & WSIGN) cc |= CC_V;
+    if (((~s1 ^ s2) & (s1 ^ r)) & WSIGN) { cc |= CC_V; intov(cpu); }
     if ((r >>> 0) < (s2 >>> 0)) cc |= CC_C;
     return cc;
 }
-function ccAdd_L(r, s1, s2)
+function ccAdd_L(cpu, r, s1, s2)
 {
     let cc = ccIIZZ_L(r);
-    if (((~s1 ^ s2) & (s1 ^ r)) & LSIGN) cc |= CC_V;
+    if (((~s1 ^ s2) & (s1 ^ r)) & LSIGN) { cc |= CC_V; intov(cpu); }
     if ((r >>> 0) < (s2 >>> 0)) cc |= CC_C;
     return cc;
 }
 
-function ccSub_B(r, s1, s2)
+function ccSub_B(cpu, r, s1, s2)
 {
     let cc = ccIIZZ_B(r);
-    if (((s1 ^ s2) & (~s1 ^ r)) & BSIGN) cc |= CC_V;
+    if (((s1 ^ s2) & (~s1 ^ r)) & BSIGN) { cc |= CC_V; intov(cpu); }
     if ((s2 >>> 0) < (s1 >>> 0)) cc |= CC_C;
     return cc;
 }
-function ccSub_W(r, s1, s2)
+function ccSub_W(cpu, r, s1, s2)
 {
     let cc = ccIIZZ_W(r);
-    if (((s1 ^ s2) & (~s1 ^ r)) & WSIGN) cc |= CC_V;
+    if (((s1 ^ s2) & (~s1 ^ r)) & WSIGN) { cc |= CC_V; intov(cpu); }
     if ((s2 >>> 0) < (s1 >>> 0)) cc |= CC_C;
     return cc;
 }
-function ccSub_L(r, s1, s2)
+function ccSub_L(cpu, r, s1, s2)
 {
     let cc = ccIIZZ_L(r);
-    if (((s1 ^ s2) & (~s1 ^ r)) & LSIGN) cc |= CC_V;
+    if (((s1 ^ s2) & (~s1 ^ r)) & LSIGN) { cc |= CC_V; intov(cpu); }
     if ((s2 >>> 0) < (s1 >>> 0)) cc |= CC_C;
     return cc;
 }
@@ -672,12 +701,12 @@ H.TSTL = (cpu, d) => { cpu.setCC(ccIIZZ_L(d.opnd[0])); };
 
 /* --- Single-operand, read/write: INCx/DECx src.mx --- */
 
-H.INCB = (cpu, d) => { let op0 = d.opnd[0], r = (op0 + 1) & BMASK; storeB(cpu, d, r); cpu.setCC(ccAdd_B(r, 1, op0)); };
-H.INCW = (cpu, d) => { let op0 = d.opnd[0], r = (op0 + 1) & WMASK; storeW(cpu, d, r); cpu.setCC(ccAdd_W(r, 1, op0)); };
-H.INCL = (cpu, d) => { let op0 = d.opnd[0], r = (op0 + 1) | 0; storeL(cpu, d, r); cpu.setCC(ccAdd_L(r, 1, op0)); };
-H.DECB = (cpu, d) => { let op0 = d.opnd[0], r = (op0 - 1) & BMASK; storeB(cpu, d, r); cpu.setCC(ccSub_B(r, 1, op0)); };
-H.DECW = (cpu, d) => { let op0 = d.opnd[0], r = (op0 - 1) & WMASK; storeW(cpu, d, r); cpu.setCC(ccSub_W(r, 1, op0)); };
-H.DECL = (cpu, d) => { let op0 = d.opnd[0], r = (op0 - 1) | 0; storeL(cpu, d, r); cpu.setCC(ccSub_L(r, 1, op0)); };
+H.INCB = (cpu, d) => { let op0 = d.opnd[0], r = (op0 + 1) & BMASK; storeB(cpu, d, r); cpu.setCC(ccAdd_B(cpu, r, 1, op0)); };
+H.INCW = (cpu, d) => { let op0 = d.opnd[0], r = (op0 + 1) & WMASK; storeW(cpu, d, r); cpu.setCC(ccAdd_W(cpu, r, 1, op0)); };
+H.INCL = (cpu, d) => { let op0 = d.opnd[0], r = (op0 + 1) | 0; storeL(cpu, d, r); cpu.setCC(ccAdd_L(cpu, r, 1, op0)); };
+H.DECB = (cpu, d) => { let op0 = d.opnd[0], r = (op0 - 1) & BMASK; storeB(cpu, d, r); cpu.setCC(ccSub_B(cpu, r, 1, op0)); };
+H.DECW = (cpu, d) => { let op0 = d.opnd[0], r = (op0 - 1) & WMASK; storeW(cpu, d, r); cpu.setCC(ccSub_W(cpu, r, 1, op0)); };
+H.DECL = (cpu, d) => { let op0 = d.opnd[0], r = (op0 - 1) | 0; storeL(cpu, d, r); cpu.setCC(ccSub_L(cpu, r, 1, op0)); };
 
 /* --- Push: PUSHL src.rl, PUSHAx src.ax --- */
 
@@ -702,9 +731,9 @@ H.MCOMB = (cpu, d) => { let r = d.opnd[0] ^ BMASK; storeB(cpu, d, r); cpu.setCC(
 H.MCOMW = (cpu, d) => { let r = d.opnd[0] ^ WMASK; storeW(cpu, d, r); cpu.setCC(ccIIZP_W(r, cpu.cc)); };
 H.MCOML = (cpu, d) => { let r = (d.opnd[0] ^ LMASK) | 0; storeL(cpu, d, r); cpu.setCC(ccIIZP_L(r, cpu.cc)); };
 
-H.MNEGB = (cpu, d) => { let op0 = d.opnd[0], r = (-op0) & BMASK; storeB(cpu, d, r); cpu.setCC(ccSub_B(r, op0, 0)); };
-H.MNEGW = (cpu, d) => { let op0 = d.opnd[0], r = (-op0) & WMASK; storeW(cpu, d, r); cpu.setCC(ccSub_W(r, op0, 0)); };
-H.MNEGL = (cpu, d) => { let op0 = d.opnd[0], r = (-op0) | 0; storeL(cpu, d, r); cpu.setCC(ccSub_L(r, op0, 0)); };
+H.MNEGB = (cpu, d) => { let op0 = d.opnd[0], r = (-op0) & BMASK; storeB(cpu, d, r); cpu.setCC(ccSub_B(cpu, r, op0, 0)); };
+H.MNEGW = (cpu, d) => { let op0 = d.opnd[0], r = (-op0) & WMASK; storeW(cpu, d, r); cpu.setCC(ccSub_W(cpu, r, op0, 0)); };
+H.MNEGL = (cpu, d) => { let op0 = d.opnd[0], r = (-op0) | 0; storeL(cpu, d, r); cpu.setCC(ccSub_L(cpu, r, op0, 0)); };
 
 H.CVTBW = (cpu, d) => { let r = sxtB(d.opnd[0]) & WMASK; storeW(cpu, d, r); cpu.setCC(ccIIZZ_W(r)); };
 H.CVTBL = (cpu, d) => { let r = sxtB(d.opnd[0]) | 0; storeL(cpu, d, r); cpu.setCC(ccIIZZ_L(r)); };
@@ -714,14 +743,14 @@ H.CVTLB = (cpu, d) => {
     let op0 = d.opnd[0] | 0, r = op0 & BMASK;
     storeB(cpu, d, r);
     let cc = ccIIZZ_B(r);
-    if (op0 > 127 || op0 < -128) cc |= CC_V;
+    if (op0 > 127 || op0 < -128) { cc |= CC_V; intov(cpu); }
     cpu.setCC(cc);
 };
 H.CVTLW = (cpu, d) => {
     let op0 = d.opnd[0] | 0, r = op0 & WMASK;
     storeW(cpu, d, r);
     let cc = ccIIZZ_W(r);
-    if (op0 > 32767 || op0 < -32768) cc |= CC_V;
+    if (op0 > 32767 || op0 < -32768) { cc |= CC_V; intov(cpu); }
     cpu.setCC(cc);
 };
 H.CVTWB = (cpu, d) => {
@@ -729,7 +758,7 @@ H.CVTWB = (cpu, d) => {
     storeB(cpu, d, r);
     let cc = ccIIZZ_B(r);
     let temp = sxtW(op0);
-    if (temp > 127 || temp < -128) cc |= CC_V;
+    if (temp > 127 || temp < -128) { cc |= CC_V; intov(cpu); }
     cpu.setCC(cc);
 };
 
@@ -743,7 +772,7 @@ H.ADAWI = (cpu, d) => {
     }
     let r = (op0 + temp) & WMASK;
     storeW(cpu, d, r);
-    cpu.setCC(ccAdd_W(r, op0, temp));
+    cpu.setCC(ccAdd_W(cpu, r, op0, temp));
 };
 
 /* --- Two-operand, read-only: CMPx src1.rx, src2.rx; BITx src1.rx, src2.rx --- */
@@ -767,7 +796,7 @@ function mkAdd(width)
         let op0 = d.opnd[0], op1 = d.opnd[1];
         let r = width === 4 ? ((op1 + op0) | 0) : ((op1 + op0) & mask);
         store(cpu, d, r);
-        cpu.setCC(ccAdd(r, op0, op1));
+        cpu.setCC(ccAdd(cpu, r, op0, op1));
     };
 }
 function mkSub(width)
@@ -779,7 +808,7 @@ function mkSub(width)
         let op0 = d.opnd[0], op1 = d.opnd[1];
         let r = width === 4 ? ((op1 - op0) | 0) : ((op1 - op0) & mask);
         store(cpu, d, r);
-        cpu.setCC(ccSub(r, op0, op1));
+        cpu.setCC(ccSub(cpu, r, op0, op1));
     };
 }
 function mkBis(width)
@@ -827,7 +856,7 @@ function mkMulShort(width)
         let r = temp & mask;
         store(cpu, d, r);
         let cc = ccIIZZ(r);
-        if (temp > hi || temp < lo) cc |= CC_V;
+        if (temp > hi || temp < lo) { cc |= CC_V; intov(cpu); }
         cpu.setCC(cc);
     };
 }
@@ -841,8 +870,8 @@ function mkDivShort(width)
     return (cpu, d) => {
         let op0 = d.opnd[0], op1 = d.opnd[1];
         let r, cc = 0;
-        if (op0 === 0) { r = op1; cc = CC_V; }
-        else if (op0 === mask && op1 === sign) { r = op1; cc = CC_V; }
+        if (op0 === 0) { r = op1; cc = CC_V; divzro(cpu); }
+        else if (op0 === mask && op1 === sign) { r = op1; cc = CC_V; intov(cpu); }
         else r = Math.trunc(sxt(op1) / sxt(op0));
         r &= mask;
         store(cpu, d, r);
@@ -875,15 +904,15 @@ H.MULL2 = H.MULL3 = (cpu, d) => {
     let {lo: r, hi: rh} = mul32signed(op0, op1);
     storeL(cpu, d, r);
     let cc = ccIIZZ_L(r);
-    if (rh !== ((r & LSIGN) ? -1 : 0)) cc |= CC_V;
+    if (rh !== ((r & LSIGN) ? -1 : 0)) { cc |= CC_V; intov(cpu); }
     cpu.setCC(cc);
 };
 
 H.DIVL2 = H.DIVL3 = (cpu, d) => {
     let op0 = d.opnd[0], op1 = d.opnd[1];
     let r, cc = 0;
-    if (op0 === 0) { r = op1; cc = CC_V; }
-    else if ((op0 >>> 0) === LMASK && (op1 >>> 0) === LSIGN) { r = op1; cc = CC_V; }
+    if (op0 === 0) { r = op1; cc = CC_V; divzro(cpu); }
+    else if ((op0 >>> 0) === LMASK && (op1 >>> 0) === LSIGN) { r = op1; cc = CC_V; intov(cpu); }
     else r = Math.trunc(op1 / op0);
     r = r | 0;
     storeL(cpu, d, r);
@@ -894,7 +923,7 @@ H.ADWC = (cpu, d) => {
     let op0 = d.opnd[0], op1 = d.opnd[1];
     let r = (op1 + op0 + (cpu.cc & CC_C)) | 0;
     storeL(cpu, d, r);
-    let cc = ccAdd_L(r, op0, op1);
+    let cc = ccAdd_L(cpu, r, op0, op1);
     if (r === op1 && op0 !== 0) cc |= CC_C;
     cpu.setCC(cc);
 };
@@ -902,7 +931,7 @@ H.SBWC = (cpu, d) => {
     let op0 = d.opnd[0], op1 = d.opnd[1];
     let r = (op1 - op0 - (cpu.cc & CC_C)) | 0;
     storeL(cpu, d, r);
-    let cc = ccSub_L(r, op0, op1);
+    let cc = ccSub_L(cpu, r, op0, op1);
     if (op0 === op1 && r !== 0) cc |= CC_C;
     cpu.setCC(cc);
 };
@@ -940,7 +969,7 @@ H.ASHL = (cpu, d) => {
         if (op0 > 31) { r = 0; temp = 0; }
         else { r = (op1 << op0) | 0; temp = r >> op0; }
         cc = ccIIZZ_L(r);
-        if (op1 !== temp) cc |= CC_V;
+        if (op1 !== temp) { cc |= CC_V; intov(cpu); }
     }
     storeL(cpu, d, r);
     cpu.setCC(cc);
@@ -951,7 +980,7 @@ H.ASHQ = (cpu, d) => {
     let {lo: r, hi: rh, flg} = opAshq(op0, op1, op2);
     storeQ(cpu, d, r, rh);
     let cc = ccIIZZ_Q(r, rh);
-    if (flg) cc |= CC_V;
+    if (flg) { cc |= CC_V; intov(cpu); }
     cpu.setCC(cc);
 };
 
@@ -967,8 +996,8 @@ H.EDIV = (cpu, d) => {
     let op3 = d.opnd[3], op4 = d.opnd[4], op5 = d.opnd[5], op6 = d.opnd[6];
     if (op5 < 0) cpu.mmu.readData(op6, L_LONG, cpu.accW());
     let r, rh, flg;
-    if (op0 === 0) { flg = CC_V; r = op1; rh = 0; }
-    else { let res = opEdiv(op0, op1, op2); r = res.quo; rh = res.rem; flg = res.flg; }
+    if (op0 === 0) { flg = CC_V; r = op1; rh = 0; divzro(cpu); }
+    else { let res = opEdiv(op0, op1, op2); r = res.quo; rh = res.rem; flg = res.flg; if (flg) intov(cpu); }
     if (op3 >= 0) cpu.regs[op3] = r; else cpu.mmu.writeData(op4, r, L_LONG, cpu.accW());
     if (op5 >= 0) cpu.regs[op5] = rh; else cpu.mmu.writeData(op6, rh, L_LONG, cpu.accW());
     cpu.setCC(ccIIZZ_L(r) | flg);

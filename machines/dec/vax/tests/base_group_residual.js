@@ -20,13 +20,10 @@
  * uses to decide whether this CPU implements an opcode at all, and prints the set difference.  No
  * hand-maintained mnemonic list lives here or anywhere else in this file.
  *
- * As of pcjsvax-515, the residual is exactly the 12 opcodes documented in strq.js's file header
- * as coordination carve-outs -- MTPR/MFPR (pcjsvax-e49) and CHMK/CHME/CHMS/CHMU/BPT/XFC/REI/
- * LDPCTX/SVPCTX/HALT (all need SCB exception dispatch and/or the privileged IPR register file,
- * also pcjsvax-e49's).  `--check-carveouts` asserts the residual is EXACTLY that set and exits
- * non-zero on any drift (an opcode silently added or removed from the carve-out list without
- * updating both this script and strq.js's header is exactly the kind of drift this script exists
- * to catch).
+ * As of pcjsvax-e49 the residual is EMPTY: all 242 opcodes of IG_BASE|IG_BSGFL|IG_BSDFL have a
+ * body.  `--check-carveouts` asserts the residual is exactly the (now empty) KNOWN_CARVEOUTS set
+ * and exits non-zero on any drift in either direction -- an opcode that stops being implemented,
+ * or a carve-out entry left behind after the opcode it named was implemented.  Both have happened.
  *
  * Usage:
  *     node machines/dec/vax/tests/base_group_residual.js
@@ -42,15 +39,19 @@ import { IMPLEMENTED as STRQ_IMPLEMENTED } from "../modules/v2/strq.js";
 import { IMPLEMENTED as EXC_IMPLEMENTED } from "../modules/v2/exc.js";
 
 /*
- * The known, documented coordination carve-outs as of pcjsvax-515 -- see strq.js's file header
- * for the full reasoning behind each.  Not a hand-maintained "done" list; used only to assert the
- * computed residual hasn't silently grown or shrunk.
+ * The known, documented coordination carve-outs.  Not a hand-maintained "done" list; used only to
+ * assert the computed residual has not silently grown or shrunk.
+ *
+ * EMPTY as of pcjsvax-e49, which implemented all twelve of the opcodes that used to be here
+ * (MTPR/MFPR, CHMK/CHME/CHMS/CHMU, BPT/XFC/REI/LDPCTX/SVPCTX/HALT -- the IPR register file and the
+ * SCB dispatch mechanism strq.js's header explains they all depend on).  The list was not emptied
+ * at the time, so `--check-carveouts` has been reporting twelve MISSING carve-outs -- i.e. failing
+ * -- ever since: the assertion was still true in substance (the residual really is what the list
+ * says it should not be) but stale in form.  Corrected in pcjsvax-c05, whose dispatch table makes
+ * the same claim a LOAD-TIME invariant in shipped code (cpustate.js buildDispatch(), check (b)):
+ * every opcode in IG_BASE|IG_BSGFL|IG_BSDFL has a body, or the machine refuses to construct.
  */
-const KNOWN_CARVEOUTS = new Set([
-    "MTPR", "MFPR",                                    // pcjsvax-e49: IPR register file
-    "CHMK", "CHME", "CHMS", "CHMU",                     // pcjsvax-e49: SCB exception dispatch
-    "BPT", "XFC", "REI", "LDPCTX", "SVPCTX", "HALT"     // pcjsvax-e49: SCB dispatch and/or IPRs
-]);
+const KNOWN_CARVEOUTS = new Set([]);
 
 const DROM_STRIDE = 7;
 

@@ -66,37 +66,28 @@
  *     Instruction Group for this CPU model -- not deferred, not missing, simply not applicable.
  *
  * ============================================================================
- * NO CPU LOOP OWNS fault_PC -- WHAT THAT COSTS THIS FILE
+ * fault_PC AND THE FPD RESUME PATH -- CLOSED BY pcjsvax-c05
  * ============================================================================
  * MOVC3/MOVC5/CMPC3/CMPC5/LOCC/SKPC/SCANC/SPANC are, architecturally, RESTARTABLE: SIMH sets
  * PSL<FPD> before the copy/scan loop and packs a resume state (fill/mask character, delta-PC,
  * remaining length) into R0 so that if the loop is interrupted (page fault, asynchronous
  * interrupt), the NEXT sim_instr() top-of-loop iteration re-enters with PSL<FPD> already set,
- * skips specifier re-resolution (decode.js's `decode(fFPD)` already has this branch built and
- * ready -- see its file header), and resumes via `SETPC(fault_PC + STR_GETDPC(R[0]))`.
+ * skips specifier re-resolution (decode.js's `decode(fFPD)` has that branch), and resumes via
+ * `SETPC(fault_PC + STR_GETDPC(R[0]))`.
  *
- * `fault_PC` -- the PC at the START of the current instruction, before decode -- is a variable
- * `sim_instr()`'s own top-of-loop maintains.  No item owns that loop yet (this file's dispatcher
- * was told as much, and this port confirms it firsthand): there is no fault_PC anywhere in this
- * codebase for this file to read.  Consequences, scoped precisely:
+ * `fault_PC` -- the PC at the START of the current instruction, before decode -- is maintained by
+ * `sim_instr()`'s own top-of-loop.  When this file was written no item owned that loop, so the
+ * delta-PC was packed as a constant zero and the resume path left the PC where it lay.  The CPU
+ * loop (modules/v2/cpustate.js) now maintains it and publishes it as `cpu.faultPC`, so BOTH halves
+ * are real: STR_PACK() stores `PC - fault_PC` and strResume() adds it back.  The consumer-visible
+ * consequence is that tests/strqdiff.js's EHKAA-phase `PSL<FPD>` skip -- which existed solely
+ * because this was broken -- is no longer needed; tests/cpudiff.js exercises the resume path
+ * directly, against SIMH, with a real mid-string page fault.
  *
- *   - The FORWARD path (PSL<FPD> clear at entry) is fully, faithfully ported below, including
- *     setting PSL<FPD> before the loop and clearing it after -- exactly SIMH's structure.  Every
- *     handler here runs its loop to completion in one synchronous call (JavaScript has no
- *     equivalent of SIMH's sim_interval yielding mid-instruction), so for any state this file's
- *     own randomized generator produces -- which, like every sibling differential in this
- *     project, never manufactures an execution-time fault -- PSL<FPD> is set and cleared inside
- *     the SAME call and is never externally observable.  This is the same "execution-time faults
- *     are out of scope" boundary cpu.js's and control.js's own headers already draw.
- *   - The RESUME path (PSL<FPD> set at entry) is structurally present -- reads STR_GETDPC/
- *     STR_GETCHR from R0, as SIMH does -- but has no correct fault_PC to add the delta to, so it
- *     leaves PC exactly where it was deposited rather than computing SIMH's resumed value.  This
- *     is a real, documented gap, not a silent one: tests/strqdiff.js's EHKAA phase detects any
- *     trace instance whose PRE-state already has PSL<FPD> set (a genuine mid-string-op resume in
- *     real EHKAA execution) and SKIPS it -- counted, reported by name, never silently dropped --
- *     using the exact same "did a trap or interrupt intervene" discipline intdiff.js's EHKAA
- *     phase already established for its own domain.  Fixing this for real needs fault_PC, i.e.
- *     needs the CPU loop.
+ * `extra_bytes` (vax_cpu.c:278) is maintained here for the same reason: it is incremented once per
+ * string byte referenced, and the CPU loop charges `1 + (extra_bytes >> 5)` cycles per instruction.
+ * A CPU object that does not define it (every pre-c05 harness) simply accumulates into a property
+ * nothing reads.
  *
  * ============================================================================
  * INTERLOCKED QUEUE INSTRUCTIONS -- WHY NO INTERLOCK CODE IS HERE
@@ -128,7 +119,7 @@
  * coerced with `>>> 0` only where MMUVAX requires it; longword data is signed int32.
  */
 
-import { OP_MEM, VAXFAULT } from "./decode.js";
+import { OP_MEM, VAXFAULT, VAXFault } from "./decode.js";
 import { OPCODES } from "./drom.js";
 import MMUVAX from "./mmu.js";
 
@@ -149,16 +140,43 @@ const PSL_M_MODE = 0x3;
 const PSL_V_PRV  = 22;
 const PSL_M_IPL  = 0x1F;
 
-/* vax_defs.h STR_* -- pack/unpack the FPD resume state into R0.  See the file header's "NO CPU
-   LOOP OWNS fault_PC" note for why the delta-PC field this file PACKS is never correctly UNPACKED
-   on resume; it is packed anyway for structural fidelity with SIMH and so the field is at least
-   present (zeroed) rather than garbage. */
+/* vax_defs.h STR_* -- pack/unpack the FPD resume state into R0.
+ *
+ * BOTH HALVES NEED fault_PC, and as of pcjsvax-c05 both have it: cpustate.js is the CPU loop that
+ * maintains it, and `cpu.faultPC` is its published accessor.  STR_PACK stores `PC - fault_PC` --
+ * how many bytes of THIS instruction have already been consumed -- in R0<31:24>, and the resume
+ * path adds that back to fault_PC to re-establish the PC just past the instruction.  Packing a
+ * constant zero delta and never unpacking it (which is what this file did while no loop owned
+ * fault_PC) is self-consistent only as long as nothing is ever really resumed: a genuinely
+ * interrupted MOVC5 resumed that way returns to the middle of its own operand specifiers. */
 const STR_V_DPC  = 24, STR_M_DPC = 0xFF;
 const STR_V_CHR  = 16, STR_M_CHR = 0xFF;
 const STR_LNMASK = 0xFFFF;
 function STR_GETDPC(x) { return (x >>> STR_V_DPC) & STR_M_DPC; }
 function STR_GETCHR(x) { return (x >>> STR_V_CHR) & STR_M_CHR; }
-function STR_PACK(fill, len) { return (((fill & STR_M_CHR) << STR_V_CHR) | (len & STR_LNMASK)) | 0; }
+function STR_PACK(cpu, fill, len)
+{
+    let dpc = (cpu.regs[15] - (cpu.faultPC | 0)) & STR_M_DPC;
+    return ((dpc << STR_V_DPC) | ((fill & STR_M_CHR) << STR_V_CHR) | (len & STR_LNMASK)) | 0;
+}
+
+/**
+ * strResume(cpu)
+ *
+ * `SETPC (fault_PC + STR_GETDPC (R[0]))`, the first line of every FPD resume path in vax_cpu1.c
+ * (814, 958, 1018, 1058).  One function because all four are identical, and because getting it
+ * wrong is invisible until a string instruction is actually interrupted.
+ *
+ * @param {Object} cpu
+ */
+function strResume(cpu)
+{
+    cpu.setPC(((cpu.faultPC | 0) + STR_GETDPC(cpu.regs[0])) | 0);
+}
+
+/* vax_defs.h TIR_V_TRAP/TRAP_SUBSCR -- see "DEFERRED TRAP" above. */
+/* vax_defs.h:577-582 MM_PARAM's two fields. */
+const MM_WRITE = 4, MM_EMASK = 3;
 
 /* vax_defs.h TIR_V_TRAP/TRAP_SUBSCR -- see "DEFERRED TRAP" above. */
 const TIR_V_TRAP   = 5;
@@ -248,15 +266,28 @@ function opProbe(cpu, opnd, rw)
     let stat = { code: 0 };
     let PR = MMUVAX.PR;
 
-    /* op_probe() itself returns CC_Z on failure or 0 on success; the CALLER (vax_cpu.c:
-       `cc = (cc & CC_C) | op_probe(opnd, opc & 1);`) is the one that preserves the incoming
-       carry bit.  Ported as one step: preserved C, plus Z only on failure. */
+    /*
+     * PR_PTNV -- the PROCESS PAGE TABLE ENTRY itself is not valid -- is the one probe outcome that
+     * is NOT reported through the condition codes: SIMH forces a real TNV exception (vax_cpu1.c
+     * op_probe), because a probe cannot answer a question whose answer lives in a page the
+     * operating system has not brought in.
+     *
+     * IT MUST CARRY ITS PARAMETERS.  `p1 = MM_PARAM(rw, PR_PTNV)` and `p2 = <the probed address>`
+     * are pushed on the exception stack by the dispatcher, and `MM_PARAM(w,p)` is
+     * `((w? 4: 0) | (p & 3))`, so for PR_PTNV (6) the low two bits are 2 -- NOT the 0 that PR_TNV
+     * (4) produces.  Throwing a bare fault loses both, which is invisible until something dispatches
+     * the exception and the handler reads the frame: EHKAA does exactly that at 80017D82, and the
+     * two machines then disagree on a value 0x800215F0 that a later MOVQ pops.  Caught by
+     * tests/cpudiff.js's EHKAA phase; unreachable by strqdiff.js's PROBE phase, which compares the
+     * condition codes and the MMU state because when it was written nothing pushed a frame.
+     */
     cpu.mmu.test(ba, acc, stat);
-    if (stat.code === PR.PTNV) cpu.fault(VAXFAULT.TNV);
+    if (stat.code === PR.PTNV) throw new VAXFault(VAXFAULT.TNV, (rw ? MM_WRITE : 0) | (PR.PTNV & MM_EMASK), ba);
     if (stat.code !== PR.TNV && stat.code !== PR.OK) { setCC(cpu, (getCC(cpu) & CC.C) | CC.Z); return; }
 
-    cpu.mmu.test((ba + length - 1) | 0, acc, stat);
-    if (stat.code === PR.PTNV) cpu.fault(VAXFAULT.TNV);
+    let end = (ba + length - 1) | 0;
+    cpu.mmu.test(end, acc, stat);
+    if (stat.code === PR.PTNV) throw new VAXFault(VAXFAULT.TNV, (rw ? MM_WRITE : 0) | (PR.PTNV & MM_EMASK), end);
     if (stat.code !== PR.TNV && stat.code !== PR.OK) { setCC(cpu, (getCC(cpu) & CC.C) | CC.Z); return; }
 
     setCC(cpu, getCC(cpu) & CC.C);
@@ -448,9 +479,7 @@ function opMovc(cpu, opnd, movc5)
     let fill, cc = 0;
 
     if (cpu.psl & PSL_FPD) {
-        /* Resume path -- see file header's "NO CPU LOOP OWNS fault_PC" note: PC is left as
-           deposited rather than recomputed, because fault_PC does not exist anywhere in this
-           codebase yet. */
+        strResume(cpu);                                 /* vax_cpu1.c:814 */
         fill = STR_GETCHR(regs[0]);
         regs[2] = regs[2] & STR_LNMASK;
         if (regs[4] > 0) regs[4] = regs[4] & STR_LNMASK;
@@ -469,7 +498,7 @@ function opMovc(cpu, opnd, movc5)
             fill = 0;
             cc = CC.Z;
         }
-        regs[0] = STR_PACK(fill, regs[2]);
+        regs[0] = STR_PACK(cpu, fill, regs[2]);
         if (regs[2]) {
             if ((regs[1] >>> 0) < (regs[3] >>> 0)) {
                 regs[1] = (regs[1] + regs[2]) | 0;
@@ -498,7 +527,7 @@ function opMovc(cpu, opnd, movc5)
         mlnt[2] = regs[2] - mlnt[0] - mlnt[1];
         for (let i = 0; i < 3; i++) {
             let lnt = LOOPLNT[i];
-            for (let j = 0; j < mlnt[i]; j += lnt) {
+            for (let j = 0; j < mlnt[i]; j += lnt, cpu.extraBytes++) {
                 if (forward) {
                     let wd = cpu.mmu.readData(regs[1], lnt, RA);
                     cpu.mmu.writeData(regs[3], wd, lnt, WA);
@@ -560,6 +589,7 @@ function opCmpc(cpu, opnd, cmpc5)
     let fill;
 
     if (cpu.psl & PSL_FPD) {
+        strResume(cpu);                                 /* vax_cpu1.c:958 */
         fill = STR_GETCHR(regs[0]);
     } else {
         regs[1] = opnd[1];
@@ -572,13 +602,13 @@ function opCmpc(cpu, opnd, cmpc5)
             regs[3] = opnd[2];
             fill = 0;
         }
-        regs[0] = STR_PACK(fill, opnd[0]);
+        regs[0] = STR_PACK(cpu, fill, opnd[0]);
         cpu.psl |= PSL_FPD;
     }
     regs[2] = regs[2] & STR_LNMASK;
 
     let s1 = 0, s2 = 0;
-    while (((regs[0] | regs[2]) & STR_LNMASK) !== 0) {
+    for (; ((regs[0] | regs[2]) & STR_LNMASK) !== 0; cpu.extraBytes++) {
         if (regs[0] & STR_LNMASK) s1 = cpu.mmu.readData(regs[1], L_BYTE, RA);
         else s1 = fill;
         if (regs[2]) s2 = cpu.mmu.readData(regs[3], L_BYTE, RA);
@@ -609,14 +639,15 @@ function opLocskp(cpu, opnd, skpc)
     let match;
 
     if (cpu.psl & PSL_FPD) {
+        strResume(cpu);                                 /* vax_cpu1.c:1018 */
         match = STR_GETCHR(regs[0]);
     } else {
         match = opnd[0];
-        regs[0] = STR_PACK(match, opnd[1]);
+        regs[0] = STR_PACK(cpu, match, opnd[1]);
         regs[1] = opnd[2];
         cpu.psl |= PSL_FPD;
     }
-    while ((regs[0] & STR_LNMASK) !== 0) {
+    for (; (regs[0] & STR_LNMASK) !== 0; cpu.extraBytes++) {
         let c = cpu.mmu.readData(regs[1], L_BYTE, RA);
         if ((c === match) !== !!skpc) break;
         regs[0] = (regs[0] & ~STR_LNMASK) | ((regs[0] - 1) & STR_LNMASK);
@@ -639,15 +670,16 @@ function opScnspn(cpu, opnd, spanc)
     let mask;
 
     if (cpu.psl & PSL_FPD) {
+        strResume(cpu);                                 /* vax_cpu1.c:1058 */
         mask = STR_GETCHR(regs[0]);
     } else {
         regs[1] = opnd[1];
         regs[3] = opnd[2];
         mask = opnd[3];
-        regs[0] = STR_PACK(mask, opnd[0]);
+        regs[0] = STR_PACK(cpu, mask, opnd[0]);
         cpu.psl |= PSL_FPD;
     }
-    while ((regs[0] & STR_LNMASK) !== 0) {
+    for (; (regs[0] & STR_LNMASK) !== 0; cpu.extraBytes++) {
         let c = cpu.mmu.readData(regs[1], L_BYTE, RA);
         let t = cpu.mmu.readData((regs[3] + c) | 0, L_BYTE, RA);
         if (((t & mask) !== 0) !== !!spanc) break;

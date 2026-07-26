@@ -672,6 +672,17 @@ class VAXExc {
         let dispatches = 0;
         for (;;) {
             if (dispatches > 64) throw new VAXStop(VAXStop.REASON.INIE, dispatches);
+            /*
+             * vax_cpu.c:656.  `fault_PC = PC` is the FIRST thing the top of sim_instr()'s loop
+             * does -- BEFORE the trap/interrupt check, not after it -- and each `continue` in that
+             * block comes back through here and re-captures it.  That ordering only matters when
+             * the dispatch itself faults (intexc() writing a frame onto a broken kernel stack):
+             * SIMH's abort handler then restores PC to the PC this iteration started with, which
+             * is the value assigned here.  Setting it only just before the opcode fetch, as this
+             * function originally did, leaves the PREVIOUS instruction's address in fault_PC for
+             * exactly that case.  The value is identical for every other path.
+             */
+            this.faultPC = cpu.regs[nPC];
             if (this.trpirq) {
                 let trap = (this.trpirq >>> TIR_V_TRAP) & TIR_M_TRAP;
                 if (trap) {
@@ -720,7 +731,8 @@ class VAXExc {
             break;
         }
 
-        this.faultPC = cpu.regs[nPC];
+        /* faultPC was captured at the top of the loop above, which is where vax_cpu.c captures it;
+           nothing between there and here moves the PC. */
         let pending = null;
         try {
             let opc = cpu.decoder.decode((cpu.psl & PSL_FPD) != 0);
