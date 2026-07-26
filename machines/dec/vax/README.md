@@ -9,8 +9,9 @@ DEC VAX
 
 A MicroVAX 3900 (KA655) machine for PCjs, ported from [Open SIMH](https://github.com/open-simh/simh)
 (MIT, © 1998-2019 Robert M Supnik).  Work in progress: at present this directory contains the
-physical memory and bus layer, instruction decode and operand resolution, and memory management —
-no instruction execution, no devices.
+physical memory and bus layer, instruction decode and operand resolution, memory management, and
+the integer/logical/variable-length-bit-field slice of instruction execution — control flow,
+floating point, string/queue/CIS instructions, and devices are not yet here.
 
 ### Read this before writing any VAX code
 
@@ -186,15 +187,41 @@ two-level page-table walks, M-bit write-backs, or the fraction of comparisons ag
 data drops below its floor.  `--ops` below 100,000 fails outright rather than scaling the floors
 down with it.
 
-All three tests assert their own coverage and **fail** when it is not met — an undersized run does
-not quietly pass — and all three ship `--selfcheck`, which injects deliberate defects into the
+Instruction execution (`modules/v2/cpu.js`) currently covers the Base Instruction Group's 107
+integer, logical, and variable-length-bit-field opcodes (control flow, floating point, and
+string/queue/CIS belong to sibling items):
+
+    node machines/dec/vax/tests/intdiff.js --selfcheck
+    node machines/dec/vax/tests/intdiff.js --simh PATH --ehkaa PATH
+
+Two phases.  A randomized differential drives a **live** SIMH console (`deposit`/`step 1`/
+`examine`) through N pre-states per opcode (`--cases-per-opcode`, default 150, floor 40) — edge-
+weighted register and memory values (0, ±1, signed min/max, all-ones), condition codes, and both
+register and memory destinations — and compares the full 16-register file plus PSL after one
+instruction.  Then the entire EHKAA diagnostic trace (the same capture `decodediff.js` uses) is
+scanned for every instance of one of these 107 opcodes; the next trace record's **pre-resolution**
+register file (patch 0002's `PREG`, not patch 0001's post-resolution `REGS` — the latter already
+carries the *next* instruction's own autoincrement side effects, which was a real bug caught only
+by running this against 335,444 real instructions) is the exact post-execution ground truth,
+provided (checked per instance) no trap or interrupt intervened between the two.  Memory-mode
+variable-bit-field instructions need an execution-time read the decode-phase `MEMR` log does not
+contain and are skipped in this phase (counted, never silently dropped) — exclusively the
+randomized phase's job, which it does. Both execution-time faults (a state no addressing-mode
+legality check the decoder itself enforces would catch) and deferred arithmetic traps (integer
+overflow/divide-by-zero, which SIMH dispatches at the top of the *next* instruction and which are
+therefore invisible to a single-instruction comparison either way) are out of scope; `cpu.js`'s
+file header states exactly why. `--selfcheck` mutates the shipped `HANDLERS` dispatch table itself.
+
+All four tests assert their own coverage and **fail** when it is not met — an undersized run does
+not quietly pass — and all four ship `--selfcheck`, which injects deliberate defects into the
 shipped code path and fails if the differential does not catch each one.  `mmudiff.js`'s first
 mutation is the `>>` vs `>>>` page-table-index hazard described above.
 
 The simulator is located via `--simh PATH`, then `$SIMH_BIN` / `$SIMH_DECODE_BIN` /
-`$SIMH_MMU_BIN`, then `../pcjs-vax/open-simh/BIN/microvax3900` (`busdiff.js`) or
-`$TMPDIR/pcjs-vax-simh/...` (`mmudiff.js`, which needs patch 0003).  If it cannot be found, the
-tests fail rather than falling back to self-comparison.
+`$SIMH_MMU_BIN` / `$SIMH_INT_BIN`, then `../pcjs-vax/open-simh/BIN/microvax3900` (`busdiff.js`) or
+`$TMPDIR/pcjs-vax-simh/...` (`mmudiff.js` and `intdiff.js`, which need patch 0003 and patches
+0001+0002 respectively). If it cannot be found, the tests fail rather than falling back to
+self-comparison.
 
 The decode ROM in `modules/v2/drom.js` is **generated**, not transcribed, from Open SIMH's
 `vax_sys.c` and `vax_defs.h`:
