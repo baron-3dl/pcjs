@@ -19,6 +19,11 @@
 #         op_* routines, the real condition-code macros and the real WRITE_B/W/L/Q store -- on
 #         an operand queue you supply, and reports the result, the condition codes, the trap
 #         request and any abort.
+#   0005  (here) adds the EXCTRACE debug category: a machine-readable dump of the complete
+#         privileged-register state at every intexc(), op_rei(), op_chm() and op_mtpr()/op_mfpr(),
+#         which is what excdiff.js replays.  The state a dispatch depends on (STK[], IS, SCBB)
+#         is simulator-internal and appears in NO existing log, so without this the EHKAA
+#         exception sequence cannot be graded at all.
 #
 # None changes any instruction semantics; the simulator's own EHKAA self-test still passes,
 # which the build runs automatically.
@@ -49,8 +54,9 @@ PATCH1="$VAX_WORK/patches/0001-inst-history-add-register-file.patch"
 PATCH2="$HERE/0002-inst-history-decode-replay.patch"
 PATCH3="$HERE/0003-mmu-differential-support.patch"
 PATCH4="$HERE/0004-fp-differential-support.patch"
+PATCH5="$HERE/0005-exception-differential-support.patch"
 
-for f in "$SRC" "$PATCH1" "$PATCH2" "$PATCH3" "$PATCH4"; do
+for f in "$SRC" "$PATCH1" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5"; do
     if [[ ! -e "$f" ]]; then
         echo "FATAL: required input not found: $f" >&2
         echo "       Set \$PCJS_VAX_REPO to the pcjs-vax work repo if it is not beside this one." >&2
@@ -70,7 +76,8 @@ else
     git apply "$PATCH2"
     git apply "$PATCH3"
     git apply "$PATCH4"
-    echo "applied 0001, 0002, 0003 and 0004"
+    git apply "$PATCH5"
+    echo "applied 0001, 0002, 0003, 0004 and 0005"
 fi
 
 cd "$DEST/open-simh"
@@ -82,3 +89,4 @@ echo "run the differentials with:"
 echo "    node machines/dec/vax/tests/decodediff.js --simh $DEST/open-simh/BIN/microvax3900"
 echo "    node machines/dec/vax/tests/mmudiff.js    --simh $DEST/open-simh/BIN/microvax3900"
 echo "    node machines/dec/vax/tests/fpadiff.js    --simh $DEST/open-simh/BIN/microvax3900"
+echo "    node machines/dec/vax/tests/excdiff.js    --simh $DEST/open-simh/BIN/microvax3900"

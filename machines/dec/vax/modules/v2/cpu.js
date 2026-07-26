@@ -23,11 +23,13 @@
  * 42 F_floating/D_floating/G_floating opcodes that live administratively inside IG_BASE/BSDFL/
  * BSGFL but are semantically floating point):
  *
- *   pcjsvax-fab   control flow: branches, jumps, SOB/AOB/ACB/CASE, calls/returns, branch-on-bit,
- *                 CHMx, exceptions (HALT/BPT/XFC/REI/LDPCTX/SVPCTX).
+ *   pcjsvax-fab   control flow: branches, jumps, SOB/AOB/ACB/CASE, calls/returns, branch-on-bit
+ *                 (modules/v2/control.js).
  *   pcjsvax-710   floating point: F_floating (technically IG_BASE) and all of D_/G_floating.
+ *   pcjsvax-e49   SCB exception/interrupt dispatch and the privileged registers: MTPR/MFPR, REI,
+ *                 CHMx, LDPCTX/SVPCTX, BPT/XFC/HALT (modules/v2/exc.js).
  *   pcjsvax-515   string/queue/remainder: MOVCn, CMPCn, LOCC, SKPC, SCANC, SPANC, MATCHC, EDITPC,
- *                 INSQxx, REMQxx, INDEX, PROBER/PROBEW, MTPR/MFPR, PUSHR/POPR, packed decimal/CIS.
+ *                 INSQxx, REMQxx, INDEX, PROBER/PROBEW, PUSHR/POPR, packed decimal/CIS.
  *
  * THE 107 OPCODES THIS FILE IMPLEMENTS (all of them; see the DISPATCH table at the bottom for the
  * authoritative list, generated positionally from drom.js's OPCODES so it can never drift from

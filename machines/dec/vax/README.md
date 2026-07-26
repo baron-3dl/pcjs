@@ -10,18 +10,19 @@ DEC VAX
 A MicroVAX 3900 (KA655) machine for PCjs, ported from [Open SIMH](https://github.com/open-simh/simh)
 (MIT, © 1998-2019 Robert M Supnik).  Work in progress: at present this directory contains the
 physical memory and bus layer, instruction decode and operand resolution, memory management, the
-integer/logical/variable-length-bit-field, control-flow, string/queue/INDEX/PROBE, and NOP slices
-of instruction execution, and F/D/G floating point.  As of pcjsvax-515, the entire Base Instruction
-Group (`IG_BASE`/`IG_BSGFL`/`IG_BSDFL`, 242 opcodes — see `tests/base_group_residual.js`, the
-re-runnable computation of exactly what remains) is implemented except MTPR/MFPR, CHMK/CHME/CHMS/
-CHMU, and HALT/BPT/XFC/REI/LDPCTX/SVPCTX — all twelve need either the SCB exception-dispatch
-mechanism or the privileged IPR/process-context register file, neither of which any item owns yet
-(pcjsvax-e49's territory).  Still entirely missing: packed-decimal/CIS (`IG_PACKD`/`IG_EMONL` —
-genuinely out of scope for this CPU model, not merely unimplemented), devices, and the CPU loop
-that ties the instruction bodies together (`sim_instr()`'s fetch/dispatch/trap loop — every
-differential test in `tests/` currently drives `decode()` and each module's own `execute` function
-directly, one instruction at a time, because nothing wires the four execution modules — cpu.js,
-control.js, fpa.js, strq.js — into one dispatcher yet).
+integer/logical/variable-length-bit-field, control-flow, string/queue/INDEX/PROBE and NOP slices of
+instruction execution, F/D/G floating point, and SCB exception/interrupt dispatch with the
+privileged registers.
+
+As of `pcjsvax-e49`, the **entire Base Instruction Group is implemented** — all 242 opcodes of
+`IG_BASE`/`IG_BSGFL`/`IG_BSDFL`. `tests/base_group_residual.js` is the re-runnable computation that
+proves it and fails on any drift; do not hand-enumerate.
+
+Still missing: packed-decimal/CIS (`IG_PACKD`/`IG_EMONL` — required for the EHKAA gate, see
+`pcjsvax-bc3`), devices, and **the CPU loop** (`sim_instr()`'s fetch/dispatch/trap loop —
+`pcjsvax-c05`). Every differential in `tests/` currently drives `decode()` and each module's own
+`execute` directly, one instruction at a time, because nothing yet wires the five execution modules
+— `cpu.js`, `control.js`, `fpa.js`, `strq.js`, `exc.js` — into a single dispatcher.
 
 ### Read this before writing any VAX code
 
@@ -133,6 +134,44 @@ decoder because storing is execution.  `writeQ()`'s comment is worth reading bef
 the C macro's indentation lies, the `if` guards only the low-longword write, and that is what
 makes a quadword straddling into an inaccessible page store *nothing* while still reporting the
 *first* page's fault when both pages are bad.
+
+Exceptions, interrupts and privileged registers
+------------------------------------------------
+
+`modules/v2/exc.js` is the half of the VAX that is not an instruction: `intexc()` (the single
+chokepoint every exception and interrupt goes through), `REI`, `CHMK/CHME/CHMS/CHMU`, `LDPCTX`,
+`SVPCTX`, `MTPR`/`MFPR`, the `eval_int()` IPL arbitration, the abort handler that turns a thrown
+`VAXFault` into an SCB dispatch, and the instruction-boundary block that decides between a pending
+trap, a pending interrupt and a pending trace trap.  Ported from `vax_cpu1.c`, `vax_cpu.c` and
+`vax_io.c`.
+
+Three things in that file are worth reading before touching it, and its header states all three at
+length:
+
+* **The condition codes.**  SIMH runs with `PSL<3:0>` split out into a local `cc`; this module (like
+  every other one here) keeps them inside `psl`.  That is a null change everywhere except one place:
+  `cc` is only assigned when `intexc()` RETURNS, so an exception whose own stack push faults leaves
+  the *old* condition codes visible to the nested KSNV dispatch.  `intexc()` reproduces that by not
+  clearing them until after the pushes.  Every KSNV frame in the differential was wrong before it
+  did.
+* **`R[14]` is not a register, it is a selector.**  `stk[0..3]` are the saved per-mode stack
+  pointers and `stk[4]` is the interrupt stack; the entry for the *current* mode is stale until
+  something writes it back.  `MTPR`/`MFPR` of `KSP` and of `IS` read and write the LIVE pointer or
+  the saved one depending on `PSL<IS>`, and getting that backwards produces a machine that works
+  until the first nested interrupt.
+* **`inIE`.**  An ACV or TNV raised while the exception flow is in progress is not an ACV or TNV; it
+  is `SCB_KSNV` on the interrupt stack, and a second one halts the machine.
+
+`MTPR`'s second specifier is `RL` — the processor register number can be, and in EHKAA sometimes is,
+**computed in a register at run time**.  Nothing in that file may assume a literal.
+
+What is deliberately absent, and why, is in the file header: machine check (system-model code that
+nothing in this machine currently raises), compatibility mode (a KA655 does not have it — open-simh
+compiles `BadCmPSL()` as a constant `TRUE` for this model), device interrupt vectors and the
+off-chip SSC/CMCTL IPRs (both the device item's).  The off-chip boundary's *architectural* behavior
+— the hardwired `SID`, the write-only and read-only reserved-operand faults, and the fact that a
+RESERVED register number reads zero rather than faulting — is implemented, because EHKAA exercises
+it (`docs/reference/ehkaa-profile.md` §4.2 lists two reserved numbers).
 
 Decoder contract
 ----------------
@@ -293,13 +332,14 @@ shipped code path and fails if the differential does not catch each one.  `mmudi
 mutation is the `>>` vs `>>>` page-table-index hazard described above.
 
 The simulator is located via `--simh PATH`, then `$SIMH_BIN` / `$SIMH_DECODE_BIN` /
-`$SIMH_MMU_BIN` / `$SIMH_INT_BIN`, then `../pcjs-vax/open-simh/BIN/microvax3900` (`busdiff.js`) or
-`$TMPDIR/pcjs-vax-simh/...` (`mmudiff.js`, `intdiff.js` and `strqdiff.js`, which need patch 0003
-and patches 0001+0002 respectively — `strqdiff.js` needs both, for the PROBE and EHKAA phases).
-If it cannot be found, the tests fail rather than falling back to self-comparison.  `strqdiff.js`'s
-`--ehkaa` default honors `$PCJS_VAX_REPO` (unlike `intdiff.js`'s otherwise-identical default,
-which does not) — needed when running from a worktree, where the plain `../pcjs-vax`
-sibling-directory guess resolves to a nonexistent sibling worktree rather than the real work repo.
+`$SIMH_MMU_BIN` / `$SIMH_INT_BIN` / `$SIMH_EXC_BIN`, then `../pcjs-vax/open-simh/BIN/microvax3900`
+(`busdiff.js`) or `$TMPDIR/pcjs-vax-simh/...` (`mmudiff.js`, `intdiff.js` and `strqdiff.js` — patch
+0003, patches 0001+0002, and both respectively) or `$TMPDIR/pcjs-vax-simh-exc/...` (`excdiff.js`,
+patch 0005). If it cannot be found the tests fail rather than falling back to self-comparison.
+
+Set `$PCJS_VAX_REPO` when running from a **worktree**: the `../pcjs-vax` fallback resolves relative
+to the worktree, which is the wrong place. `strqdiff.js` and `fpadiff.js` honour it; `intdiff.js`
+does not.
 
 Floating point:
 
@@ -329,6 +369,51 @@ are non-trivial, or if any case fails to reach a comparison.  `--cases` below 40
 outright rather than scaling the floors down with it.  `--selfcheck` injects twelve deliberate
 defects into the shipped code path — two of them rounding constants and one a normalization loop —
 and fails if the differential does not catch each.
+
+Exceptions and privileged registers:
+
+    machines/dec/vax/tests/simh/build.sh $TMPDIR/pcjs-vax-simh-exc   # needs patch 0005
+    node machines/dec/vax/tests/excdiff.js --selfcheck
+    node machines/dec/vax/tests/excdiff.js
+
+Three phases.  The EHKAA diagnostic is run to its PASS halt with patch 0005's `EXCTRACE` armed,
+which dumps the complete privileged state at every `intexc()`, `REI`, `CHMx` and `MTPR`/`MFPR` —
+entry state and result state as separate records, so an operation that FAULTED is distinguishable
+from one that succeeded — and every one of those events is replayed and graded: **2,356 dispatches
+across all 25 SCB vectors the diagnostic takes, 2,966 REIs (42 of which SIMH rejects on the PSL
+validity rules, and which must therefore fault here too), 91 CHMx, 1,518 MTPRs and 391 MFPRs across
+all 24 IPRs** including two reserved register numbers and register-computed PR#s.  Then a randomized
+phase drives a **live** SIMH console (`deposit`/`step 1`/`examine`) over eleven case kinds — MTPR,
+MFPR, REI (half legal returns, half drawn from a rule-violation pool), CHMx, software interrupts,
+memory/CRD-error interrupts, arithmetic traps, trace traps, BPT/XFC, LDPCTX/SVPCTX and
+privileged-instruction faults — comparing the full register file, PSL, all twenty privileged
+registers and a window of every stack.  Then a mapped phase turns memory management ON over a
+purpose-built system page table with deliberately unreadable and invalid pages, so ACV/TNV dispatch
+happens for real with its two parameters pushed, a CHMx target-stack probe can fault, and an
+exception whose own push faults becomes `SCB_KSNV` on the interrupt stack.
+
+The run fails if any documented vector or IPR is not replayed — or if one turns up that
+`docs/reference/ehkaa-profile.md` does not list — if fewer than 12 of the 15 software interrupt
+levels are actually taken, if the register-computed-PR# case count falls below its floor (a
+literal-only `MTPR`/`MFPR` would otherwise pass), or if any case fails to reach a comparison.
+`--cases` below 40 or `--mapped` below 60 fails outright rather than scaling the floors down.
+`--selfcheck` injects fifteen deliberate defects into `VAXExc.prototype` — the object every opcode
+body actually calls — and fails if the differential does not catch each.  **Three survived their
+first runs**, and none of them was a wrong assertion: all three needed a boundary that a uniform
+pool lands on roughly once in sixty to once in six hundred cases (an `MTPR` to `SIRR` of a value
+whose low nibble is zero, in kernel; a `PSL<IPL>` of exactly `0x1D` with `MEMERR` set; a mapped
+case whose kernel-stack page is broken).  The fix was to walk each boundary deterministically so a
+run at the MINIMUM case count still reaches it — `MTPR_EDGE`, `MFPR_EDGE`, `ERRINT_EDGE`,
+`MAPPED_VARIANTS` and `forceKernel()` — rather than to enlarge the run and hope; each carries the
+reason at its definition.
+
+**One measured number in `docs/reference/ehkaa-profile.md` does not reproduce, and it is not a bug
+in either place.**  §5 records 1,675 dispatch events; with a large debug log the same binary on the
+same image takes 2,356.  The 25 vectors and 24 IPRs are identical — only the counts move, EHKAA has
+timer-driven tests whose iteration count depends on host wall-clock time per simulated tick, and the
+*unpatched* simulator does the same thing given any comparably chatty debug category.  `excdiff.js`
+therefore asserts the vector and IPR SETS as equalities and the event COUNT as a floor; see
+`tests/simh/README.md` for the measurement.
 
 The decode ROM in `modules/v2/drom.js` is **generated**, not transcribed, from Open SIMH's
 `vax_sys.c` and `vax_defs.h`:

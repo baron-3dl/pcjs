@@ -1,12 +1,14 @@
 # Instrumented Open SIMH for the VAX differentials
 
-`decodediff.js`, `mmudiff.js` and `fpadiff.js` grade our decoder, our MMU and our
-floating point against a real Open SIMH `microvax3900`. Doing that requires the
-simulator to expose things it does not expose on its own: enough state for a
-decode to be *replayed* rather than merely inspected, a way to observe a
-translation at all, and a way to hand one floating instruction the operands you
-choose rather than the operands a program happened to produce. This directory
-holds the patches that add them, and the script that builds them.
+`decodediff.js`, `mmudiff.js`, `fpadiff.js` and `excdiff.js` grade our decoder,
+our MMU, our floating point and our exception dispatch against a real Open SIMH
+`microvax3900`. Doing that requires the simulator to expose things it does not
+expose on its own: enough state for a decode to be *replayed* rather than merely
+inspected, a way to observe a translation at all, a way to hand one floating
+instruction the operands you choose rather than the operands a program happened
+to produce, and the privileged state an exception dispatch depends on — which
+lives entirely in simulator variables and appears in no existing log. This
+directory holds the patches that add them, and the script that builds them.
 
 ```
 machines/dec/vax/tests/simh/build.sh          # -> $TMPDIR/pcjs-vax-simh/open-simh/BIN/microvax3900
@@ -16,6 +18,8 @@ export SIMH_FP_BIN=$SIMH_DECODE_BIN
 node machines/dec/vax/tests/decodediff.js
 node machines/dec/vax/tests/mmudiff.js
 node machines/dec/vax/tests/fpadiff.js
+export SIMH_EXC_BIN=$SIMH_DECODE_BIN
+node machines/dec/vax/tests/excdiff.js
 ```
 
 **`build.sh` REUSES an existing destination directory.** If you add a patch, or
@@ -184,13 +188,68 @@ caller pre-loads it with `DEPOSIT`, which is physical — so that a destination
 made deliberately inaccessible can still be given a known prior value, which is
 how `fpadiff.js`'s QUADSTORE phase proves that nothing was partially written.
 
+## What 0005 adds
+
+An exception dispatch is a pure function of the SCB base, the four per-mode stack
+pointers, the interrupt stack pointer and the PSL — and **not one of those is
+observable while the machine runs**. `SET CPU DEBUG=INTEXC` reports the vector,
+the old PSL and the new one, which is enough to *count* dispatches and not nearly
+enough to *reproduce* one: the new stack pointer comes from `STK[]` or `IS`, the
+vector address from `SCBB`, and neither appears in any log. The same is true of
+`REI` (which restores a stack pointer from `STK[]` and can raise an AST software
+interrupt from `ASTLVL`), of `CHMx`, and of `MTPR`/`MFPR` (whose entire job is
+those registers).
+
+0005 adds one debug category, `EXCTRACE`, that emits a machine-readable
+entry-state and result-state record around each of them:
+
+| Record | Emitted | Fields (after the 17-field state vector, which every record carries) |
+|---|---|---|
+| `EXCA` / `EXCB` | `intexc()`, before / after computing the new PSL and stack | `vec ei ipl oldpsl PC oldsp trpirq` / `scbpa newpc PSL SP trpirq` |
+| `REIA` / `REIB` | `op_rei()`, after popping the frame / after committing it | `PSL SP newpc newpsl trpirq` / `PSL SP newpc trpirq` |
+| `CHMA` / `CHMB` | `op_chm()`, entry / after building the new PSL | `opc opnd0 PSL&#124;cc PC SP` / `newpc PSL SP` |
+| `MTPA` / `MTPB` | `op_mtpr()`, entry / exit | `prn val PSL SP trpirq` / `cc PSL SP trpirq` |
+| `MFPA` / `MFPB` | `op_mfpr()`, entry / exit | `prn PSL SP` / `val` |
+
+The 17-field state vector is
+`KSP ESP SSP USP IS SCBB PCBB ASTLVL SISR MAPEN P0BR P0LR P1BR P1LR SBR SLR PME`.
+
+Three details are load-bearing:
+
+* **The `A` record is emitted before the operation can fault, the `B` record only
+  on success.** An `A` with no `B` is therefore not a gap in the log, it is the
+  statement "SIMH rejected this" — which is how `excdiff.js` grades REI's nine
+  PSL validity rules and MTPR/MFPR's privilege and range checks against real
+  workload data, rather than only against generated ones.
+* **`SP` is in the `MTPA`/`MTPB`/`MFPA` records** even though it is not a
+  privileged register, because `MTPR`/`MFPR` of `KSP` (with `PSL<IS>` clear) and
+  of `IS` (with it set) read and write the LIVE stack pointer, `R[14]`, not the
+  saved one. Without it, 188 of EHKAA's 391 `MFPR`s would grade nothing.
+* **`intexc()`'s SCB read address is hoisted into a local and logged.** It is
+  computed identically to before (`(SCBB + vec) & (PAMASK & ~3)`, still evaluated
+  from the same `SCBB`), so the read is unchanged; logging it is what lets the
+  differential grade the address rather than only the value it returned.
+
+### The debug log changes what EHKAA does — and that is not this patch's doing
+
+With `EXCTRACE` on, EHKAA takes **2,356** dispatches instead of the **1,675** that
+`docs/reference/ehkaa-profile.md` §5 records. The vectors are the same 25 and the
+IPRs the same 24; only the counts move. This is **not** an artifact of the patch:
+the **unpatched** simulator, given any comparably chatty debug category
+(`set cpu debug=intexc;rei;rsvdfault;abort;context`), also produces 2,356. EHKAA
+has timer-driven tests whose iteration count depends on how much wall-clock time
+the host spends per simulated tick, and a large debug log moves that. Each
+configuration is internally deterministic (three consecutive runs: 2,356 / 2,356
+/ 2,356). `excdiff.js` therefore asserts the vector and IPR **sets** as
+equalities and the event **count** as a floor.
+
 ## Provenance and rebasing
 
-All four patches are against Open SIMH at commit `a1f57fa3`. Keep them small and
+All five patches are against Open SIMH at commit `a1f57fa3`. Keep them small and
 additive so they keep applying as upstream moves; net diff is two files +79 lines
-for 0002, three files +166/-4 for 0003 and one file +356/-0 for 0004, with every
-copyright header untouched. No patch changes instruction semantics — the
-simulator's own EHKAA self-test, which `make ... vax` runs, passes unmodified
-with all four applied.
+for 0002, three files +166/-4 for 0003, one file +356/-0 for 0004 and three files
++71/-1 for 0005, with every copyright header untouched. No patch changes
+instruction semantics — the simulator's own EHKAA self-test, which `make ... vax`
+runs, passes unmodified with all five applied.
 
 Open SIMH is MIT, © 1998–2019 Robert M Supnik.
