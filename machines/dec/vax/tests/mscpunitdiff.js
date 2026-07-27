@@ -129,7 +129,7 @@ import RQVAX, {
     MD_SWP, MD_NXU, MD_SPD,
     DRV_TAB, RQDF_RMV, RQDF_RO, RD54_DTYPE,
     U_ATT, U_ONL, U_WLK, U_RO, U_DIS,
-    RQ_NUMBY, RQ_NUMDR, RQ_ITIME, RQ_ITIME4, RQ_QTIME, RQ_XTIME
+    RQ_NUMBY, RQ_NUMDR, RQ_ITIME, RQ_ITIME4, RQ_QTIME, RQ_XTIME, bufferProvider
 } from "../modules/v2/rq.js";
 import {
     PAGE, R_CODE, R_RESULT, MAP_MBR, DATA_NPAGE, OBS_REGS,
@@ -2320,6 +2320,17 @@ const MUTATIONS = {
     },
 
     /* --- THE PROVIDER, AND THE CHEAT IT EXISTS TO PREVENT --- */
+    "sim_disk_isavailable-always-says-NO": () => {
+        /* rq_onl() asks sim_disk_isavailable() before it brings a unit online, and on this platform
+           that function is `return TRUE;` for any attached RAW container -- measured, not assumed
+           (the only arm that can say otherwise is Windows' media-eject ioctl, and the only thing
+           that sets `media_removed` is sim_disk_unload(), which is excluded by name).  A controller
+           that answered NO would report ST_OFL|SB_OFL_NV for a perfectly good image, which is a
+           plausible-looking answer to the one question this whole item is about. */
+        let orig = RQVAX.prototype.isAvailable;
+        RQVAX.prototype.isAvailable = function(u) { return false; };
+        return () => { RQVAX.prototype.isAvailable = orig; };
+    },
     "the-image-provider's-contract-is-not-checked": () => {
         /* Removing the check is not visible in any response -- nothing here reads a block.  It is
            caught by the three malformed providers PHASE P offers, which is why that phase exists:
@@ -2380,9 +2391,10 @@ const MUTATIONS = {
  * not been read yet (no byteLength), an ArrayBuffer passed raw (byteLength but no read), and a
  * length that is a float because it came out of a division.
  */
-function checkProviderContract(failures, mutationOpts)
+function checkProviderContract(failures, mutationOpts, providers)
 {
     let rq = machine(mutationOpts).rq;
+    let providersFor = (im) => providers[im.tag];
     let bad = [
         {what: "no byteLength", p: {read() { return 0; }}},
         {what: "no read()", p: {byteLength: 1024}},
@@ -2404,6 +2416,34 @@ function checkProviderContract(failures, mutationOpts)
             rq.detach(0);
         }
     }
+    rq.detach(0);
+
+    /* *** AND THE POSITIVE HALF: THE CONTROLLER MUST NOT BE ABLE TO TELL ONE PROVIDER FROM
+       ANOTHER. ***  rq.js ships bufferProvider() -- the browser-side wrapper, over a Uint8Array,
+       which is what a FileReader hands back -- and tests/mscpharness.js ships the `fs`-backed one.
+       Attaching the SAME NUMBER OF BYTES through each must give the same unit, or the interface that
+       makes HANDOFF.md 8's user-supplied-image decision implementable in a browser is a fiction.
+       Graded against each other rather than against the oracle, because SIMH has no notion of an
+       injectable image source at all -- it has `fs` -- so there is nothing else to compare to. */
+    let rx33 = DRV_TAB.findIndex((d) => d.name === "RX33");
+    let im = IMAGES.find((x) => x.tag === "odd");
+    let cap = [];
+    for (let prov of [providersFor(im), bufferProvider(new Uint8Array(im.bytes))]) {
+        rq.detach(0);
+        rq.setType(0, RD54_DTYPE);
+        rq.setWriteLock(0, false);
+        rq.setType(0, rx33);
+        rq.attach(0, prov, {});
+        cap.push(rq.units[0].capac >>> 0);
+    }
+    if (cap[0] !== cap[1]) {
+        failures.push(`PHASE P: the same ${im.bytes}-byte image gives capac ${cap[0]} through the ` +
+            `Node fs provider and ${cap[1]} through rq.js's own bufferProvider().  The controller ` +
+            `is distinguishing WHERE the image came from, which is exactly what the injectable ` +
+            `provider interface exists to make impossible -- and it is the browser half of it that ` +
+            `would be wrong.`);
+    }
+
     rq.detach(0);
     rq.setType(0, RD54_DTYPE);
     rq.setWriteLock(0, false);
@@ -2464,8 +2504,8 @@ function runPass(simh, opts, mutationOpts = {})
         `${acc.attachCaps.size} distinct capacit(ies) on the oracle`);
 
     /* ---- PHASE P: the provider contract ---- */
-    checkProviderContract(failures, mutationOpts);
-    report.push(`  PHASE P  attach() refuses 4 malformed image providers`);
+    checkProviderContract(failures, mutationOpts, opts.providers);
+    report.push(`  PHASE P  attach() refuses 4 malformed image providers, and the fs-backed and buffer-backed\n           providers give the same unit for the same bytes`);
 
     /* ---- PHASE C: the MSCP commands ---- */
     let cases = enumeratedCases(opts.images);
