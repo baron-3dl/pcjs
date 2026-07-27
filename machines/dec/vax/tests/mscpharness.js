@@ -24,6 +24,13 @@
  * Case construction, coverage floors, exclusion fences and mutations.  Those are each
  * differential's own argument about what it proves, and sharing them would let one test's coverage
  * certify another's.
+ *
+ * ONE THING MOVED HERE FROM mscpringdiff.js WHEN pcjsvax-f52 ARRIVED: geometry()/qbusPagesFor(),
+ * the arithmetic that says where a comm region's two rings and packet buffers live.  It is on the
+ * plumbing side of that line -- it decides no case and asserts nothing -- and it contains the one
+ * fact in this whole device that is easiest to get backwards (*** THE RESPONSE RING IS AT `comm`
+ * AND THE COMMAND RING ABOVE IT ***).  Two copies of that would be two chances to get it wrong, and
+ * the second copy would be in the test least able to notice.
  */
 
 import fs from "fs";
@@ -514,6 +521,87 @@ export function physPageFor(qpage, spread)
 /** A non-zero, page-distinct seed.  Zeroing is only observable against a non-zero background, and
     a page-distinct one also catches a transfer that landed on the wrong page entirely. */
 export function seedFor(ppage) { return ((0xA5A50000 | ((ppage * 0x0101) & 0xFFFF)) >>> 0); }
+
+/**
+ * geometry(spec)
+ *
+ * Where everything lives in QBUS space, computed FROM THE SPEC -- never by asking rq.js, which
+ * would grade a defect against itself.  *** THE RESPONSE RING COMES FIRST ***: rq_step4() does
+ * `rq.ba = comm; cq.ba = comm + rq.lnt`, so the response ring is at the base and the command ring
+ * sits above it.  Measured on the live oracle with a one-descriptor pair at comm = 0x2000:
+ * `Command ring, base = 2004` and `Response ring, base = 2000`.
+ *
+ * Packet buffers start on the first 64-byte boundary above both rings.  A descriptor names the
+ * address of the packet's BODY, four bytes above the buffer's start, because the two-word UQSSP
+ * header lives at `descriptor address + UQ_HDR_OFF`.
+ *
+ * @param {Object} spec {comm, rqCode, cqCode, nCmdBuf, nRspBuf}
+ * @returns {Object}
+ */
+export function geometry(spec)
+{
+    let rqLnt = 4 << spec.rqCode, cqLnt = 4 << spec.cqCode;
+    let rqBa = spec.comm >>> 0, cqBa = (spec.comm + rqLnt) >>> 0;
+    let nCmd = spec.nCmdBuf, nRsp = spec.nRspBuf;
+    let pgUp = (a) => (a + PAGE - 1) & ~(PAGE - 1);
+    /* THE THREE AREAS ARE ON SEPARATE QBUS PAGES, deliberately.  A page is the unit the CQBIC
+       scatter-gather map validates, so "unmap the page the command packets live on" is only a
+       statement about command packets if nothing else lives there -- and the PE_PRE / PE_PWE cases
+       are exactly that statement.  A 64-byte packing would put the rings, the command buffers and
+       the response buffers in one page and make both fatals indistinguishable from PE_QRE. */
+    let cmdBase = pgUp(spec.comm + rqLnt + cqLnt);
+    let rspBase = cmdBase + pgUp(nCmd * 64);
+    return {
+        rqLnt, cqLnt, rqBa, cqBa, cmdBase, rspBase,
+        rqSlots: rqLnt >> 2, cqSlots: cqLnt >> 2,
+        cmdBuf: (i) => (cmdBase + i * 64) >>> 0,
+        cmdEnv: (i) => (cmdBase + i * 64 + 4) >>> 0,
+        rspBuf: (j) => (rspBase + j * 64) >>> 0,
+        rspEnv: (j) => (rspBase + j * 64 + 4) >>> 0,
+        /* The interrupt flag words sit BELOW comm: SA_COMM_CI (-4) for the command ring, SA_COMM_RI
+           (-2) for the response ring, and SA_COMM_QQ (-8) is the lowest word rq_step4() zeroes when
+           the host asked for a purge interrupt.  So the region starts eight bytes below `comm`. */
+        lo: (spec.comm - 8) >>> 0,
+        hi: (rspBase + pgUp(nRsp * 64) - 1) >>> 0
+    };
+}
+
+/** Every Qbus page a case can reference, derived from the geometry rather than listed. */
+export function qbusPagesFor(g)
+{
+    let pages = [];
+    for (let a = g.lo & ~(PAGE - 1); a <= g.hi; a += PAGE) pages.push((a / PAGE) | 0);
+    return pages;
+}
+
+/**
+ * fileImageProvider(path)
+ *
+ * THE NODE HALF OF rq.js's IMAGE PROVIDER CONTRACT, and the reason that contract exists: this is the
+ * only place in the tree that knows a disk image is a FILE.  rq.js takes `{byteLength, read()}` and
+ * cannot tell an `fs` descriptor from a browser `File` read into an ArrayBuffer -- which is what
+ * makes HANDOFF.md 8's user-supplied-image decision implementable in a browser rather than only
+ * under Node.
+ *
+ * The descriptor is opened once and left open; the caller closes it.  `read()` is deliberately
+ * REAL rather than a stub even though nothing in pcjsvax-f52 calls it -- a stub would satisfy
+ * rq.js's contract check while being useless to pcjsvax-346, which is the failure mode the check
+ * exists to prevent.
+ *
+ * @param {string} p
+ * @returns {Object}
+ */
+export function fileImageProvider(p)
+{
+    let fd = fs.openSync(p, "r");
+    return {
+        byteLength: fs.statSync(p).size,
+        read(offset, length, dst) {
+            return fs.readSync(fd, dst, 0, length, offset);
+        },
+        close() { fs.closeSync(fd); }
+    };
+}
 
 /**
  * commExtent(spec)
