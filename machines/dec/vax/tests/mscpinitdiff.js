@@ -16,6 +16,11 @@
  * have touched, twenty-three of the controller's examinable registers, nine words of its packet
  * array, and the text of `SHOW RQ RINGS` / `FREEQ` / `RESPQ`.
  *
+ * The plumbing, the physical layout, the assembler, the machine, the observation vector and the
+ * SHOW renderers live in tests/mscpharness.js, shared with tests/mscpringdiff.js.  What stays here
+ * is this differential's own argument: its cases, its coverage floors, its exclusion fences and its
+ * mutations -- sharing THOSE would let one test's coverage certify another's.
+ *
  * EVERYTHING IS GRADED THROUGH REAL CPU EXECUTION.  No case calls a device accessor directly.
  * HANDOFF.md 7 premise 7 is the reason and it bites twice here: SIMH's console CANNOT reach the
  * I/O page at all (`e -p 20001468` answers "Address space exceeded"), so a console-level probe of
@@ -59,10 +64,13 @@
  *
  * WHAT IS DELIBERATELY NOT GRADED, BY NAME (standing rule 6)
  * -----------------------------------------------------------
- *   - MSCP packet processing, the response ring, disk I/O.  pcjsvax-6a5's later children.  rq.js
- *     throws RQUnimplemented by name rather than inventing an answer, and `assertExclusions()` below
- *     FAILS the run if the ORACLE ever reports PBSY != 0, RESP != 0 or FREE != 1 -- so a case that
- *     reached packet processing on the oracle is a failure, not a silently different program.
+ *   - MSCP packet processing and the response ring.  rq.js DOES implement them (pcjsvax-0b4) and
+ *     tests/mscpringdiff.js grades them; THIS file grades the handshake, and a case here that
+ *     reached a command would be grading two things at once.  `assertExclusions()` below FAILS the
+ *     run if the ORACLE ever reports PBSY != 0, RESP != 0 or FREE != 1 -- so a case that reached
+ *     packet processing on the oracle is a failure, not a silently different program.
+ *   - Disk I/O and the twelve unit-bearing MSCP commands.  pcjsvax-f52.  rq.js throws
+ *     RQUnimplemented by name rather than inventing an answer.
  *   - Controller INTERRUPT delivery.  rq_init_int() fires only when the host's s1dat has BOTH
  *     SA_S1H_IE and a non-zero SA_S1H_VEC; rq.js records the request and wires it nowhere.
  *     `assertExclusions()` FAILS the run if any graded case supplies such an s1dat, so the unwired
@@ -87,16 +95,8 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { execFileSync } from "child_process";
-import { fileURLToPath } from "url";
 
-import BusVAX from "../modules/v2/bus.js";
-import MemoryVAX from "../modules/v2/memory.js";
-import CPUStateVAX from "../modules/v2/cpustate.js";
-import { VAX } from "../modules/v2/defines.js";
-import { OPCODES } from "../modules/v2/drom.js";
-import { SCB } from "../modules/v2/exc.js";
-import CQBICVAX, { CQMAPVAX, CQBIC_BASE, CQMAP_BASE, CQMAPSIZE, CQMAP_VLD } from "../modules/v2/cqbic.js";
+import CQBICVAX from "../modules/v2/cqbic.js";
 import RQVAX, {
     RQ_BASE, IOLN_RQ, RQDX3_CTYPE, CTLR_TAB, RQUnimplemented,
     CST_S1, CST_S1_WR, CST_S2, CST_S3, CST_S3_PPA, CST_S3_PPB, CST_S4, CST_UP, CST_DEAD, CST_NAMES,
@@ -106,39 +106,16 @@ import RQVAX, {
     PE_QWE, PE_QRE, PE_PPF, RQ_SVER, RQ_NPKTS, RQ_PKT_SIZE_W,
     RQ_ITIME, RQ_ITIME4, RQ_QTIME, RQ_XTIME
 } from "../modules/v2/rq.js";
+import {
+    MEMSIZE, MEM_MB, PAGE, R_SCBB, R_MCHK_HDLR, R_MERR_HDLR, R_CODE, R_KSP, R_IS,
+    MAP_MBR, MAP_HI, DATA_BASE, DATA_NPAGE, DATA_HI, LOWMAP_HI, HDLR_NOPS, OBS_REGS,
+    RQ_IP, RQ_SA, CQBIC_BASE, CQMAP_BASE, CQMAPSIZE, CQMAP_VLD,
+    hex, findSimhBin, runSimh, mulberry32, sampleHeap, peakHeap,
+    OPC, Asm, makeMachine, machine, RQ_OBS, rqFieldOf, PKT_WORDS, pktWord,
+    showCtrl, physPageFor, seedFor, commExtent, walkScript, emitAction,
+    simhResetLines, jsResetForCase
+} from "./mscpharness.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-/** 16MB, the SIMH microvax3900 default and every other differential's size. */
-const MEMSIZE = 0x01000000;
-const MEM_MB  = MEMSIZE / (1024 * 1024);
-const PAGE    = 512;
-
-/* Fixed physical layout, MAPPING OFF -- the convention dbldiff.js / cmctldiff.js / qdmadiff.js use.
-   TWO handler pages, so a machine check and a deferred memory error are told apart by PC alone. */
-const R_SCBB       = 0x00100000;
-const R_MCHK_HDLR  = 0x00102000;
-const R_MERR_HDLR  = 0x00103000;
-const R_CODE       = 0x00104000;
-const R_KSP        = 0x00110000;
-/* A machine check is a SEVERE exception: intexc() reloads SP from the INTERRUPT stack regardless of
-   mode, so IS must be set or the frame push faults inside `in_ie` and SIMH stops hard. */
-const R_IS         = 0x00118000;
-/** The CQBIC scatter-gather map's backing store: 8192 longword entries.  Page-aligned. */
-const MAP_MBR      = 0x00200000;
-const MAP_HI       = (MAP_MBR + CQMAPSIZE) >>> 0;
-/** The physical pages the comm region is scattered across.  Deliberately far from everything else. */
-const DATA_BASE    = 0x00300000;
-const DATA_NPAGE   = 64;
-const DATA_HI      = (DATA_BASE + DATA_NPAGE * PAGE) >>> 0;
-/** Low memory that an UNPROGRAMMED map (MBR 0) would read entries out of -- zeroed so the fatal
-    cases fail for the reason they are supposed to (no valid bit) rather than by accident. */
-const LOWMAP_HI    = 0x00001000;
-
-const HDLR_NOPS = 16;
-/** R0..R14 -- R15 is PC, observed separately.  R12/R13 are never written by any case and are graded
-    precisely because a stray write would show up there. */
-const OBS_REGS  = 15;
 /** An absolute bound on the instructions any case may execute.  A case that does not HALT within it
     is reported BY NAME rather than compared at whatever PC it happened to reach. */
 const MAX_STEPS = 40000;
@@ -150,383 +127,17 @@ const RANDOM_CASES_FLOOR   = 12;
     count (rules 4 and 14).  ONE machine is built and reused; the dominant term is its single 16MB
     RAM allocation, plus one Uint8Array per dumped page. */
 const MAX_HEAP_BYTES = 512 * 1024 * 1024;
-let PEAK_HEAP = 0;
 
-function sampleHeap()
-{
-    let mu = process.memoryUsage();
-    let used = mu.heapUsed + mu.external;
-    if (used > PEAK_HEAP) PEAK_HEAP = used;
-    return used;
-}
-
-function hex(v, n = 8) { return (v >>> 0).toString(16).toUpperCase().padStart(n, "0"); }
-
-/* ------------------------------------------------------------------------------------------- *
- * Plumbing                                                                                      *
- * ------------------------------------------------------------------------------------------- */
-
-function vaxRepo()
-{
-    if (process.env['PCJS_VAX_REPO']) return process.env['PCJS_VAX_REPO'];
-    return path.resolve(__dirname, "../../../../../pcjs-vax");
-}
-
-function findSimhBin(pathArg)
-{
-    let candidates = [];
-    if (pathArg) candidates.push(pathArg);
-    for (let v of ['SIMH_CPU_BIN', 'SIMH_INT_BIN', 'SIMH_DECODE_BIN', 'SIMH_BIN']) {
-        if (process.env[v]) candidates.push(process.env[v]);
-    }
-    let scratch = process.env['PCJS_VAX_SCRATCH'];
-    if (scratch) candidates.push(path.join(scratch, "open-simh/BIN/microvax3900"));
-    candidates.push(path.join(os.tmpdir(), "pcjs-vax-simh/open-simh/BIN/microvax3900"));
-    candidates.push(path.join(vaxRepo(), "open-simh/BIN/microvax3900"));
-    for (let p of candidates) if (fs.existsSync(p)) return p;
-    throw new Error("mscpinitdiff needs a REAL SIMH microvax3900; it has no fixture fallback.  Build\n" +
-        "one with machines/dec/vax/tests/simh/build.sh and pass --simh PATH.  Tried:\n  " + candidates.join("\n  "));
-}
-
-/**
- * runSimh(bin, script, iniPath)
- *
- * `run` IS FORBIDDEN IN EVERY DO-FILE THIS FILE WRITES, and the check is here rather than in a
- * comment.  SCP's `run` RESETS ALL DEVICES before starting, which silently destroyed three stages of
- * a handshake during pcjsvax-6a5's decomposition -- the controller went back to CST_S1 and the SA
- * read-backs looked like a plain implementation bug.  `step` and `go` do not reset.  This is a new
- * environment gotcha of the same family as HANDOFF.md 4's exported-`E` trap, and asserting it
- * costs one regexp.
- */
-function runSimh(bin, script, iniPath, timeoutMs = 10 * 60 * 1000)
-{
-    if (/^\s*run\b/mi.test(script)) {
-        throw new Error("mscpinitdiff: a do-file line begins with `run`, which RESETS ALL DEVICES " +
-            "and destroys the handshake under test.  Use `step` or `go`.");
-    }
-    fs.writeFileSync(iniPath, script);
-    return execFileSync(bin, [iniPath], {encoding: "utf8", maxBuffer: 1 << 29, timeout: timeoutMs});
-}
-
-/** The same mulberry32 every VAX differential in this tree uses. */
-function mulberry32(a)
-{
-    return function() {
-        a |= 0; a = (a + 0x6D2B79F5) | 0;
-        let t = Math.imul(a ^ (a >>> 15), 1 | a);
-        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-}
-
-/* ------------------------------------------------------------------------------------------- *
- * A very small assembler.  Opcode NUMBERS come from drom.js's OPCODES table, never transcribed.  *
- * ------------------------------------------------------------------------------------------- */
-
-function opcodeOf(name)
-{
-    let opc = OPCODES.indexOf(name);
-    if (opc < 0 || opc > 0xFF) throw new Error(`mscpinitdiff: opcode "${name}" not found or not single-byte`);
-    return opc;
-}
-const OPC = {};
-for (let n of ["MOVL", "MOVW", "MOVB", "MOVZWL", "MOVZBL", "CMPL", "BNEQ", "BRB", "INCL", "CLRL",
-               "SOBGTR", "NOP", "HALT"]) OPC[n] = opcodeOf(n);
-
-function lw(a) { a = a >>> 0; return [a & 0xFF, (a >>> 8) & 0xFF, (a >>> 16) & 0xFF, (a >>> 24) & 0xFF]; }
-
-/**
- * @class Asm
- *
- * Emits bytes and counts INSTRUCTIONS.  The instruction count is not decoration: it is what the
- * poll loops' displacements are computed from, and a miscount would silently change the schedule
- * this file exists to grade.
- */
-class Asm {
-    constructor() { this.b = []; }
-    get len() { return this.b.length; }
-    emit(...bytes) { this.b.push(...bytes); return this; }
-
-    /** MOVL/MOVW/MOVB I^#val, @#addr */
-    movImmAbs(size, val, addr) {
-        if (size === 4) return this.emit(OPC.MOVL, 0x8F, ...lw(val), 0x9F, ...lw(addr));
-        if (size === 2) return this.emit(OPC.MOVW, 0x8F, val & 0xFF, (val >>> 8) & 0xFF, 0x9F, ...lw(addr));
-        return this.emit(OPC.MOVB, 0x8F, val & 0xFF, 0x9F, ...lw(addr));
-    }
-    /** MOVL/MOVZWL/MOVZBL @#addr, Rn -- all three leave a full, zero-extended longword in Rn, which
-        is what keeps a case's read-back from mixing with the previous case's leftovers. */
-    movAbsReg(size, addr, rn) {
-        let opc = (size === 4) ? OPC.MOVL : (size === 2) ? OPC.MOVZWL : OPC.MOVZBL;
-        return this.emit(opc, 0x9F, ...lw(addr), 0x50 | (rn & 0xF));
-    }
-    clrl(rn) { return this.emit(OPC.CLRL, 0x50 | (rn & 0xF)); }
-    halt() { return this.emit(OPC.HALT); }
-
-    /**
-     * poll(addr, curReg, prevReg, cntReg)
-     *
-     * The host's own busy-wait, and the instrument that makes SIMH's event schedule observable IN
-     * BAND.  FIVE instructions per iteration:
-     *
-     *      loop: MOVZWL @#addr, Rcur ; CMPL Rcur, Rprev ; BNEQ out ; INCL Rcnt ; BRB loop
-     *
-     * `Rcnt` ends up holding the number of iterations that did NOT see the change, which for a
-     * `sim_activate` of `delay` instructions is the smallest i with 1 + 5i >= delay.  Measured on
-     * the oracle: 90 for ITIME 450, 2 for I4TIME 10.
-     */
-    poll(addr, curReg, prevReg, cntReg) {
-        this.clrl(cntReg);
-        let top = this.len;
-        this.movAbsReg(2, addr, curReg);                            // 7 bytes
-        this.emit(OPC.CMPL, 0x50 | curReg, 0x50 | prevReg);         // 3
-        this.emit(OPC.BNEQ, 4);                                     // 2 -- skip INCL(2) + BRB(2)
-        this.emit(OPC.INCL, 0x50 | cntReg);                         // 2
-        let disp = top - (this.len + 2);
-        this.emit(OPC.BRB, disp & 0xFF);                            // 2
-        return this;
-    }
-
-    /**
-     * delay(n, reg)
-     *
-     * `MOVL I^#n, Rreg` then a one-instruction `SOBGTR Rreg, .` loop: exactly n + 1 instructions,
-     * used where there is nothing to poll ON.  The purge/poll path needs it -- writing 0 to SA in
-     * CST_S3_PPA advances the state WITHOUT changing SA, so no value ever becomes visible and a
-     * polling loop would spin forever.
-     */
-    delay(n, reg) {
-        this.emit(OPC.MOVL, 0x8F, ...lw(n), 0x50 | reg);
-        let top = this.len;
-        this.emit(OPC.SOBGTR, 0x50 | reg, (top - (this.len + 3)) & 0xFF);
-        return this;
-    }
-}
-
-/* ------------------------------------------------------------------------------------------- *
- * The machine under test -- ONE, built once, reused by every case (standing rule 14)             *
- * ------------------------------------------------------------------------------------------- */
-
-/**
- * makeMachine(opts)
- *
- * RAM at 0, the CQBIC register file and its map window in REG_BASE space, and the Qbus I/O page
- * with ONE device on it: the RQ controller's four bytes.  No doorbell, no SSC, no console, no
- * timers -- nothing graded here touches any of them, and leaving them out means a defect in one of
- * them cannot make this file pass or fail.
- *
- * `opts` exists ONLY for --selfcheck's WIRING mutations, which are defects in how the device is
- * MOUNTED rather than in what it computes and so cannot be expressed by perturbing rq.js (standing
- * rule 11 -- the shipped construction is perturbed, not replaced):
- *
- *   rqBaseDelta   move the RQ window within the I/O page
- *   rqSizeDelta   widen or narrow the RQ window
- *   noQbusHook    leave cpu.qbus unwired, i.e. no event queue at all
- */
-function makeMachine(opts = {})
-{
-    let bus = new BusVAX({busWidth: VAX.PAWIDTH, id: "bus"}, null, null);
-    bus.addMemory(0, MEMSIZE, MemoryVAX.TYPE.RAM);
-    let cpu = new CPUStateVAX({id: "cpu"});
-    cpu.setBus(bus);
-    cpu.reset();
-    let cqbic = new CQBICVAX(cpu.exc, bus, MEMSIZE);
-    let rq = new RQVAX(cqbic, {cnum: 0, ctype: RQDX3_CTYPE});
-    bus.addRegBlock([
-        {base: CQBIC_BASE, length: 0x14, dev: cqbic},
-        {base: CQMAP_BASE, length: CQMAPSIZE, dev: new CQMAPVAX(cqbic)}
-    ]);
-    bus.addIoPage([{
-        base: (RQ_BASE + (opts.rqBaseDelta || 0)) >>> 0,
-        length: (IOLN_RQ + (opts.rqSizeDelta || 0)) >>> 0,
-        dev: rq
-    }]);
-    if (!opts.noQbusHook) cpu.qbus = rq;
-    sampleHeap();
-    return {bus, cpu, cqbic, rq};
-}
-
-const MACHINES = new Map();
-
-function machine(opts = {})
-{
-    let key = `${opts.rqBaseDelta || 0}:${opts.rqSizeDelta || 0}:${opts.noQbusHook ? 1 : 0}`;
-    if (!MACHINES.has(key)) MACHINES.set(key, makeMachine(opts));
-    return MACHINES.get(key);
-}
-
-/* ------------------------------------------------------------------------------------------- *
- * The observation vector.  Every RQ register is read through the SAME width/offset rq_reg[]      *
- * publishes, on BOTH engines, so the comparison never reports a difference that is an artifact   *
- * of what the oracle is able to print.                                                           *
- * ------------------------------------------------------------------------------------------- */
-
-/**
- * rq_reg[] (pdp11_rq.c:1230-1262), transcribed as {name, width, offset, get}.  `offset` is
- * GRDATA's own right-shift -- CQLNT/CQIDX/RQLNT/RQIDX are published SHIFTED DOWN BY TWO, which is
- * why the oracle prints 01 for a four-byte ring.  Getting that wrong would make every ring length
- * differ by a factor of four and look like a decode bug in rq.js rather than a printing convention.
- */
-const RQ_OBS = [
-    {name: "SA",     width: 16, offset: 0, get: (r) => r.sa},
-    {name: "SAW",    width: 16, offset: 0, get: (r) => r.saw},
-    {name: "S1DAT",  width: 16, offset: 0, get: (r) => r.s1dat},
-    {name: "COMM",   width: 22, offset: 0, get: (r) => r.comm},
-    {name: "CQIOFF", width: 32, offset: 0, get: (r) => r.cq.ioff},
-    {name: "CQBA",   width: 22, offset: 0, get: (r) => r.cq.ba},
-    {name: "CQLNT",  width:  8, offset: 2, get: (r) => r.cq.lnt},
-    {name: "CQIDX",  width:  8, offset: 2, get: (r) => r.cq.idx},
-    {name: "RQIOFF", width: 32, offset: 0, get: (r) => r.rq.ioff},
-    {name: "RQBA",   width: 22, offset: 0, get: (r) => r.rq.ba},
-    {name: "RQLNT",  width:  8, offset: 2, get: (r) => r.rq.lnt},
-    {name: "RQIDX",  width:  8, offset: 2, get: (r) => r.rq.idx},
-    {name: "FREE",   width:  5, offset: 0, get: (r) => r.freq},
-    {name: "RESP",   width:  5, offset: 0, get: (r) => r.rspq},
-    {name: "PBSY",   width:  5, offset: 0, get: (r) => r.pbsy},
-    {name: "CFLGS",  width: 16, offset: 0, get: (r) => r.cflgs},
-    {name: "CSTA",   width:  4, offset: 0, get: (r) => r.csta},
-    {name: "PERR",   width:  9, offset: 0, get: (r) => r.perr},
-    {name: "CRED",   width:  5, offset: 0, get: (r) => r.credits},
-    {name: "HAT",    width: 17, offset: 0, get: (r) => r.hat},
-    {name: "HTMO",   width: 17, offset: 0, get: (r) => r.htmo},
-    {name: "PRGI",   width:  1, offset: 0, get: (r) => (r.prgi ? 1 : 0)},
-    {name: "PIP",    width:  1, offset: 0, get: (r) => (r.pip ? 1 : 0)}
-];
-
-/**
- * rqFieldOf(rq, o)
- *
- * SIMH's GRDATA/DRDATA rendering: right-shift by the register's OFFSET, then take the low `width`
- * bits.  Done with >>> and a modulus rather than `(1 << width) - 1` because a 32-bit field
- * (CQIOFF, which holds SA_COMM_CI == -4) must come out as the unsigned word the oracle prints
- * rather than as a negative JS number -- and `1 << 32` is 1, not 0x100000000.
- */
-function rqFieldOf(rq, o)
-{
-    let shifted = ((o.get(rq) | 0) >>> (o.offset || 0)) >>> 0;
-    if (o.width >= 32) return shifted >>> 0;
-    return (shifted % Math.pow(2, o.width)) >>> 0;
-}
-
-/**
- * The packet array, as SIMH publishes it: `VBRDATAD (PKTS, rq_ctx.pak, DEV_RDX, 16,
- * sizeof(rq_ctx.pak)/2, ...)` is a FLAT 16-bit view over `struct rqpkt { uint16 link; uint16 d[32]; }
- * pak[32]`, so index i is packet `i / 33`, and within it the LINK when `i % 33 == 0` and `d[i%33 - 1]`
- * otherwise.  Probed rather than dumped whole: 1056 words per case would dominate the do-file, and
- * the interesting words are the free list's own links and the first and last data words.
- *
- * Grading these is what keeps rq_reset()'s packet initialisation from being state nothing reads --
- * the free-list walk behind `SHOW RQ FREEQ` reads the links, and these read the data too.
- */
-const PKT_WORDS = 1 + RQ_PKT_SIZE_W;
+/** Nine words of SIMH's flat 16-bit view over the packet array, PROBED rather than dumped whole:
+    1056 words per case would dominate the do-file, and the interesting words are the free list's own
+    links and the first and last data words.  Grading these is what keeps rq_reset()'s packet
+    initialisation from being state nothing reads. */
 const PKT_PROBES = [0, 1, PKT_WORDS, PKT_WORDS + 1, 2 * PKT_WORDS, 2 * PKT_WORDS + 1,
                     31 * PKT_WORDS, 31 * PKT_WORDS + 1, 32 * PKT_WORDS - 1];
-
-function pktWord(rq, i)
-{
-    let pkt = (i / PKT_WORDS) | 0, fld = i % PKT_WORDS;
-    return fld === 0 ? (rq.pakLink[pkt] & 0xFFFF) : (rq.pakData[pkt * RQ_PKT_SIZE_W + (fld - 1)] & 0xFFFF);
-}
-
-/* ------------------------------------------------------------------------------------------- *
- * SHOW RQ RINGS / FREEQ / RESPQ, reproduced from rq.js's state                                   *
- * ------------------------------------------------------------------------------------------- */
-
-/**
- * showCtrl(rq, cqbic, flags)
- *
- * rq_show_ctrl() (pdp11_rq.c:3548-3597) and rq_show_ring(), for the VAX arm's `%x` formats.  This
- * lives in the differential rather than in rq.js because it is a RENDERING of state, not device
- * behaviour -- but it is graded as text against the oracle's own output, which makes it a real
- * assertion about `cq`/`rq`/`freq`/`rspq`/`pip`/`hat` and about the DESCRIPTORS the rings point at:
- * rq_show_ring reads them back THROUGH THE MAP, so a comm region that was zeroed to the wrong
- * physical page prints non-zero descriptors here even when every register agrees.
- *
- * @param {RQVAX} rq
- * @param {CQBICVAX} cqbic
- * @param {string} flags "RI" | "FR" | "RS"
- * @returns {string}
- */
-function showCtrl(rq, cqbic, flags)
-{
-    if (rq.csta !== CST_UP) return "Controller is not initialized\n";
-    let out = "";
-    if (flags === "RI") {
-        out += rq.pip ? `Polling in progress, host timer = ${rq.hat}\n` : `Host timer = ${rq.hat}\n`;
-        out += "Command " + showRing(rq.cq, cqbic);
-        out += "Response " + showRing(rq.rq, cqbic);
-    } else if (flags === "FR") {
-        let q = rq.freeQueue();
-        if (q.length) {
-            for (let i = 0; i < q.length; i++) {
-                if (i === 0) out += `Free queue = ${q[i]}`;
-                else if ((i % 16) === 0) out += `,\n ${q[i]}`;
-                else out += `, ${q[i]}`;
-            }
-            out += "\n";
-        } else out += "Free queue is empty\n";
-    } else {
-        /* rq_show_ctrl()'s RQ_SH_RS arm walks the response queue and prints a PACKET per entry --
-           rendering that is MSCP packet territory and out of this item's scope.  A non-empty queue
-           cannot happen here (rq.js's quesvc() throws first), and if it ever did, this returns text
-           the oracle can never print rather than an empty string that would silently match nothing. */
-        out += rq.rspq ? `Response queue is NOT empty (head ${rq.rspq}) -- packet rendering is ` +
-                         `pcjsvax-6a5's later children, not pcjsvax-c2c\n`
-                       : "Response queue is empty\n";
-    }
-    return out;
-}
-
-function showRing(ring, cqbic)
-{
-    let out = `ring, base = ${(ring.ba >>> 0).toString(16)}, index = ${ring.idx >> 2}, ` +
-              `length = ${ring.lnt >> 2}\n`;
-    let buf = new Uint8Array(4);
-    for (let i = 0; i < (ring.lnt >> 2); i++) {
-        if (cqbic.mapReadW((ring.ba + (i << 2)) >>> 0, 4, buf)) {
-            out += ` ${String(i).padStart(3)}: non-existent memory\n`;
-            break;
-        }
-        let desc = (buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24)) >>> 0;
-        out += ` ${String(i).padStart(3)}: ${desc.toString(16).padStart(8, "0")}\n`;
-    }
-    return out;
-}
 
 /* ------------------------------------------------------------------------------------------- *
  * Case construction                                                                             *
  * ------------------------------------------------------------------------------------------- */
-
-/** The physical page a Qbus page is mapped to, per case.  DESCENDING and STRIDED, so the comm
-    region is scattered and out of order -- the `scatteredPages` coverage floor requires that at
-    least one graded case actually landed that way, which is what an identity mapping would fail. */
-function physPageFor(qpage, spread)
-{
-    let i = ((qpage * 7) + spread * 13) % DATA_NPAGE;
-    return ((DATA_BASE + (DATA_NPAGE - 1 - i) * PAGE) / PAGE) | 0;
-}
-
-/** A non-zero, page-distinct seed.  Zeroing is only observable against a non-zero background, and
-    a page-distinct one also catches a transfer that landed on the wrong page entirely. */
-function seedFor(ppage) { return ((0xA5A50000 | ((ppage * 0x0101) & 0xFFFF)) >>> 0); }
-
-/**
- * commExtent(spec)
- *
- * The Qbus byte range rq_step4() will zero, computed FROM THE SPEC -- never by asking rq.js where
- * the data went, which would grade a defect against itself.  This is rq_step4()'s arithmetic
- * written a second time on purpose (the same discipline qdmadiff.js applies to its own page list);
- * its ONLY use is deciding which map entries a case programs and which physical pages get dumped,
- * so a disagreement between the two shows up as a memory difference rather than as a silent pass.
- */
-function commExtent(spec)
-{
-    let rqLnt = (1 << ((spec.s1dat >>> SA_S1H_V_RQ) & SA_S1H_M_RQ)) << 2;
-    let cqLnt = (1 << ((spec.s1dat >>> SA_S1H_V_CQ) & SA_S1H_M_CQ)) << 2;
-    let base = spec.comm + (spec.prgi ? SA_COMM_QQ : SA_COMM_CI);
-    let lnt = spec.comm + cqLnt + rqLnt - base;
-    if (lnt > SA_COMM_MAX) lnt = SA_COMM_MAX;
-    return {base: base >>> 0, lnt, rqLnt, cqLnt};
-}
 
 /**
  * qbusPagesFor(spec)
@@ -573,7 +184,7 @@ function buildCase(spec)
     for (let e of c.entries) {
         a.movImmAbs(4, (CQMAP_VLD | e.p) >>> 0, (CQMAP_BASE + e.q * 4) >>> 0);
     }
-    for (let act of c.script) emitAction(a, act, c);
+    for (let act of c.script) emitCase(a, act);
     a.halt();
     c.code = a.b;
     c.haltPC = (R_CODE + c.code.length) >>> 0;
@@ -581,31 +192,16 @@ function buildCase(spec)
     return c;
 }
 
-const RQ_IP = RQ_BASE;
-const RQ_SA = (RQ_BASE + 2) >>> 0;
-
 /**
- * emitAction(a, act, c)
+ * emitCase(a, act)
  *
- * The action vocabulary a case's `script` is written in.  Every one of them is a REAL instruction
- * against a REAL address; there is no "call the device" action, by construction.
+ * The base vocabulary lives in mscpharness.js; this differential adds none of its own, so the whole
+ * job here is turning "the harness does not know this action" into a failure with the action's name
+ * in it rather than a silently missing instruction.
  */
-function emitAction(a, act, c)
+function emitCase(a, act)
 {
-    switch (act.a) {
-    case "rsa":   return a.movAbsReg(2, RQ_SA, act.r);                  // MOVZWL @#SA, Rr
-    case "rip":   return a.movAbsReg(2, RQ_IP, act.r);                  // MOVZWL @#IP, Rr
-    case "ripl":  return a.movAbsReg(4, RQ_IP, act.r);                  // MOVL   @#IP, Rr -- both slots
-    case "rb":    return a.movAbsReg(1, (RQ_BASE + act.off) >>> 0, act.r);
-    case "rd":    return a.movAbsReg(2, act.addr >>> 0, act.r);         // an arbitrary probe address
-    case "wsa":   return a.movImmAbs(2, act.v, RQ_SA);
-    case "wip":   return a.movImmAbs(2, act.v, RQ_IP);
-    case "wb":    return a.movImmAbs(1, act.v, (RQ_BASE + act.off) >>> 0);
-    case "went":  return a.movImmAbs(4, act.v >>> 0, (CQMAP_BASE + act.q * 4) >>> 0);
-    case "poll":  return a.poll(RQ_SA, act.r, act.prev, act.cnt);
-    case "delay": return a.delay(act.n, act.r);
-    }
-    throw new Error(`mscpinitdiff: unknown script action "${act.a}"`);
+    if (!emitAction(a, act)) throw new Error(`mscpinitdiff: unknown script action "${act.a}"`);
 }
 
 /* ------------------------------------------------------------------------------------------- *
@@ -621,42 +217,6 @@ const S1DATS = [
     0xBB01,     // cq code 7, rq code 3, echoS2 0xBB, echoS3 0x01
     0x8D2A      // cq code 1, rq code 5, echoS2 0x8D, echoS3 0x2A
 ];
-
-/**
- * walkScript(s1dat, comm, prgi, regs)
- *
- * The four-step handshake as a host writes it, with a poll after each write.  `regs` names the
- * registers; they are explicit rather than allocated so a failure report reads directly.
- *
- * The step-2 word carries the comm region's LOW half masked with SA_S2H_CLO (0xFFFE) and its low
- * bit is the purge-interrupt flag; the step-3 word carries the HIGH half, which the controller
- * shifts left 16 and ORs in.  Both are computed from `comm` here, so a case with a comm region
- * above 64KB exercises the shift rather than agreeing with a zero.
- */
-function walkScript(s1dat, comm, prgi, opts = {})
-{
-    let s = [{a: "rsa", r: 0}];
-    s.push({a: "wsa", v: s1dat, step: 1});
-    s.push({a: "poll", r: 1, prev: 0, cnt: 5});
-    s.push({a: "wsa", v: ((comm & SA_S2H_CLO) | (prgi ? SA_S2H_PI : 0)) & 0xFFFF, step: 2});
-    s.push({a: "poll", r: 2, prev: 1, cnt: 6});
-    if (opts.pp) {
-        s.push({a: "wsa", v: (((comm >>> 16) & SA_S3H_CHI) | SA_S3H_PP) & 0xFFFF, step: 3});
-        s.push({a: "poll", r: 3, prev: 2, cnt: 7});          // SA -> 0
-        s.push({a: "wsa", v: opts.ppaBad === undefined ? 0 : opts.ppaBad, step: 3.5});
-        s.push({a: "delay", n: opts.ppaDelay, r: 11});
-        s.push({a: "rip", r: 9});                            // the IP READ that completes step 4
-        s.push({a: "rsa", r: 3});
-    } else {
-        s.push({a: "wsa", v: ((comm >>> 16) & SA_S3H_CHI) & 0xFFFF, step: 3});
-        s.push({a: "poll", r: 3, prev: 2, cnt: 7});
-    }
-    if (!opts.stopBeforeGo) {
-        s.push({a: "wsa", v: SA_S4H_GO, step: 4});
-        s.push({a: "poll", r: 4, prev: 3, cnt: 8});
-    }
-    return s;
-}
 
 /**
  * reachScript(state)
@@ -988,25 +548,7 @@ function simhCaseLines(c)
 {
     let L = [];
     L.push(`echo ${MARK}${c.idx}`);
-    L.push("reset -p all");
-    L.push("deposit MAPEN 0");
-    L.push(`deposit rq itime ${c.itime}`, `deposit rq i4time ${c.i4time}`,
-           `deposit rq qtime ${c.qtime}`, `deposit rq xtime ${c.xtime}`);
-    L.push("deposit qba mbr 0", "deposit qba dser 0", "deposit qba mear 0", "deposit qba sear 0",
-           "deposit sysd bto 0", "deposit cpu memerr 0");
-    L.push(`deposit SCBB ${hex(R_SCBB)}`, `deposit KSP ${hex(R_KSP)}`,
-           `deposit R14 ${hex(R_KSP)}`, `deposit IS ${hex(R_IS)}`,
-           `deposit -l ${hex((R_SCBB + SCB.MCHK) >>> 0)} ${hex(R_MCHK_HDLR)}`,
-           `deposit -l ${hex((R_SCBB + SCB.MEMERR) >>> 0)} ${hex(R_MERR_HDLR)}`);
-    for (let k = 0; k < HDLR_NOPS; k++) {
-        L.push(`deposit -b ${hex(R_MCHK_HDLR + k)} ${OPC.NOP.toString(16)}`);
-        L.push(`deposit -b ${hex(R_MERR_HDLR + k)} ${OPC.NOP.toString(16)}`);
-    }
-    for (let k = 0; k < OBS_REGS; k++) if (k !== 14) L.push(`deposit R${k} 0`);
-    /* The map's backing store and the low-memory window an UNPROGRAMMED map would read entries out
-       of, both zeroed, so a fatal case fails for the reason it is supposed to. */
-    L.push(`deposit -l ${hex(MAP_MBR)}:${hex(MAP_HI - 4)} 0`);
-    L.push(`deposit -l 0:${hex(LOWMAP_HI - 4)} 0`);
+    L.push(...simhResetLines(c));
     for (let p of c.dumpPages) L.push(`deposit -l ${hex(p * PAGE)}:${hex(p * PAGE + PAGE - 4)} ${hex(seedFor(p))}`);
     for (let k = 0; k < c.code.length; k++) L.push(`deposit -b ${hex(R_CODE + k)} ${c.code[k].toString(16)}`);
     L.push("deposit PSL 0", `deposit PC ${hex(R_CODE)}`);
@@ -1106,24 +648,7 @@ function runCaseJS(c, mutationOpts = {})
        case that looked at one.  The fresh-SIMH-process state is rq.powerUp(), called ONCE per pass
        by runPass() -- which is the boundary the oracle actually has, since every pass writes a new
        do-file and starts a new simulator. */
-    cpu.reset();
-    rq.reset();
-    rq.itime = c.itime; rq.itime4 = c.i4time; rq.qtime = c.qtime; rq.xtime = c.xtime;
-    cqbic.reset();
-    cpu.exc.cqDser = 0; cpu.exc.cqMear = 0; cpu.exc.sscBto = 0; cpu.exc.memErr = 0;
-    cpu.exc.scbb = R_SCBB;
-    cpu.regs[14] = R_KSP;
-    cpu.exc.stk[0] = R_KSP;
-    cpu.exc.stk[4] = R_IS;
-    for (let k = 0; k < OBS_REGS; k++) if (k !== 14) cpu.regs[k] = 0;
-    for (let k = 0; k < HDLR_NOPS; k++) {
-        bus.setByte((R_MCHK_HDLR + k) >>> 0, OPC.NOP);
-        bus.setByte((R_MERR_HDLR + k) >>> 0, OPC.NOP);
-    }
-    bus.setLong((R_SCBB + SCB.MCHK) >>> 0, R_MCHK_HDLR);
-    bus.setLong((R_SCBB + SCB.MEMERR) >>> 0, R_MERR_HDLR);
-    for (let a = MAP_MBR; a < MAP_HI; a += 4) bus.setLong(a >>> 0, 0);
-    for (let a = 0; a < LOWMAP_HI; a += 4) bus.setLong(a >>> 0, 0);
+    jsResetForCase(m, c);
     for (let p of c.dumpPages) {
         let s = seedFor(p);
         for (let a = p * PAGE; a < p * PAGE + PAGE; a += 4) bus.setLong(a >>> 0, s);
@@ -1812,10 +1337,10 @@ function main()
         console.log(`\nPHASES`);
         for (let line of report) console.log(line);
 
-        let peakMB = PEAK_HEAP / (1024 * 1024);
+        let peak = peakHeap(), peakMB = peak / (1024 * 1024);
         console.log(`\npeak JS heap+external: ${peakMB.toFixed(1)} MB (absolute ceiling ` +
             `${MAX_HEAP_BYTES / (1024 * 1024)} MB)`);
-        if (PEAK_HEAP > MAX_HEAP_BYTES) {
+        if (peak > MAX_HEAP_BYTES) {
             failures.push(`peak heap+external ${peakMB.toFixed(1)} MB exceeds the absolute ceiling ` +
                 `${MAX_HEAP_BYTES / (1024 * 1024)} MB`);
         }
