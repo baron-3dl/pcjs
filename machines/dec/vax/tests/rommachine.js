@@ -34,6 +34,7 @@ import NVRVAX from "../modules/v2/nvr.js";
 import CQBICVAX from "../modules/v2/cqbic.js";
 import KA655VAX from "../modules/v2/ka655.js";
 import CMCTLVAX, { CMCTL_BASE, CMCTL_LENGTH } from "../modules/v2/cmctl.js";
+import CQIPCVAX, { DBLVAX, CQIPC_BASE, CQIPC_SIZE, DBL_BASE, DBL_SIZE } from "../modules/v2/cqipc.js";
 import CDGVAX from "../modules/v2/cdg.js";
 import ConsoleVAX from "../modules/v2/console.js";
 import ClkVAX, { IPL_CLK_ABS, INT_V_CLK } from "../modules/v2/clk.js";
@@ -50,7 +51,8 @@ const MEMSIZE = 0x01000000;
  * without it the very first instructions would fault on RAM before ever reaching the ROM's own
  * device probing) plus the ROM itself, decoded via BusVAX.addRom(), plus the SSC base register,
  * decoded via BusVAX.addSsc() (pcjsvax-320), plus the REG_BASE sub-devices (BusVAX.addRegBlock(),
- * pcjsvax-bfb) and the cache diagnostic space (BusVAX.addCdg(), pcjsvax-0b7).
+ * pcjsvax-bfb), the cache diagnostic space (BusVAX.addCdg(), pcjsvax-0b7) and the CQBIC doorbell's
+ * two bytes of the Qbus I/O page (BusVAX.addIoPage(), pcjsvax-b8a).
  *
  * `fOmitCdg` (pcjsvax-fe7, romdiff.js's --no-cdg) leaves the cache-diagnostic space UNDECODED.  It
  * touches exactly one line of this function and nothing anywhere else -- deliberately, because
@@ -60,7 +62,8 @@ const MEMSIZE = 0x01000000;
  *
  * @param {Uint8Array} romBytes
  * @param {boolean} [fOmitCdg]
- * @returns {Object} {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, cmctl, ka655, cdg, devices}
+ * @returns {Object} {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, cqipc, dbl, cmctl, ka655, cdg,
+ *   devices}
  */
 function makeRomMachine(romBytes, fOmitCdg = false)
 {
@@ -101,11 +104,25 @@ function makeRomMachine(romBytes, fOmitCdg = false)
        length is a computation over the bank geometry (see cmctl.js's header), and a second
        hand-written copy of it here is precisely the drift standing rule 7 was earned by. */
     let cmctl = new CMCTLVAX(MEMSIZE);
+    /* CQIPCVAX (pcjsvax-b8a) is `cq_ipc`, ONE register with TWO address paths -- the local register
+       at CQIPCBASE and the Qbus I/O-page doorbell the QBA's DIB autoconfigures (see cqipc.js's
+       header).  Both mounts below share this one instance for the same reason console.js's IPR and
+       SSC paths share one ConsoleVAX: two models of a W1C register would drift, and the W1C bit is
+       what makes the drift observable.  setIpc() wires cqbic_wr()'s DSER<SME> cross-clear, the one
+       side effect on cq_ipc that lives outside cqipc.js. */
+    let cqipc = new CQIPCVAX();
+    cqbic.setIpc(cqipc);
     bus.addRegBlock([
         {base: VAX.PHYSMEM.REG_BASE >>> 0, length: 0x14, dev: cqbic},
         {base: CMCTL_BASE, length: CMCTL_LENGTH, dev: cmctl},
-        {base: (VAX.PHYSMEM.REG_BASE + 0x4000) >>> 0, length: 8, dev: ka655}
+        {base: (VAX.PHYSMEM.REG_BASE + 0x4000) >>> 0, length: 8, dev: ka655},
+        {base: CQIPC_BASE, length: CQIPC_SIZE, dev: cqipc}
     ]);
+    /* The Qbus I/O page, decoded for the FIRST time in this tree, and for exactly DBL_SIZE bytes.
+       Everything else in the range keeps faulting through the identical path it took before -- see
+       bus.js's addIoPage() and cqipc.js's SCOPE section. */
+    let dbl = new DBLVAX(cqipc);
+    bus.addIoPage([{base: DBL_BASE, length: DBL_SIZE, dev: dbl}]);
     let cdg = null;
     if (!fOmitCdg) { cdg = new CDGVAX(ka655); bus.addCdg(cdg); }
     cpu.setBus(bus);
@@ -116,9 +133,9 @@ function makeRomMachine(romBytes, fOmitCdg = false)
     /* Derived from the constructions above, in this same function, so it can neither list a device
        the machine does not have nor omit one it does (see the file header).  `cdg` is present only
        when it was actually decoded, which is what makes `fOmitCdg` visible to a census. */
-    let devices = [consoleDev, clk, ssc, nvr, cqbic, cmctl, ka655, cdg].filter((d) => d !== null)
+    let devices = [consoleDev, clk, ssc, nvr, cqbic, cqipc, dbl, cmctl, ka655, cdg].filter((d) => d !== null)
         .map((d) => ({name: d.constructor.name, dev: d}));
-    return {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, cmctl, ka655, cdg, devices};
+    return {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, cqipc, dbl, cmctl, ka655, cdg, devices};
 }
 
 export { makeRomMachine, MEMSIZE };
