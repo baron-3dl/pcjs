@@ -946,21 +946,32 @@ function selfcheck(simh, scratch)
 
 function getArg(name, def) { let i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] : def; }
 
+function cleanupScratch(scratch)
+{
+    try { fs.rmSync(scratch, {recursive: true, force: true}); }
+    catch (e) { console.log(`  (could not remove scratch ${scratch}: ${e.message})`); }
+}
+
 function main()
 {
     let simh = findSimh(getArg("--simh", null));
     let scratch = fs.mkdtempSync(path.join(os.tmpdir(), "hwintdiff-"));
     console.log(`hwintdiff.js: simh=${simh} scratch=${scratch}`);
 
+    /* Every exit path -- success, an assertion/coverage FAIL, or a --selfcheck failure -- runs
+       through this try/finally, so scratch is always removed (HANDOFF.md pcjsvax-bd1: this file
+       had no rmSync of scratch anywhere, on any path). */
+    try {
     if (process.argv.indexOf("--selfcheck") >= 0) {
         let results = selfcheck(simh, scratch);
         let bad = results.filter((r) => !r.caught);
         if (bad.length) {
             console.error(`SELFCHECK FAILED: ${bad.length} mutation(s) not caught: ${bad.map((b) => b.mn).join(", ")}`);
-            process.exit(1);
+            process.exitCode = 1;
+            return;
         }
         console.log(`selfcheck: all ${results.length} mutations caught.`);
-        process.exit(0);
+        return;
     }
 
     let problems = [];
@@ -1038,9 +1049,13 @@ function main()
     if (problems.length) {
         console.error(`\nFAILED (${problems.length} problem(s)):`);
         for (let p of problems) console.error("  - " + p);
-        process.exit(1);
+        process.exitCode = 1;
+        return;
     }
     console.log(`\nPASSED.`);
+    } finally {
+        cleanupScratch(scratch);
+    }
 }
 
 main();

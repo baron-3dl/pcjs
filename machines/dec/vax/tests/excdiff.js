@@ -1748,6 +1748,12 @@ const MIN_NONTRIVIAL_FRACTION = 0.9;
 
 function getArg(name, def) { let i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] : def; }
 
+function cleanupScratch(scratch)
+{
+    try { fs.rmSync(scratch, {recursive: true, force: true}); }
+    catch (e) { console.log(`  (could not remove scratch ${scratch}: ${e.message})`); }
+}
+
 function main()
 {
     let simh = findSimh(getArg("--simh", null));
@@ -1756,31 +1762,40 @@ function main()
     let ehkaaExe = getArg("--ehkaa", path.join(vaxRepo(), "open-simh/VAX/tests/ehkaa.exe"));
     console.log(`excdiff.js: simh=${simh} scratch=${scratch} seed=${seed}`);
 
-    if (process.argv.indexOf("--selfcheck") >= 0) {
-        let results = selfcheck(simh, scratch, {seed, ehkaaExe});
-        if (!results) process.exit(1);
-        let bad = results.filter((r) => !r.caught);
-        if (bad.length) {
-            console.error(`SELFCHECK FAILED: ${bad.length} mutation(s) not caught:`);
-            for (let b of bad) console.error("  - " + b.name);
-            process.exit(1);
+    /* Every exit path -- success, an assertion/coverage FAIL, or a --selfcheck failure -- runs
+       through this try/finally, so scratch is always removed.  HANDOFF.md pcjsvax-bd1: this file
+       had NO rmSync of scratch anywhere, on any path -- the same defect as strqdiff.js, and the
+       largest single contributor of the leaked directories found on this disk (144
+       /tmp/excdiff-* dirs). */
+    try {
+        if (process.argv.indexOf("--selfcheck") >= 0) {
+            let results = selfcheck(simh, scratch, {seed, ehkaaExe});
+            if (!results) { process.exitCode = 1; return; }
+            let bad = results.filter((r) => !r.caught);
+            if (bad.length) {
+                console.error(`SELFCHECK FAILED: ${bad.length} mutation(s) not caught:`);
+                for (let b of bad) console.error("  - " + b.name);
+                process.exitCode = 1;
+                return;
+            }
+            console.log(`selfcheck: all ${results.length} mutations caught.`);
+            return;
         }
-        console.log(`selfcheck: all ${results.length} mutations caught.`);
-        process.exit(0);
-    }
 
-    let cases = +getArg("--cases", "120");
-    let mapped = +getArg("--mapped", "150");
-    if (cases < MIN_CASES_PER_KIND) {
-        console.error(`FATAL: --cases ${cases} is below the coverage floor (${MIN_CASES_PER_KIND}); an undersized run must fail, not quietly pass.`);
-        process.exit(1);
-    }
-    if (mapped < MIN_MAPPED_CASES) {
-        console.error(`FATAL: --mapped ${mapped} is below the coverage floor (${MIN_MAPPED_CASES}); an undersized run must fail, not quietly pass.`);
-        process.exit(1);
-    }
+        let cases = +getArg("--cases", "120");
+        let mapped = +getArg("--mapped", "150");
+        if (cases < MIN_CASES_PER_KIND) {
+            console.error(`FATAL: --cases ${cases} is below the coverage floor (${MIN_CASES_PER_KIND}); an undersized run must fail, not quietly pass.`);
+            process.exitCode = 1;
+            return;
+        }
+        if (mapped < MIN_MAPPED_CASES) {
+            console.error(`FATAL: --mapped ${mapped} is below the coverage floor (${MIN_MAPPED_CASES}); an undersized run must fail, not quietly pass.`);
+            process.exitCode = 1;
+            return;
+        }
 
-    let problems = [];
+        let problems = [];
 
     console.log(`\n=== EHKAA phase ===`);
     let e = phaseEHKAA({simh, scratch, ehkaaExe, seed});
@@ -1867,9 +1882,13 @@ function main()
     if (problems.length) {
         console.error(`\nFAILED (${problems.length} problem(s)), seed=${seed}:`);
         for (let p of problems) console.error("  - " + p);
-        process.exit(1);
+        process.exitCode = 1;
+        return;
     }
     console.log(`\nPASSED. seed=${seed}`);
+    } finally {
+        cleanupScratch(scratch);
+    }
 }
 
 main();

@@ -1954,9 +1954,16 @@ async function main()
     };
 
     console.log("fpadiff: SIMH " + simhBin);
-    requireFpSupport(simhBin, scratch);
 
+    /* Every exit path -- requireFpSupport() throwing, a --selfcheck failure, an undersized-args
+       FAIL, a normal FAIL/PASS, or any other thrown exception -- runs through this try/finally,
+       so scratch is always removed.  HANDOFF.md pcjsvax-bd1: an earlier revision called
+       process.exit() from three separate places without removing scratch first, and
+       requireFpSupport() throwing (e.g. no FP-patched SIMH) skipped the two rmSync() calls that
+       only ran on paths that got that far. */
+    try {
     let problems = [];
+    requireFpSupport(simhBin, scratch);
 
     if (fSelfcheck) {
         /*
@@ -1986,11 +1993,11 @@ async function main()
             }
         }
         restoreMutations();
-        fs.rmSync(scratch, {recursive: true, force: true});
         if (nMissed) {
             console.log("\nFAIL: " + nMissed + " mutation(s) survived.  An undetected mutation is a" +
                 " HOLE IN THE ORACLE and must be investigated, not papered over with more cases.");
-            process.exit(1);
+            process.exitCode = 1;
+            return;
         }
         console.log("\nselfcheck PASS: every mutation was caught");
         return;
@@ -2000,7 +2007,8 @@ async function main()
         console.error("FAIL: --cases " + nCases + " is below the floor of " + MIN_CASES +
             ".  The coverage floors below are absolute counts and are NOT scaled down with the" +
             " case count: an undersized run must fail, not quietly pass.");
-        process.exit(1);
+        process.exitCode = 1;
+        return;
     }
 
     /* ---------------------------------------------------------------- EXERCISER */
@@ -2095,20 +2103,22 @@ async function main()
         console.log("\nEHKAA skipped (--skip-ehkaa)");
     }
 
-    fs.rmSync(scratch, {recursive: true, force: true});
-
     console.log("");
     if (problems.length) {
         for (let p of problems.slice(0, 40)) console.log("  " + p);
         if (problems.length > 40) console.log("  ... and " + (problems.length - 40) + " more");
         console.log("\nFAIL (" + problems.length + " problem(s))");
-        process.exit(1);
+        process.exitCode = 1;
+        return;
     }
     console.log("PASS");
+    } finally {
+        fs.rmSync(scratch, {recursive: true, force: true});
+    }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) == path.resolve(fileURLToPath(import.meta.url))) {
-    main().catch((e) => { console.error(e); process.exit(1); });
+    main().catch((e) => { console.error(e); process.exitCode = 1; });
 }
 
 export {

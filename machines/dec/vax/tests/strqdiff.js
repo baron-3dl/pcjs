@@ -1355,6 +1355,18 @@ function selfcheck(simh, scratch)
 
 function getArg(name, def) { let i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] : def; }
 
+/**
+ * cleanupScratch(scratch) -- same shape as conoutdiff.js's helper of the same name (HANDOFF.md
+ * pcjsvax-bfb).  Never throws: a failure to remove scratch must not mask the run's real result.
+ *
+ * @param {string} scratch
+ */
+function cleanupScratch(scratch)
+{
+    try { fs.rmSync(scratch, {recursive: true, force: true}); }
+    catch (e) { console.log(`  (could not remove scratch ${scratch}: ${e.message})`); }
+}
+
 function main()
 {
     let simh = findSimh(getArg("--simh", null));
@@ -1362,80 +1374,94 @@ function main()
     let seed = +getArg("--seed", String((Math.random() * 0xFFFFFFFF) | 0));
     console.log(`strqdiff.js: simh=${simh} scratch=${scratch} seed=${seed}`);
 
-    if (process.argv.indexOf("--selfcheck") >= 0) {
-        let results = selfcheck(simh, scratch);
-        let bad = results.filter((r) => !r.caught);
-        if (bad.length) {
-            console.error(`SELFCHECK FAILED: ${bad.length} mutation(s) not caught: ${bad.map((b) => b.mn).join(", ")}`);
-            process.exit(1);
+    /* Every exit path below -- success, an assertion/coverage FAIL, or a --selfcheck failure --
+       runs through this try/finally, so scratch is always removed.  --selfcheck's own function
+       returns a result list rather than calling process.exit() itself (see selfcheck()'s
+       call site below), matching the shape conoutdiff.js's selfcheck() uses for the same reason:
+       an earlier revision of THIS file called process.exit() directly on every exit path and
+       leaked one scratch directory per invocation -- MEASURED as 83 abandoned
+       /tmp/strqdiff-* directories holding 10.4 GB (pcjsvax-bd1). */
+    try {
+        if (process.argv.indexOf("--selfcheck") >= 0) {
+            let results = selfcheck(simh, scratch);
+            let bad = results.filter((r) => !r.caught);
+            if (bad.length) {
+                console.error(`SELFCHECK FAILED: ${bad.length} mutation(s) not caught: ${bad.map((b) => b.mn).join(", ")}`);
+                process.exitCode = 1;
+                return;
+            }
+            console.log(`selfcheck: all ${results.length} mutations caught.`);
+            return;
         }
-        console.log(`selfcheck: all ${results.length} mutations caught.`);
-        process.exit(0);
-    }
 
-    let casesPerOpcode = +getArg("--cases-per-opcode", "150");
-    if (casesPerOpcode < MIN_CASES_PER_OPCODE) {
-        console.error(`FATAL: --cases-per-opcode ${casesPerOpcode} is below the coverage floor (${MIN_CASES_PER_OPCODE}); an undersized run must fail, not quietly pass.`);
-        process.exit(1);
-    }
-
-    let problems = [];
-
-    console.log(`\n=== RANDOMIZED phase: ${casesPerOpcode} cases x ${RANDOMIZED_MN.length} opcodes ===`);
-    let r = phaseRandomized(simh, scratch, {seed, casesPerOpcode});
-    console.log(`  total=${r.total} nontrivial=${r.nontrivial} (${(100 * r.nontrivial / r.total).toFixed(1)}%)`);
-    console.log(`  failures=${r.failures.length} notReached=${r.notReached.length}`);
-    if (r.total < MIN_TOTAL_CASES) problems.push(`COVERAGE: total cases ${r.total} < floor ${MIN_TOTAL_CASES}`);
-    if (r.nontrivial / r.total < MIN_NONTRIVIAL_FRACTION) problems.push(`COVERAGE: non-trivial fraction ${(r.nontrivial / r.total).toFixed(3)} < floor ${MIN_NONTRIVIAL_FRACTION}`);
-    for (let mn of r.mnemonics) {
-        let n = r.perOpcodeCounts.get(mn) || 0;
-        if (n < MIN_CASES_PER_OPCODE) problems.push(`COVERAGE: opcode ${mn} got only ${n} cases (floor ${MIN_CASES_PER_OPCODE})`);
-    }
-    if (r.notReached.length) problems.push(`COVERAGE: ${r.notReached.length} case(s) never reached comparison: ${r.notReached.slice(0, 10).join("; ")}`);
-    for (let f of r.failures.slice(0, 25)) problems.push("RANDOMIZED: " + f);
-    if (r.failures.length > 25) problems.push(`RANDOMIZED: ...and ${r.failures.length - 25} more failures`);
-
-    console.log(`\n=== MAXLEN phase (true 65535-byte length) ===`);
-    let ml = phaseMaxLen(simh, scratch, {seed});
-    console.log(`  compared=${ml.compared} expected=${ml.expected} failures=${ml.failures.length} notReached=${ml.notReached.length}`);
-    if (ml.compared < ml.expected) problems.push(`COVERAGE: MAXLEN compared only ${ml.compared}/${ml.expected} cases`);
-    for (let f of ml.failures) problems.push(f);
-    if (ml.notReached.length) problems.push(`COVERAGE: MAXLEN ${ml.notReached.length} case(s) never reached comparison: ${ml.notReached.join("; ")}`);
-
-    console.log(`\n=== PROBE phase (PROBER/PROBEW real MMU protection) ===`);
-    let pr = phaseProbe(simh, scratch, {seed});
-    console.log(`  compared=${pr.compared} total=${pr.total} failures=${pr.failures.length} notReached=${pr.notReached.length}`);
-    if (pr.compared < pr.total) problems.push(`COVERAGE: PROBE compared only ${pr.compared}/${pr.total} cases`);
-    for (let f of pr.failures.slice(0, 25)) problems.push(f);
-    if (pr.failures.length > 25) problems.push(`PROBE: ...and ${pr.failures.length - 25} more failures`);
-    if (pr.notReached.length) problems.push(`COVERAGE: PROBE ${pr.notReached.length} case(s) never reached comparison: ${pr.notReached.join("; ")}`);
-
-    console.log(`\n=== EHKAA phase ===`);
-    /* $PCJS_VAX_REPO overrides the sibling-directory guess -- from a worktree, "../pcjs-vax"
-       relative to REPO_ROOT resolves to a nonexistent sibling worktree, not the real pcjs-vax
-       work repo (see the README's ENVIRONMENT note). */
-    let defaultVaxRepo = process.env['PCJS_VAX_REPO'] || path.resolve(REPO_ROOT, "../pcjs-vax");
-    let e = phaseEHKAA({simh, scratch, ehkaaExe: getArg("--ehkaa", path.resolve(defaultVaxRepo, "open-simh/VAX/tests/ehkaa.exe"))});
-    if (e.skipped) {
-        console.log(`  SKIPPED: ${e.reason}`);
-        problems.push(`EHKAA: skipped (${e.reason}) -- not a substitute for the randomized phase, but its absence means real-workload coverage was NOT exercised this run`);
-    } else {
-        console.log(`  trace records=${e.total} compared=${e.compared} skippedTrap=${e.skippedTrap} skippedFPDResume=${e.skippedFPDResume} skippedNotWanted=${e.skippedNotWanted} failures=${e.failures.length}`);
-        console.log(`  per-opcode instances: ${[...e.perOpcode.entries()].map(([k, v]) => `${k}=${v}`).sort().join(" ")}`);
-        for (let f of e.failures.slice(0, 25)) problems.push("EHKAA: " + f);
-        if (e.failures.length > 25) problems.push(`EHKAA: ...and ${e.failures.length - 25} more failures`);
-        if (e.compared < 50) problems.push(`COVERAGE: EHKAA compared only ${e.compared} instances (expected >=50 across NOP/INDEX/MOVC3/MOVC5 in a 335,444-instruction trace)`);
-        for (let mn of EHKAA_MN) {
-            if (!(e.perOpcode.get(mn) > 0)) problems.push(`COVERAGE: EHKAA saw zero instances of ${mn} -- report by name, not silently absorbed`);
+        let casesPerOpcode = +getArg("--cases-per-opcode", "150");
+        if (casesPerOpcode < MIN_CASES_PER_OPCODE) {
+            console.error(`FATAL: --cases-per-opcode ${casesPerOpcode} is below the coverage floor (${MIN_CASES_PER_OPCODE}); an undersized run must fail, not quietly pass.`);
+            process.exitCode = 1;
+            return;
         }
-    }
 
-    if (problems.length) {
-        console.error(`\nFAILED (${problems.length} problem(s)), seed=${seed}:`);
-        for (let p of problems) console.error("  - " + p);
-        process.exit(1);
+        let problems = [];
+
+        console.log(`\n=== RANDOMIZED phase: ${casesPerOpcode} cases x ${RANDOMIZED_MN.length} opcodes ===`);
+        let r = phaseRandomized(simh, scratch, {seed, casesPerOpcode});
+        console.log(`  total=${r.total} nontrivial=${r.nontrivial} (${(100 * r.nontrivial / r.total).toFixed(1)}%)`);
+        console.log(`  failures=${r.failures.length} notReached=${r.notReached.length}`);
+        if (r.total < MIN_TOTAL_CASES) problems.push(`COVERAGE: total cases ${r.total} < floor ${MIN_TOTAL_CASES}`);
+        if (r.nontrivial / r.total < MIN_NONTRIVIAL_FRACTION) problems.push(`COVERAGE: non-trivial fraction ${(r.nontrivial / r.total).toFixed(3)} < floor ${MIN_NONTRIVIAL_FRACTION}`);
+        for (let mn of r.mnemonics) {
+            let n = r.perOpcodeCounts.get(mn) || 0;
+            if (n < MIN_CASES_PER_OPCODE) problems.push(`COVERAGE: opcode ${mn} got only ${n} cases (floor ${MIN_CASES_PER_OPCODE})`);
+        }
+        if (r.notReached.length) problems.push(`COVERAGE: ${r.notReached.length} case(s) never reached comparison: ${r.notReached.slice(0, 10).join("; ")}`);
+        for (let f of r.failures.slice(0, 25)) problems.push("RANDOMIZED: " + f);
+        if (r.failures.length > 25) problems.push(`RANDOMIZED: ...and ${r.failures.length - 25} more failures`);
+
+        console.log(`\n=== MAXLEN phase (true 65535-byte length) ===`);
+        let ml = phaseMaxLen(simh, scratch, {seed});
+        console.log(`  compared=${ml.compared} expected=${ml.expected} failures=${ml.failures.length} notReached=${ml.notReached.length}`);
+        if (ml.compared < ml.expected) problems.push(`COVERAGE: MAXLEN compared only ${ml.compared}/${ml.expected} cases`);
+        for (let f of ml.failures) problems.push(f);
+        if (ml.notReached.length) problems.push(`COVERAGE: MAXLEN ${ml.notReached.length} case(s) never reached comparison: ${ml.notReached.join("; ")}`);
+
+        console.log(`\n=== PROBE phase (PROBER/PROBEW real MMU protection) ===`);
+        let pr = phaseProbe(simh, scratch, {seed});
+        console.log(`  compared=${pr.compared} total=${pr.total} failures=${pr.failures.length} notReached=${pr.notReached.length}`);
+        if (pr.compared < pr.total) problems.push(`COVERAGE: PROBE compared only ${pr.compared}/${pr.total} cases`);
+        for (let f of pr.failures.slice(0, 25)) problems.push(f);
+        if (pr.failures.length > 25) problems.push(`PROBE: ...and ${pr.failures.length - 25} more failures`);
+        if (pr.notReached.length) problems.push(`COVERAGE: PROBE ${pr.notReached.length} case(s) never reached comparison: ${pr.notReached.join("; ")}`);
+
+        console.log(`\n=== EHKAA phase ===`);
+        /* $PCJS_VAX_REPO overrides the sibling-directory guess -- from a worktree, "../pcjs-vax"
+           relative to REPO_ROOT resolves to a nonexistent sibling worktree, not the real pcjs-vax
+           work repo (see the README's ENVIRONMENT note). */
+        let defaultVaxRepo = process.env['PCJS_VAX_REPO'] || path.resolve(REPO_ROOT, "../pcjs-vax");
+        let e = phaseEHKAA({simh, scratch, ehkaaExe: getArg("--ehkaa", path.resolve(defaultVaxRepo, "open-simh/VAX/tests/ehkaa.exe"))});
+        if (e.skipped) {
+            console.log(`  SKIPPED: ${e.reason}`);
+            problems.push(`EHKAA: skipped (${e.reason}) -- not a substitute for the randomized phase, but its absence means real-workload coverage was NOT exercised this run`);
+        } else {
+            console.log(`  trace records=${e.total} compared=${e.compared} skippedTrap=${e.skippedTrap} skippedFPDResume=${e.skippedFPDResume} skippedNotWanted=${e.skippedNotWanted} failures=${e.failures.length}`);
+            console.log(`  per-opcode instances: ${[...e.perOpcode.entries()].map(([k, v]) => `${k}=${v}`).sort().join(" ")}`);
+            for (let f of e.failures.slice(0, 25)) problems.push("EHKAA: " + f);
+            if (e.failures.length > 25) problems.push(`EHKAA: ...and ${e.failures.length - 25} more failures`);
+            if (e.compared < 50) problems.push(`COVERAGE: EHKAA compared only ${e.compared} instances (expected >=50 across NOP/INDEX/MOVC3/MOVC5 in a 335,444-instruction trace)`);
+            for (let mn of EHKAA_MN) {
+                if (!(e.perOpcode.get(mn) > 0)) problems.push(`COVERAGE: EHKAA saw zero instances of ${mn} -- report by name, not silently absorbed`);
+            }
+        }
+
+        if (problems.length) {
+            console.error(`\nFAILED (${problems.length} problem(s)), seed=${seed}:`);
+            for (let p of problems) console.error("  - " + p);
+            process.exitCode = 1;
+            return;
+        }
+        console.log(`\nPASSED. seed=${seed}`);
+    } finally {
+        cleanupScratch(scratch);
     }
-    console.log(`\nPASSED. seed=${seed}`);
 }
 
 main();
