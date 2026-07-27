@@ -194,7 +194,11 @@ function makeMachine(romBytes)
        cpustate.js's own hook; ticking it again here would double clk_svc's effective rate). */
     let consoleDev = new ConsoleVAX(cpu.exc);
     let clk = new ClkVAX(cpu.exc);
-    bus.addSsc(new SSCVAX(cpu.exc, consoleDev), new NVRVAX());
+    /* SSCVAX (pcjsvax-055) self-wires T0/T1's interrupt sources in its own constructor (see
+       ssc.js's file header) -- kept as a local so `cpu.tmr` below can reach it for the
+       per-instruction tick hook, the same reason `clk` is kept as a local for `cpu.clk`. */
+    let ssc = new SSCVAX(cpu.exc, consoleDev);
+    bus.addSsc(ssc, new NVRVAX());
     bus.addRegBlock([
         {base: VAX.PHYSMEM.REG_BASE >>> 0, length: 0x14, dev: new CQBICVAX(cpu.exc)},
         {base: (VAX.PHYSMEM.REG_BASE + 0x4000) >>> 0, length: 8, dev: new KA655VAX()}
@@ -203,6 +207,7 @@ function makeMachine(romBytes)
     cpu.exc.setIPRDevice(makeIprDevice(clk, consoleDev));
     cpu.exc.addInterruptSource(IPL_CLK_ABS, INT_V_CLK, SCB.INTTIM);
     cpu.clk = clk;
+    cpu.tmr = ssc;
     return {bus, cpu};
 }
 

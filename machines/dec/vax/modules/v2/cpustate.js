@@ -380,6 +380,24 @@ export default class CPUStateVAX extends Component {
          */
         this.clk = null;
 
+        /*
+         * Optional per-instruction device-service hook, or null (pcjsvax-055) -- a SECOND, entirely
+         * independent slot of the exact same shape as `clk` immediately above, for modules/v2/ssc.js's
+         * SSCVAX (the SSC's T0/T1 programmable timers), NOT a second consumer of `clk`.  Two separate
+         * slots, not one shared one, because the two devices are ticked by DIFFERENT owners on real
+         * SIMH (vax_stddev.c's clk_svc vs. vax_sysdev.c's tmr_svc, two unrelated event-queue entries)
+         * and merging them into one call site would silently coordinate two devices that have no
+         * relationship on real hardware -- see modules/v2/iprdevice.js's file header for the
+         * "do NOT double-tick" warning this mirrors on the OTHER hook (exc.js's setIRQL()); this is
+         * the same discipline applied here: `tmr` gets its OWN slot instead of being folded into
+         * `clk`'s, specifically so nothing can accidentally tick either device twice per instruction
+         * or once too rarely.  This class still does not know what a "timer" is: a machine builder
+         * wires it in (see tests/romdiff.js's/tests/tmrdiff.js's makeMachine()), reset() below does
+         * NOT touch it (a device's identity is not CPU state, matching `clk`), and it is called from
+         * exactly one place, stepCPU()'s loop, immediately after `clk`'s own call.
+         */
+        this.tmr = null;
+
         this.decoder = new VAXDecoder(this);
         this.exc = new VAXExc(this);
         this.fpu = new VAXFloat(this);
@@ -918,6 +936,10 @@ export default class CPUStateVAX extends Component {
              * one -- the same reason hst.finish() runs here and not immediately after the body.
              */
             if (this.clk) this.clk.tick(this);
+
+            /* pcjsvax-055: SSCVAX's T0/T1 timers -- a SECOND, independent per-instruction hook; see
+               the `tmr` property's own doc comment above for why this is not folded into `clk`'s. */
+            if (this.tmr) this.tmr.tick(this);
 
             /*
              * vax_cpu.c:729-730.  `sim_interval` is charged BEFORE the fetch, and `extra_bytes`
