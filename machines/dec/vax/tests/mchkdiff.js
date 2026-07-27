@@ -50,15 +50,19 @@
  * item already has.  Measured directly (see calibrate() below, and its printed report, and
  * EXPECTED_CALIBRATION's committed counts):
  *
- *   - CDG_BASE is backed END TO END (`cdg_rd`/`cdg_wr` span exactly VAX.PHYSMEM.CDG_LENGTH):
- *     every access SIMH does not machine-check.  100% expected divergence; reported, not graded.
+ *   - CDG_BASE was backed END TO END (`cdg_rd`/`cdg_wr` span exactly VAX.PHYSMEM.CDG_LENGTH) and
+ *     was therefore a 100% expected divergence: reported, never graded.  pcjsvax-0b7 DECODED it
+ *     (bus.js's addCdg(), cdg.js), so it left BusVAX.RESERVED and left this file's RANGES with it,
+ *     exactly the SSC_BASE precedent below.  The divergence did not become invisible -- it became
+ *     a MATCH, graded at register level (aliasing, the CACR diagnostic-parity side effect on read,
+ *     the byte/word write merge, end-to-end backing) by tests/cdgdiff.js.
  *   - REG_BASE is a MIX: several real sub-windows (CQBIC at +0, CMCTL at +0x100, KA655 regs at
  *     +0x4000, CQIPC at +0x1F40, CQMAP at +0x8000) are backed; the rest of its 512KB genuinely
  *     machine-checks on both sides THROUGH ReadReg()/WriteReg(), the mechanism this item models.
  *   - NVR_BASE (added to BusVAX.RESERVED by the pcjsvax-446 re-dispatch -- see bus.js's
  *     isReserved(), standing rule 7) is ALSO backed end to end (`nvr_rd`/`nvr_wr`): NVR's OWN
  *     storage is a real device in SIMH, addressed through the same ReadReg/WriteReg table as
- *     everything else here.  100% expected divergence, same as CDG -- but it must be IN the pool's
+ *     everything else here.  100% expected divergence, as CDG's was -- but it must be IN the pool's
  *     candidate space (not a silent gap) for that fact to be checked and reported rather than
  *     assumed.
  *   - SSC_BASE is NO LONGER in BusVAX.RESERVED, and therefore no longer one of this file's RANGES
@@ -285,8 +289,9 @@ function candidatesFor(base, len)
 
 /** {name, base, len, addrs} for every BusVAX.RESERVED entry -- names are diagnostic labels only.
     Order MUST track bus.js's BusVAX.RESERVED array (asserted at load time below).  "SSC" was
-    removed by pcjsvax-320 (see the file header): SSC_BASE is no longer a whole reserved range. */
-const RANGE_NAMES = ["CDG", "IOPAGE", "REG", "CQM", "NVR"];
+    removed by pcjsvax-320 and "CDG" by pcjsvax-0b7 (see the file header): neither is a whole
+    reserved-but-undecoded range any more. */
+const RANGE_NAMES = ["IOPAGE", "REG", "CQM", "NVR"];
 if (RANGE_NAMES.length !== BusVAX.RESERVED.length) {
     throw new Error(`mchkdiff.js: RANGE_NAMES has ${RANGE_NAMES.length} entries, ` +
         `BusVAX.RESERVED has ${BusVAX.RESERVED.length} -- bus.js's reserved-range list changed ` +
@@ -515,7 +520,7 @@ function calibrate(simh, scratch)
      *
      *   confirmed  -- does SIMH dispatch a machine check here AT ALL (PC reaches R_HANDLER)?  This
      *                 alone decides GRADED vs EXCLUDED.  An address is excluded only when SIMH
-     *                 itself never dispatches -- a real device answered (CDG, REG's backed
+     *                 itself never dispatches -- a real device answered (REG's backed
      *                 sub-windows), or the reference is an IOPAGE/CQM WRITE, whose unbacked case
      *                 (vax_io.c WriteQb) sets a deferred `mem_err` and returns normally with no
      *                 synchronous exception at all (pcjsvax-d22).  Nothing else is excluded.
@@ -569,12 +574,15 @@ function calibrate(simh, scratch)
  * with btoSeen=false -- see calibrate()'s doc comment); `backed` is SIMH never dispatching at all.
  */
 const EXPECTED_CALIBRATION = {
-    CDG:    {confirmed: {write: 0, read: 0},  backed: {write: 10, read: 10}},
     IOPAGE: {confirmed: {write: 0, read: 10}, backed: {write: 10, read: 0}},
     REG:    {confirmed: {write: 8, read: 8},  backed: {write: 2,  read: 2}},
     CQM:    {confirmed: {write: 0, read: 10}, backed: {write: 10, read: 0}},
     NVR:    {confirmed: {write: 0, read: 0},  backed: {write: 10, read: 10}}
-    /* SSC removed by pcjsvax-320 -- see RANGE_NAMES and the file header. */
+    /* SSC removed by pcjsvax-320, CDG by pcjsvax-0b7 -- see RANGE_NAMES and the file header.
+       CDG's row was `confirmed 0 / backed 10` in BOTH directions: it contributed nothing to the
+       graded set and everything to the excluded one.  Now that bus.js decodes it (addCdg(),
+       cdg.js) it is not a reserved range at all, and tests/cdgdiff.js grades it directly and at
+       register level instead of this file recording it as a 100% expected divergence. */
 };
 
 /**

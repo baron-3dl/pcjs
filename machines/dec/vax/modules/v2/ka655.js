@@ -33,10 +33,17 @@
  * (silent accept, matching vax_io.c's own no-else/no-default shape) for BOTH the wrong-register and
  * the misaligned-CACR case; graded by tests/romdiff.js's verifyFallthroughSemantics().
  *
- * NOT MODELED: the cache-diagnostic (CDG) side effects CACR's CEN/DIAG bits would otherwise gate --
- * this item's boundary never reaches CDG (VAX.PHYSMEM.CDG_BASE, a SEPARATE, still-undecoded range;
- * see mchkdiff.js's calibration note "CDG_BASE is backed END TO END... 100% expected divergence").
- * If a later boundary shows the ROM touching CDG, that item must extend this file or add a sibling.
+ * CDG -- pcjsvax-0b7 IS the "later boundary" an earlier version of this paragraph said would have
+ * to extend this file, so it did.  cdg.js now decodes VAX.PHYSMEM.CDG_BASE, and vax_sysdev.c's
+ * cdg_rd() (:1226-1240) writes THIS register as a side effect of every CDG READ: it clears CACR_DRO
+ * and ORs in four diagnostic-parity bits computed from the longword just read.  setCdgDiagParity()
+ * below is exactly that, CDGVAX calls it on every read, and tests/cdgdiff.js's CACR phase grades all
+ * four bit positions and both parity seeds against the live oracle.
+ *
+ * STILL NOT MODELED, because vax_sysdev.c does not model it either: CACR's CEN (cache enable) and
+ * DIAG (diagnostic mode) bits GATE NOTHING.  Nothing in cdg_rd()/cdg_wr(), or anywhere else in
+ * vax_sysdev.c, reads them back -- writeReg() below stores them and readReg() returns them, and
+ * that is the whole of their behaviour on both engines.
  */
 
 import { VAX } from "./defines.js";
@@ -52,6 +59,26 @@ const CACR_FIXED = 0x00000040;
 const CACR_CPE   = 0x00000020;
 const CACR_W1C   = CACR_CPE;
 const CACR_RW    = (0x00000010 | 0x00000004 | 0x00000002 | 0x00000001);   // CEN|DPE|WWP|DIAG
+const CACR_DRO   = 0x00FFFF00;      // diag bits, READ-ONLY to software -- only cdg_rd() writes them
+const CACR_V_DPAR = 24;             // bit position of diagnostic-parity lane 0
+
+/**
+ * parity(val, odd)
+ *
+ * vax_sysdev.c:1254-1261 -- XOR the seed with every set bit, i.e. `odd ^ (popcount(val) & 1)`.
+ * Transcribed as the loop rather than the identity so a reader can check it against the C directly.
+ *
+ * @param {number} val
+ * @param {number} odd the seed, 0 or 1
+ * @returns {number} 0 or 1
+ */
+function parity(val, odd)
+{
+    for (val = val >>> 0; val != 0; val = val >>> 1) {
+        if (val & 1) odd = odd ^ 1;
+    }
+    return odd;
+}
 
 export default class KA655VAX {
     /**
@@ -126,6 +153,53 @@ export default class KA655VAX {
     }
 
     /**
+     * setCdgDiagParity(t)
+     *
+     * vax_sysdev.c:1231-1237, the tail of cdg_rd() -- a CDG READ writes THIS register:
+     *
+     *      ka_cacr = ka_cacr & ~CACR_DRO;
+     *      ka_cacr = ka_cacr |
+     *          (parity ((t >> 24) & 0xFF, 1) << (CACR_V_DPAR + 3)) |
+     *          (parity ((t >> 16) & 0xFF, 0) << (CACR_V_DPAR + 2)) |
+     *          (parity ((t >> 8)  & 0xFF, 1) << (CACR_V_DPAR + 1)) |
+     *          (parity ( t        & 0xFF, 0) <<  CACR_V_DPAR);
+     *
+     * Note the ALTERNATING seed: bytes 3 and 1 seed odd=1, bytes 2 and 0 seed odd=0.
+     *
+     * THE PARITY BITS ACCUMULATE ACROSS READS, AND THAT IS NOT A TYPO HERE -- IT IS MEASURED.
+     * `CACR_DRO` is 0x00FFFF00, i.e. bits 8-23, while `CACR_V_DPAR` is 24: the `& ~CACR_DRO` does
+     * NOT cover the four bits the next line ORs in, so they are never cleared and the register ends
+     * up holding the OR of every longword ever read.  A careful reader predicts the opposite (the
+     * clear reads as if it were meant to reset the parity field), so this is not taken on faith:
+     * tests/cdgdiff.js's CACR-ACCUM cases read two DIFFERENT longwords in sequence and compare the
+     * resulting CACR against the live oracle, which returns 0x0F000000 where a non-accumulating
+     * implementation returns 0x05000000.  Getting this "right" by clearing the parity bits too is
+     * a real, catchable defect -- it is that file's CACR-DRO-MASK-WIDENED mutation.
+     *
+     * A consequence: `& ~CACR_DRO` is behaviourally INERT, because nothing on either engine ever
+     * SETS a bit in 8-23 (ka_wr writes bits 0-6; this function writes 24-27).  It is reproduced
+     * anyway, because the C does it, and cdgdiff.js asserts the inertness premise live on every
+     * CACR case rather than leaving it as a claim in a comment.
+     *
+     * The seeds, the bit positions and the DRO clear mask are class data rather than four
+     * hand-written lines so that tests/cdgdiff.js's --selfcheck can PERTURB the shipped computation
+     * -- invert one lane's seed, swap two lanes' bit positions, widen the clear mask -- instead of
+     * substituting its own copy of it (standing rule 11).
+     *
+     * @this {KA655VAX}
+     * @param {number} t the longword cdg_rd() just returned
+     */
+    setCdgDiagParity(t)
+    {
+        let cacr = this.cacr & KA655VAX.CDG_DRO_CLEAR_MASK;
+        for (let i = 0; i < 4; i++) {
+            let b = (t >>> (i * 8)) & 0xFF;
+            cacr |= parity(b, KA655VAX.CDG_DPAR_SEEDS[i]) << (CACR_V_DPAR + KA655VAX.CDG_DPAR_SHIFTS[i]);
+        }
+        this.cacr = cacr | 0;
+    }
+
+    /**
      * readLong(addr) / readWord(addr) / readByte(addr) / writeLong(addr, val) / writeWord(addr, val)
      * / writeByte(addr, val) -- `addr` is absolute physical, offset from KABASE by the caller
      * (regblock.js's makeRegController() passes the FULL address; `rg = addr >>> 2` here assumes
@@ -155,3 +229,16 @@ export default class KA655VAX {
     writeWord(addr, val) { return this.writeReg(((addr >>> 0) - KA_BASE) >>> 2, val | 0, (addr & 3) === 0); }
     writeByte(addr, val) { return this.writeReg(((addr >>> 0) - KA_BASE) >>> 2, val | 0, (addr & 3) === 0); }
 }
+
+/*
+ * cdg_rd()'s four diagnostic-parity lanes, as data.  Lane `i` takes byte `i` of the longword just
+ * read, seeds parity() with CDG_DPAR_SEEDS[i] (vax_sysdev.c's ALTERNATING 0/1/0/1 -- bytes 3 and 1
+ * seed odd=1, bytes 2 and 0 seed odd=0), and lands at bit CACR_V_DPAR + CDG_DPAR_SHIFTS[i].
+ * CDG_DRO_CLEAR_MASK is cdg_rd()'s `ka_cacr & ~CACR_DRO`.  See setCdgDiagParity() for why these
+ * are class data and not four inline lines.
+ */
+KA655VAX.CDG_DPAR_SEEDS  = [0, 1, 0, 1];
+KA655VAX.CDG_DPAR_SHIFTS = [0, 1, 2, 3];
+KA655VAX.CDG_DRO_CLEAR_MASK = ~CACR_DRO;
+
+export { KA_BASE, CACR_DRO, CACR_V_DPAR };
