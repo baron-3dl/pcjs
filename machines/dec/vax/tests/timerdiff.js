@@ -132,7 +132,7 @@ import { VAX } from "../modules/v2/defines.js";
 import CPUStateVAX from "../modules/v2/cpustate.js";
 import { OPCODES } from "../modules/v2/drom.js";
 import { SCB, MT, PSL_V_IPL, IPL_HMIN } from "../modules/v2/exc.js";
-import ClkVAX, { IPL_CLK_ABS, INT_V_CLK, INSTRS_PER_TICK } from "../modules/v2/clk.js";
+import ClkVAX, { IPL_CLK_ABS, INT_V_CLK, INSTRS_PER_TICK, ROM_MASK, ROM_TAG, TOY_MAX_SECS, dayOfYear } from "../modules/v2/clk.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -724,6 +724,37 @@ function caseTodrOverflowBoundary(bin, scratch, failures)
         if ((js.R0 >>> 0) !== (expect >>> 0)) failures.push(`${tag}: JS R0=${hex(js.R0)}, expected ${hex(expect)}`);
         if ((simh.R0 >>> 0) !== (expect >>> 0)) failures.push(`${tag}: SIMH R0=${hex(simh.R0)}, expected ${hex(expect)}`);
     }
+
+    /*
+     * MEASURED CORRECTION (veracity re-dispatch round 4): vax_stddev.c's overflow branch is
+     * `return todr_reg = 0` -- an ASSIGNMENT, not just a return -- and the R0-only checks above
+     * cannot see that: a mutation that keeps `return 0` but drops the `this.todrReg = 0` write
+     * passes every assertion above (R0 is still 0 either way).  Measured live: after the
+     * overflowing read, the real oracle's RAW register is ALSO 0 (`examine CLK TODR` reads 0, not
+     * merely the MFPR result) -- compared here cross-engine, catching the assignment specifically.
+     */
+    {
+        let tag = "todr_overflow_register_zeroed";
+        let code = asm(mtpr(AT, MT.TODR), mfpr(MT.TODR, 0));
+        let L = ["set cpu 16m", "set cpu simhalt", "reset all", "deposit MAPEN 0"];
+        for (let i = 0; i < code.length; i++) L.push(`deposit -b ${hex(R_CODE + i)} ${code[i].toString(16)}`);
+        L.push(`deposit PSL 0`, `deposit PC ${hex(R_CODE)}`, "step 2", "examine -h CLK TODR", "exit");
+        let out = runSimh(bin, L.join("\n") + "\n", path.join(scratch, `timerdiff-${tag}.ini`));
+        let m = /^TODR:\s*([0-9A-Fa-f]+)/m.exec(out);
+        if (!m) throw new Error(`timerdiff: case ${tag} -- SIMH did not report CLK TODR; output:\n${out}`);
+        let simhTodrAfter = parseInt(m[1], 16) >>> 0;
+
+        let {bus, cpu, clk} = makeMachine();
+        for (let i = 0; i < code.length; i++) bus.setByte(R_CODE + i, code[i]);
+        cpu.psl = 0;
+        cpu.setPC(R_CODE);
+        cpu.stepCPU(2);
+        let jsTodrAfter = clk.todrReg >>> 0;
+
+        if (simhTodrAfter !== 0) failures.push(`${tag}: oracle's own raw TODR is ${hex(simhTodrAfter)} after the overflowing read, expected 0 -- test premise broken`);
+        if (jsTodrAfter !== 0) failures.push(`${tag}: JS raw todrReg=${hex(jsTodrAfter)} after the overflowing read, expected 0 (the assignment side-effect of \`return todr_reg = 0\` did not happen)`);
+    }
+
     covered.todrNonRom = true;
     covered.todrWrite = true;
 }
@@ -745,18 +776,43 @@ function caseTodrOverflowBoundary(bin, scratch, failures)
  *     that, unconditionally -- still the same time-independent claim caseRomVsNonRomRawDiscriminator
  *     makes, just against a LIVE resync value instead of a hand-picked one)
  *   - the non-ROM read is also != 0 (still running, not accidentally "stopped")
- *   - MEASURED CORRECTION (veracity re-dispatch round 2): a BOUNDED cross-engine delta -- NOT
- *     bit-exact equality, but |simhRom.r0 - jsRom.r0| < DELTA_TOL -- IS available and was left
- *     ungraded in the first version, on the (correct but incomplete) grounds that EXACT agreement
- *     is impossible.  The two engines' resync anchors differ only by real process-start skew
- *     (measured directly: 80 centiseconds between two back-to-back invocations); DELTA_TOL=500cs
- *     (5 real seconds) is generous against that skew and astronomically tighter than the class of
- *     bug this catches -- the round-1 DST day-count bug this same round fixed in clk.js's
- *     resync() diverged by 8,640,000 centiseconds (24 hours) and would have sailed through the
- *     shape checks above (still !=0, still >=0x10000000, still self-consistent) while failing
- *     THIS assertion by four orders of magnitude.  This is the same "genuine impossibility used to
- *     justify a weaker check than what is actually available" pattern the round-1 review caught
- *     elsewhere on this item -- fixed here rather than repeated.
+ *   - a BOUNDED cross-engine delta -- NOT bit-exact equality, but a delta bounded by the ACTUAL
+ *     MEASURED real time the comparison took, not a fixed guess (see below)
+ *
+ * MEASURED CORRECTION (veracity re-dispatch round 3): round 2 added the bounded-delta idea with a
+ * FIXED DELTA_TOL=500, justified as "generous against measured process-start skew (~80cs)" -- but
+ * that 80cs was a measurement of a single BACK-TO-BACK MTPR/MFPR pair (checkTodrRunning()), not of
+ * what this function actually spans.  The ORIGINAL version of this function measured simhRom,
+ * THEN spawned SIMH AGAIN for simhNonRom, and only THEN built jsRom -- so the compared delta
+ * covered TWO FULL SIMH PROCESS LIFETIMES, and scales with host load: measured 123-130cs light,
+ * 241-455cs at load average 40, 330-867cs at load average 91 (15 of 20 trials over 500).  HANDOFF.md
+ * 11 forbids the obvious fix (widen the tolerance) -- a wider fixed number is still a blind guess,
+ * just a more generous one, and would eventually be wrong again under different load.
+ *
+ * THE FIX: bracket EACH engine's resync as tightly as the process model allows, and size the
+ * tolerance from the ACTUAL MEASURED bracket width, the same "measured elapsed, not assumed"
+ * technique caseTodrRate() already uses for its own real-time comparison.  `t0`/`t1` bracket the
+ * SIMH ROM probe's ENTIRE process lifetime (spawn through exit); the JS machine is then built
+ * IMMEDIATELY afterward (a few microseconds, synchronous), so its resync instant is essentially
+ * `t1`.  SIMH's OWN resync instant is somewhere inside `[t0, t1]` -- unknown exactly, but bounded:
+ * the true elapsed time between the two resyncs is therefore AT MOST `t1 - t0` (worst case: SIMH
+ * resynced at t0) and AT LEAST ~0 (best case: SIMH resynced right at t1).  `NOISE` covers JS-side
+ * scheduling/GC jitter on top of that bound.  This tolerance now WIDENS under load exactly as far
+ * as the actual measured bracket widens, and TIGHTENS when the host is idle -- not a blind guess
+ * in either direction -- while still catching the round-1 DST day-count bug (8,640,000cs) by five
+ * or more orders of magnitude even at the worst measured load in this item's own history.
+ *
+ * ROM and non-ROM each get their OWN bracket and their OWN JS probe built immediately after it
+ * (interleaved: simh-rom, js-rom, simh-nonrom, js-nonrom), rather than the original's "both SIMH
+ * calls, then both JS calls" ordering, which is what created the two-lifetime gap in the first
+ * place.
+ *
+ * DISCLOSED, NOT GUARDED: the resync formula encodes seconds-since-Jan-1 LOCAL time, so two
+ * engines whose resync instants straddle a local New Year midnight would differ by ~3.15e9
+ * centiseconds even though only milliseconds of real time separated them.  Not guarded against --
+ * this file's own runs take well under a second end to end, so the only way to hit it is running
+ * this exact differential within a few hundred milliseconds of local midnight on December 31st,
+ * a coincidence not worth defending against -- but it is a real, disclosed limit of this bound.
  *
  * @param {string} bin
  * @param {string} scratch
@@ -767,36 +823,39 @@ function caseBareTodrAfterReset(bin, scratch, failures)
     let tag = "todr_bare_after_reset";
     let readCode = mfpr(MT.TODR, 0);
 
-    function probe(execAddr, writeAddr, extraLines) {
+    function probeSimh(execAddr, writeAddr, label) {
         let L = ["set cpu 16m", "set cpu simhalt", "reset all", "deposit MAPEN 0"];
         for (let i = 0; i < readCode.length; i++) L.push(`deposit -b ${hex(writeAddr + i)} ${readCode[i].toString(16)}`);
         L.push(`deposit PSL 0`, `deposit PC ${hex(execAddr)}`, "step 1",
             "examine -h R0", "examine -h CLK TODR", "examine -h CLK BLOW", "exit");
-        let out = runSimh(bin, L.join("\n") + "\n", path.join(scratch, `timerdiff-${tag}-${extraLines}.ini`));
+        let out = runSimh(bin, L.join("\n") + "\n", path.join(scratch, `timerdiff-${tag}-${label}.ini`));
         let r0 = /^R0:\s*([0-9A-Fa-f]+)/m.exec(out);
         let todr = /^TODR:\s*([0-9A-Fa-f]+)/m.exec(out);
         let blow = /^BLOW:\s*([0-9A-Fa-f]+)/m.exec(out);
         if (!r0 || !todr || !blow) throw new Error(`timerdiff: case ${tag} -- incomplete SIMH output:\n${out}`);
         return {r0: parseInt(r0[1], 16) >>> 0, todr: parseInt(todr[1], 16) >>> 0, blow: parseInt(blow[1], 16) & 1};
     }
-
-    let simhRom = probe(ROM_CODE_ADDR, ROM_CODE_ADDR, "rom");
-    let simhNonRom = probe(R_CODE, R_CODE, "nonrom");
-
-    let jsRom = (() => {
-        let m = makeMachineWithRom();
-        for (let i = 0; i < readCode.length; i++) m.bus.setByteDirect(ROM_CODE_ADDR + i, readCode[i]);
-        m.cpu.setPC(ROM_CODE_ADDR);
+    function probeJs(makeFn, addr, direct) {
+        let m = makeFn();
+        for (let i = 0; i < readCode.length; i++) (direct ? m.bus.setByteDirect(addr + i, readCode[i]) : m.bus.setByte(addr + i, readCode[i]));
+        m.cpu.setPC(addr);
         m.cpu.stepCPU(1);
         return {r0: m.cpu.regs[0] >>> 0, todr: m.clk.todrReg >>> 0, blow: m.clk.todrBlow & 1};
-    })();
-    let jsNonRom = (() => {
-        let m = makeMachine();
-        for (let i = 0; i < readCode.length; i++) m.bus.setByte(R_CODE + i, readCode[i]);
-        m.cpu.setPC(R_CODE);
-        m.cpu.stepCPU(1);
-        return {r0: m.cpu.regs[0] >>> 0, todr: m.clk.todrReg >>> 0, blow: m.clk.todrBlow & 1};
-    })();
+    }
+
+    const NOISE = 50;   // centiseconds; covers JS-side scheduling/GC jitter on top of the measured bracket
+
+    let t0 = Date.now();
+    let simhRom = probeSimh(ROM_CODE_ADDR, ROM_CODE_ADDR, "rom");
+    let t1 = Date.now();
+    let jsRom = probeJs(makeMachineWithRom, ROM_CODE_ADDR, true);
+    let romTol = Math.round((t1 - t0) / 10) + NOISE;
+
+    let t2 = Date.now();
+    let simhNonRom = probeSimh(R_CODE, R_CODE, "nonrom");
+    let t3 = Date.now();
+    let jsNonRom = probeJs(makeMachine, R_CODE, false);
+    let nonRomTol = Math.round((t3 - t2) / 10) + NOISE;
 
     for (let [label, r] of [["simh ROM", simhRom], ["simh non-ROM", simhNonRom], ["js ROM", jsRom], ["js non-ROM", jsNonRom]]) {
         if (r.blow !== 0) failures.push(`${tag}: ${label} BLOW=${r.blow}, expected 0 (resync must clear it)`);
@@ -807,15 +866,15 @@ function caseBareTodrAfterReset(bin, scratch, failures)
     if ((jsRom.r0 >>> 0) < 0x10000000) failures.push(`${tag}: js ROM R0=${hex(jsRom.r0)} below 0x10000000 -- resync's formula shape not reproduced`);
     if ((simhRom.r0 >>> 0) < 0x10000000) failures.push(`${tag}: simh ROM R0=${hex(simhRom.r0)} below 0x10000000 -- test premise broken`);
 
-    /* Bounded cross-engine delta -- see the doc comment above for why 500cs is generous against
-       measured process-start skew (~80cs) yet would have caught the round-1 DST day-count bug
-       (8,640,000cs) by four orders of magnitude. */
-    const DELTA_TOL = 500;
-    let delta = Math.abs((simhRom.r0 >>> 0) - (jsRom.r0 >>> 0));
-    if (delta > DELTA_TOL) {
-        failures.push(`${tag}: |simh ROM R0 - js ROM R0| = ${delta} centiseconds, exceeds ${DELTA_TOL} ` +
-            `(simh=${hex(simhRom.r0)} js=${hex(jsRom.r0)}) -- power-on resync anchors have diverged ` +
-            `far beyond ordinary process-start skew`);
+    let romDelta = Math.abs((simhRom.r0 >>> 0) - (jsRom.r0 >>> 0));
+    if (romDelta > romTol) {
+        failures.push(`${tag}: ROM |simh R0 - js R0| = ${romDelta} centiseconds, exceeds measured-elapsed tolerance ${romTol} ` +
+            `(bracket ${t1 - t0}ms, simh=${hex(simhRom.r0)} js=${hex(jsRom.r0)})`);
+    }
+    let nonRomDelta = Math.abs((simhNonRom.r0 >>> 0) - (jsNonRom.r0 >>> 0));
+    if (nonRomDelta > nonRomTol) {
+        failures.push(`${tag}: non-ROM |simh R0 - js R0| = ${nonRomDelta} centiseconds, exceeds measured-elapsed tolerance ${nonRomTol} ` +
+            `(bracket ${t3 - t2}ms, simh=${hex(simhNonRom.r0)} js=${hex(jsNonRom.r0)})`);
     }
 
     covered.todrRom = true;
@@ -1067,6 +1126,21 @@ const MUTATIONS = {
             return Math.round(elapsedMs / 10) | 0;
         };
         return () => { ClkVAX.prototype.todrRd = orig; };
+    },
+    /* vax_stddev.c's overflow branch is `return todr_reg = 0` -- an ASSIGNMENT.  This mutation
+       keeps the RETURN VALUE (0, so any R0-only check still passes) but drops the register write,
+       exactly the gap caseTodrOverflowBoundary()'s dedicated register-comparison closes. */
+    "overflow_return_only_no_assignment"() {
+        let orig = ClkVAX.prototype.todrRd;
+        ClkVAX.prototype.todrRd = function() {
+            let pc = (this.exc && typeof this.exc.faultPC === "number") ? (this.exc.faultPC >>> 0) : 0;
+            if (((pc & ROM_MASK) >>> 0) === ROM_TAG) return this.todrReg | 0;
+            if (this.todrReg === 0) return 0;
+            let elapsedMs = Date.now() - this.wallBaseMs;
+            if (elapsedMs / 1000 >= TOY_MAX_SECS) return 0;   // no `this.todrReg = 0` here
+            return Math.round(elapsedMs / 10) | 0;
+        };
+        return () => { ClkVAX.prototype.todrRd = orig; };
     }
 };
 
@@ -1169,6 +1243,64 @@ function selfcheck(bin, scratch)
            The mutation's bug signature is r0 === n (it wrongly took the raw/ROM branch there) --
            "caught" means this check actually observed that wrong value. */
         results.push({name: "rom_mask_includes_mirror", caught: r0 === n});
+    }
+    {
+        /* M10: the overflow branch's ASSIGNMENT side-effect (`return todr_reg = 0`) dropped,
+           keeping only the return value.  R0-only checks cannot see this; the raw register can. */
+        let restore = MUTATIONS.overflow_return_only_no_assignment();
+        let {cpu, clk} = makeMachine();
+        clk.write(MT.TODR, 0xFFFFFFA1 | 0);
+        let addr = R_CODE;
+        let code = mfpr(MT.TODR, 0);
+        for (let i = 0; i < code.length; i++) cpu.bus.setByte(addr + i, code[i]);
+        cpu.psl = 0;
+        cpu.setPC(addr);
+        cpu.stepCPU(1);
+        let r0 = cpu.regs[0] >>> 0;
+        let todrRegAfter = clk.todrReg >>> 0;
+        restore();
+        /* R0 is 0 either way (that is the whole point of this mutation); only the raw register
+           distinguishes correct (todrRegAfter===0) from the mutation (todrRegAfter still 0xFFFFFFA1). */
+        results.push({name: "overflow_return_only_no_assignment", caught: r0 === 0 && todrRegAfter !== 0});
+    }
+    {
+        /*
+         * M12/M13 (veracity re-dispatch round 4): the round-3 DST fix (dayOfYear(), a leap-year-
+         * aware calendar walk replacing a DST-broken ms-division) had NO regression guard --
+         * reverting to the ms-division, or dropping the leap-year adjustment, both SURVIVE the
+         * rest of this file's checks, because they are unreachable on this host (UTC, no DST, and
+         * today is not Dec 31) and the bounded-delta assertion cannot help (both engines agree
+         * under UTC).  This asserts the SHIPPED dayOfYear() directly (not a monkey-patched mutant
+         * -- dayOfYear is a plain function export, not a prototype method, so there is nothing to
+         * monkey-patch from outside the module) against a table of known (TZ, local instant) ->
+         * day-of-year pairs, computed independently via Date.UTC's ms-division of the SAME
+         * calendar date (safe: UTC has no DST, so this cross-check does not share dayOfYear()'s
+         * own failure mode).  Covers: a spring-forward-affected instant (catches M12: reverting to
+         * ms-division), a fall-back-affected instant (same), a plain leap year, a century
+         * non-leap year (1900) and a century leap year (2000) (catches M13: dropping the
+         * `%400===0` leap-year term or the leap adjustment entirely).
+         */
+        let dayOfYearFailures = [];
+        const YDAY_CASES = [
+            {tz: "America/New_York", y: 2026, mo: 2, d: 9, h: 0, mi: 30, note: "spring-forward-affected"},
+            {tz: "America/New_York", y: 2026, mo: 10, d: 2, h: 1, mi: 30, note: "fall-back-affected"},
+            {tz: "UTC", y: 2024, mo: 11, d: 31, h: 12, mi: 0, note: "leap year"},
+            {tz: "UTC", y: 1900, mo: 11, d: 31, h: 12, mi: 0, note: "century non-leap"},
+            {tz: "UTC", y: 2000, mo: 11, d: 31, h: 12, mi: 0, note: "century leap"}
+        ];
+        let origTz = process.env.TZ;
+        for (let c of YDAY_CASES) {
+            process.env.TZ = c.tz;
+            let d = new Date(c.y, c.mo, c.d, c.h, c.mi, 0, 0);
+            let got = dayOfYear(d);
+            let expected = Math.round((Date.UTC(c.y, c.mo, c.d) - Date.UTC(c.y, 0, 1)) / 86400000);
+            if (got !== expected) {
+                dayOfYearFailures.push(`dayOfYear(TZ=${c.tz} ${c.y}-${c.mo + 1}-${c.d} ${c.h}:${c.mi}, ${c.note}): got ${got}, expected ${expected}`);
+            }
+        }
+        if (origTz === undefined) delete process.env.TZ; else process.env.TZ = origTz;
+        for (let f of dayOfYearFailures) console.log(`  ${f}`);
+        results.push({name: "dayOfYear_table (M12/M13 guard)", caught: dayOfYearFailures.length === 0});
     }
     let allCaught = results.every((r) => r.caught);
     return {results, allCaught};
