@@ -890,7 +890,7 @@ export default class BusVAX extends Component {
      * setFaultHandler(fn)
      *
      * @this {BusVAX}
-     * @param {function(number,number)|null} fn
+     * @param {function(number,number,boolean)|null} fn
      */
     setFaultHandler(fn)
     {
@@ -898,15 +898,25 @@ export default class BusVAX extends Component {
     }
 
     /**
-     * fault(addr, access)
+     * fault(addr, access, fNoBto)
      *
      * Bus interface for signaling non-existent memory.
+     *
+     * `fNoBto` (pcjsvax-622) distinguishes vax_sysdev.c's TWO machine-check origins, which the ROM
+     * can tell apart by reading the SSC bus-timeout register: ReadReg()/WriteReg()'s undecoded
+     * fall-through sets `ssc_bto |= SSCBTO_BTO | SSCBTO_RWT` and THEN machine-checks (:1031,
+     * :1070), while a register handler that raises `MACH_CHECK()` itself -- cmctl_rd()'s register
+     * 18 -- never touches ssc_bto.  It defaults to false, so every existing caller keeps exactly
+     * the fall-through behaviour it had; regblock.js's REG_MCHK path is the only caller that passes
+     * true.  MEASURED on the live oracle: REG+0x148 machine-checks with BTO = 00000000, REG+0x14C
+     * (undecoded) with BTO = C0000000.
      *
      * @this {BusVAX}
      * @param {number} addr
      * @param {number} [access] (a VAX.ACCESS value, for diagnostic purposes only)
+     * @param {boolean} [fNoBto] true to suppress the SSC bus-timeout bits -- see above
      */
-    fault(addr, access)
+    fault(addr, access, fNoBto)
     {
         this.fFault = true;
         this.nFaults++;
@@ -915,7 +925,7 @@ export default class BusVAX extends Component {
             if (DEBUGGER && this.dbg) {
                 this.dbg.printf(MESSAGE.FAULT + MESSAGE.ADDR, "memory fault (%#x) on %#010x\n", access, addr >>> 0);
             }
-            if (this.fnFault) this.fnFault(this.addrFault, access);
+            if (this.fnFault) this.fnFault(this.addrFault, access, !!fNoBto);
         }
     }
 

@@ -441,7 +441,12 @@ export default class CPUStateVAX extends Component {
     {
         this.bus = bus;
         this.mmu = new MMUVAX(bus);
-        bus.setFaultHandler((addr, access) => this.onBusFault(addr, access));
+        /* All THREE arguments are forwarded.  A two-argument lambda here silently dropped
+           onBusFault()'s `fNoBto` (pcjsvax-622) and turned every handler-raised machine check back
+           into an undecoded-address one, complete with the SSC bus-timeout bits the oracle leaves
+           clear -- caught by tests/cmctldiff.js on its first run, which is the whole argument for
+           grading through real CPU execution rather than by calling the device accessor. */
+        bus.setFaultHandler((addr, access, fNoBto) => this.onBusFault(addr, access, fNoBto));
     }
 
     /**
@@ -487,14 +492,31 @@ export default class CPUStateVAX extends Component {
      * cannot be recomputed there.  A deferred write never reaches takeFault() at all, so `delta`
      * is irrelevant there -- nothing is thrown.
      *
+     * A THIRD mechanism arrives here as `fNoBto` (pcjsvax-622): a register handler that IS reached
+     * and raises `MACH_CHECK()` ITSELF, without vax_sysdev.c's fall-through `ssc_bto |= SSCBTO_BTO
+     * | SSCBTO_RWT`.  cmctl_rd()/cmctl_wr()'s register 18 is the first such case; regblock.js's
+     * REG_MCHK is how a sub-device asks for it, and is the only caller that sets the flag.  The
+     * difference is observable -- the ROM can read the bus-timeout register -- and is graded on
+     * both engines by tests/cmctldiff.js's EXT and SPAN phases, which read BTO back after the
+     * check.  Everything else about the fault is IDENTICAL, which is why the machine-check code
+     * still comes from exc.js (machineCheckCode(), the half of busTimeout() that is shared) rather
+     * than being recomputed here.
+     *
+     * `fWrite` is a MASK test, not an equality test: MemoryVAX.writeNone() reports the bare
+     * VAX.ACCESS.WRITE, while regblock.js's REG_MCHK path reports the sized WRITE_BYTE/WRITE_WORD/
+     * WRITE_LONG.  Every VAX.ACCESS.WRITE_* value is WRITE|size and no READ_* value has the WRITE
+     * bit, so the mask answers both, and answers identically to the equality test for every caller
+     * that predates this change.
+     *
      * @this {CPUStateVAX}
      * @param {number} addr
-     * @param {number} access one of VAX.ACCESS.* -- VAX.ACCESS.WRITE for a write, otherwise a read
+     * @param {number} access one of VAX.ACCESS.* -- any WRITE/WRITE_* value for a write
+     * @param {boolean} [fNoBto] true for the handler-raised machine check described above
      */
-    onBusFault(addr, access)
+    onBusFault(addr, access, fNoBto)
     {
         let a = addr >>> 0;
-        let fWrite = access === VAX.ACCESS.WRITE;
+        let fWrite = (access & VAX.ACCESS.WRITE) !== 0;
         if (VAX.isQbusAddr(a)) {
             this.exc.cqMerr(a);
             if (fWrite) {
@@ -504,7 +526,7 @@ export default class CPUStateVAX extends Component {
             let delta = (this.regs[nPC] - this.exc.faultPC) | 0;
             throw new VAXFault(-SCB.MCHK, MCHK_READ, delta);
         }
-        let p1 = this.exc.busTimeout(fWrite);
+        let p1 = fNoBto ? this.exc.machineCheckCode(fWrite) : this.exc.busTimeout(fWrite);
         let delta = (this.regs[nPC] - this.exc.faultPC) | 0;
         throw new VAXFault(-SCB.MCHK, p1, delta);
     }
