@@ -1611,6 +1611,32 @@ const BODIES = {
      */
     HALT(decoder, cpu) {
         if (cpu.psl & PSL_CUR) throw new VAXFault(VAXFAULT.RESIN);
+        /*
+         * vax_cpu.c:2643-2652, and it is NOT a detail of SCP -- it is part of the HALT INSTRUCTION:
+         *
+         *      while ((sim_clock_queue != QUEUE_LIST_END) &&
+         *             ((sim_clock_queue->flags & UNIT_IDLE) == 0)) {
+         *          sim_interval = 0; temp = sim_process_event (); ... }
+         *
+         * "allow potentially pending I/O to complete before taking the halt action".  Every queued
+         * unit that is not UNIT_IDLE is SERVICED immediately, regardless of how much of its delay
+         * remains.  MEASURED on the live oracle (pcjsvax-c2c): drive the controller to CST_UP, read
+         * IP to start a host poll (scheduled QTIME == 100 instructions out), then HALT FOUR
+         * instructions later -- and `EXAMINE RQ PIP` reads 0, i.e. the poll ran.  Same answer at
+         * every delay from 0 to 400 and under both `step` and `go`.
+         *
+         * This is why HANDOFF.md's note that "a HALT drains SIMH's event queue" is a statement about
+         * the CPU rather than about the console, and why a differential CANNOT observe a pre-event
+         * state by halting early: the halt itself completes the event.
+         *
+         * Only `cpu.qbus` is drained, and that is the C's OWN restriction rather than a shortcut:
+         * SIMH's clock and interval-timer units carry UNIT_IDLE, so the C's loop STOPS at them --
+         * and in this tree `clk`/`tmr` are per-instruction ticks with no queue entry at all, so
+         * there is nothing there to drain either way.  `cpu.qbus` is null in every machine that has
+         * no Qbus event-queue device, which today is every machine except the one
+         * tests/mscpinitdiff.js builds, so this is a no-op everywhere else.
+         */
+        if (cpu.qbus && cpu.qbus.drainOnHalt) cpu.qbus.drainOnHalt(cpu);
         throw new VAXStop(VAXStop.REASON.HALT);
     },
 

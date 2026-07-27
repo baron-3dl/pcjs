@@ -54,16 +54,30 @@
  * TQ, LPT -- real SIMH devices this project implements none of), which PHASE W needs in order to
  * exclude them BY NAME rather than mistake them for a decode this machine is missing.
  *
- * PHASE W IS THE BEACHHEAD ASSERTION
- * ------------------------------------
- * Decoding the Qbus I/O page at all is new (bus.js's addIoPage()), and the item's scope is "the
- * doorbell ONLY -- every other I/O page address must keep bus-faulting exactly as it does today, and
- * that must be asserted, not assumed."  PHASE W probes a programmatically derived address set --
- * the window's own bytes, its immediate neighbours, tests/mchkdiff.js's OWN candidatesFor() pool for
- * this range (imported, not re-derived), and a stride sweep of the whole page -- and requires that
- * the set of addresses THIS MACHINE decodes inside the I/O page is EXACTLY the doorbell window.
- * Against the oracle it requires identical classification at every probed address except those
- * inside a PHASE A device window, which are excluded by name and counted.
+ * PHASE W IS THE BEACHHEAD ASSERTION, AND IT NOW GUARDS TWO WINDOWS
+ * ------------------------------------------------------------------
+ * Decoding the Qbus I/O page at all was new with pcjsvax-b8a, and its scope was "the doorbell ONLY
+ * -- every other I/O page address must keep bus-faulting exactly as it does today, and that must be
+ * asserted, not assumed."  pcjsvax-c2c added the SECOND window on that page, modules/v2/rq.js's
+ * RQDX3 controller at 0x20001468..0x2000146B, and this phase is the assertion that would otherwise
+ * have silently become "one window plus whatever else showed up."
+ *
+ * The widening is PRECISE, not a relaxation.  `IOPAGE_WINDOWS` below is the single list of every
+ * window this tree decodes on the Qbus I/O page, with the base and length taken from the owning
+ * MODULE's constants.  It drives three things that used to be written for one window each: the probe
+ * set (every window's own bytes and its neighbours), the EXPECTED decoded set, and which oracle
+ * device rows are excluded by name.  A THIRD, unintended range still fails the run -- it would
+ * appear in `decodedHere` and not in `expected` -- and a window that disappears fails too, from the
+ * other direction.  What changed is only that the expected set is now derived from a list rather
+ * than from one hard-coded pair of constants.
+ *
+ * The other half of the widening is the exclusion.  PHASE W excludes an oracle-backed address from
+ * comparison only when NOTHING IN THIS TREE implements the device that backs it -- and until
+ * pcjsvax-c2c, RQ was in that category.  It no longer is, so RQ's four bytes are now COMPARED
+ * against the oracle rather than skipped: `unimplementedRows` is computed by subtracting
+ * IOPAGE_WINDOWS from `SHOW QBA IOSPACE`'s rows, so implementing a device automatically moves it out
+ * of the exclusion and into the comparison instead of leaving a stale "implemented by nothing in
+ * this tree" claim behind (HANDOFF.md standing rule 12).
  *
  *      node machines/dec/vax/tests/dbldiff.js [options]
  *        --simh PATH       microvax3900 (else $SIMH_CPU_BIN/$SIMH_BIN, else the scratch build)
@@ -86,6 +100,7 @@ import { VAX } from "../modules/v2/defines.js";
 import { OPCODES } from "../modules/v2/drom.js";
 import { SCB } from "../modules/v2/exc.js";
 import CQBICVAX, { CQBIC_BASE, REG_DSER, CQDSER_SME } from "../modules/v2/cqbic.js";
+import RQVAX, { RQ_BASE, IOLN_RQ } from "../modules/v2/rq.js";
 import CQIPCVAX, {
     DBLVAX, CQIPC_BASE, CQIPC_SIZE, DBL_BASE, DBL_SIZE,
     CQIPC_QME, CQIPC_INV, CQIPC_AHLT, CQIPC_DBIE, CQIPC_LME, CQIPC_DB,
@@ -261,6 +276,18 @@ const MOUNTS = [
     {name: "REG", base: CQIPC_BASE, size: CQIPC_SIZE, space: "reg"}
 ];
 
+/**
+ * EVERY window this tree decodes on the Qbus I/O page, named, with base and length taken from the
+ * owning module's own constants.  ONE list, THREE consumers -- windowProbes(), PHASE W's expected
+ * set, and PHASE W's oracle-row exclusion -- so a new window is one entry here rather than three
+ * edits that can drift (HANDOFF.md standing rule 5).  `oracle` is the device NAME the oracle's
+ * `SHOW QBA IOSPACE` prints for the same window; PHASE A checks base and length against it.
+ */
+const IOPAGE_WINDOWS = [
+    {oracle: "QBA", base: DBL_BASE, size: DBL_SIZE, what: "the CQBIC doorbell (cqipc.js, pcjsvax-b8a)"},
+    {oracle: "RQ",  base: RQ_BASE,  size: IOLN_RQ,  what: "the RQDX3 controller (rq.js, pcjsvax-c2c)"}
+];
+
 if (DBL_SIZE !== CQIPC_SIZE) {
     throw new Error(`dbldiff: cqipc.js gives the doorbell ${DBL_SIZE} byte(s) on the Qbus and ` +
         `${CQIPC_SIZE} in register space; vaxmod_defs.h's CQIPCSIZE and vax_io.c's IOLN_DBL are ` +
@@ -280,10 +307,12 @@ if (!IOPAGE_RANGE) {
 for (let a of IOPAGE_RANGE.addrs) {
     for (let off = 0; off < 4; off++) {
         let x = (a + off) >>> 0;
-        if (x >= DBL_BASE && x < DBL_BASE + DBL_SIZE) {
-            throw new Error(`dbldiff: mchkdiff.js probes 0x${hex(x)}, which pcjsvax-b8a has now ` +
-                `decoded as part of the doorbell window -- mchkdiff's EXPECTED_CALIBRATION for ` +
-                `IOPAGE must be re-measured, and this assertion is what says so.`);
+        for (let w of IOPAGE_WINDOWS) {
+            if (x >= w.base && x < w.base + w.size) {
+                throw new Error(`dbldiff: mchkdiff.js probes 0x${hex(x)}, which is now decoded as ` +
+                    `part of ${w.what} -- mchkdiff's EXPECTED_CALIBRATION for IOPAGE must be ` +
+                    `re-measured, and this assertion is what says so.`);
+            }
         }
     }
 }
@@ -355,22 +384,33 @@ function makeMachine(opts = {})
     let cpu = new CPUStateVAX({id: "cpu"});
     cpu.setBus(bus);
     cpu.reset();
-    let cqbic = new CQBICVAX(cpu.exc);
+    /* The bus and MEMSIZE are passed (pcjsvax-c2c) only so that the RQ controller below is a REAL
+       mount rather than one whose DMA path would throw if anything reached it.  Nothing this file
+       grades performs a DMA -- PHASE W does word READS at the RQ window, which touch no memory --
+       and CQMAPVAX is deliberately still not mounted, so the CQBIC's behaviour in every phase is
+       unchanged from before. */
+    let cqbic = new CQBICVAX(cpu.exc, bus, MEMSIZE);
     let cqipc = new CQIPCVAX();
     cqbic.setIpc(cqipc);
     let dblIpc = opts.splitState ? new CQIPCVAX() : cqipc;
     let dbl = new DBLVAX(dblIpc);
+    let rq = new RQVAX(cqbic);
     bus.addRegBlock([
         {base: CQBIC_BASE, length: 0x14, dev: cqbic},
         {base: CQIPC_BASE, length: CQIPC_SIZE, dev: cqipc}
     ]);
-    bus.addIoPage([{
-        base: (DBL_BASE + (opts.dblBaseDelta || 0)) >>> 0,
-        length: (DBL_SIZE + (opts.dblSizeDelta || 0)) >>> 0,
-        dev: dbl
-    }]);
+    /* BOTH windows this tree decodes on the I/O page.  The doorbell's base and length carry
+       --selfcheck's wiring deltas; RQ's do not, because the mutations here are about the doorbell.
+       tests/mscpinitdiff.js owns RQ's own wiring mutations and its behaviour; what this file owns is
+       the RANGE assertion over the whole page, which needs RQ mounted to be true of the tree. */
+    bus.addIoPage([
+        {base: (DBL_BASE + (opts.dblBaseDelta || 0)) >>> 0,
+         length: (DBL_SIZE + (opts.dblSizeDelta || 0)) >>> 0, dev: dbl},
+        {base: RQ_BASE, length: IOLN_RQ, dev: rq}
+    ]);
+    cpu.qbus = rq;
     sampleHeap();
-    return {bus, cpu, cqbic, cqipc, dblIpc, dbl};
+    return {bus, cpu, cqbic, cqipc, dblIpc, dbl, rq};
 }
 
 /** One machine per wiring variant, built once and reused for every case and every --selfcheck pass
@@ -403,6 +443,7 @@ function runCaseJS(kase, opts = {})
     cqipc.reset();
     if (dblIpc !== cqipc) dblIpc.reset();
     cqbic.reset();
+    m.rq.powerUp();                         /* SIMH's `reset -p all` plus a fresh simulator's globals */
     cpu.exc.cqDser = 0;
     cpu.exc.cqMear = 0;
     cpu.exc.sscBto = 0;
@@ -739,7 +780,7 @@ function classify(r)
  * windowProbes()
  *
  * The address set, derived three ways and never hand-listed (rule 5):
- *   - every byte of the doorbell window and of the two words on either side of it
+ *   - every byte of EVERY window in IOPAGE_WINDOWS, and of the two words on either side of each
  *   - tests/mchkdiff.js's OWN candidate pool for this range, imported
  *   - a stride sweep of the whole page, at a stride that is a divisor of neither the page size nor
  *     the window offset, so it cannot systematically miss or hit the window
@@ -749,7 +790,9 @@ function classify(r)
 function windowProbes()
 {
     let s = new Set();
-    for (let off = -4; off < DBL_SIZE + 4; off++) s.add((DBL_BASE + off) >>> 0);
+    for (let w of IOPAGE_WINDOWS) {
+        for (let off = -4; off < w.size + 4; off++) s.add((w.base + off) >>> 0);
+    }
     for (let a of IOPAGE_RANGE.addrs) s.add(a >>> 0);
     let base = VAX.PHYSMEM.IOPAGE_BASE >>> 0, len = VAX.PHYSMEM.IOPAGE_LENGTH;
     for (let off = 0; off < len; off += 322) s.add((base + off) >>> 0);
@@ -1002,21 +1045,27 @@ function runPass(simh, opts, mutationOpts = {})
 
     /* ---- PHASE A ---- */
     let rows = opts.ioRows;
-    let qba = rows.filter((r) => r.name === "QBA");
-    if (qba.length !== 1) {
-        failures.push(`PHASE A: \`SHOW QBA IOSPACE\` lists ${qba.length} QBA row(s); exactly one is ` +
-            `the doorbell's autoconfigured window`);
-    } else {
-        let got = {base: qba[0].base, size: (qba[0].end - qba[0].base + 1) >>> 0};
-        if (got.base !== (DBL_BASE >>> 0) || got.size !== DBL_SIZE) {
-            failures.push(`PHASE A: the oracle autoconfigures the doorbell at 0x${hex(got.base)}` +
-                `..+${got.size}, cqipc.js has 0x${hex(DBL_BASE)}..+${DBL_SIZE} -- the constant and ` +
-                `the live autoconfiguration disagree`);
+    for (let w of IOPAGE_WINDOWS) {
+        let hit = rows.filter((r) => r.name === w.oracle);
+        if (hit.length !== 1) {
+            failures.push(`PHASE A: \`SHOW QBA IOSPACE\` lists ${hit.length} ${w.oracle} row(s); ` +
+                `exactly one is ${w.what}'s autoconfigured window`);
+            continue;
         }
-        report.push(`  PHASE A  oracle autoconfigures QBA at 0x${hex(got.base)} for ${got.size} ` +
-            `byte(s); cqipc.js agrees`);
+        let got = {base: hit[0].base, size: (hit[0].end - hit[0].base + 1) >>> 0};
+        if (got.base !== (w.base >>> 0) || got.size !== w.size) {
+            failures.push(`PHASE A: the oracle autoconfigures ${w.oracle} at 0x${hex(got.base)}` +
+                `..+${got.size}, this tree has 0x${hex(w.base)}..+${w.size} for ${w.what} -- the ` +
+                `constant and the live autoconfiguration disagree`);
+        }
+        report.push(`  PHASE A  oracle autoconfigures ${w.oracle} at 0x${hex(got.base)} for ` +
+            `${got.size} byte(s); ${w.what} agrees`);
     }
-    let otherWindows = rows.filter((r) => r.name !== "QBA");
+    /* SUBTRACTED, not listed: a device this tree implements must not stay on the exclusion list, or
+       PHASE W would go on skipping the addresses that are now the most interesting ones it has.
+       This is the line that made RQ move from "excluded by name" to "compared" when pcjsvax-c2c
+       landed rq.js, without anyone having to remember to edit an exclusion. */
+    let otherWindows = rows.filter((r) => !IOPAGE_WINDOWS.some((w) => w.oracle === r.name));
     report.push(`  PHASE A  ${otherWindows.length} other I/O-page device window(s) on the oracle, ` +
         `implemented by nothing in this tree: ${otherWindows.map((r) => r.name).join(", ") || "(none)"}`);
 
@@ -1050,20 +1099,26 @@ function runPass(simh, opts, mutationOpts = {})
                 failures.push(`PHASE W: 0x${hex(a)} classifies as "${cj}" here and "${cs}" on the oracle`);
             }
         }
-        /* The beachhead assertion: the ONLY thing this machine decodes inside the I/O page is the
-           doorbell window.  Stated over the probed set, and the probed set includes every byte of
-           the window and of the words on either side of it. */
+        /* The beachhead assertion: the ONLY things this machine decodes inside the I/O page are the
+           windows in IOPAGE_WINDOWS.  Stated over the probed set, and the probed set includes every
+           byte of every window and of the words on either side of each -- so a window that grew, a
+           window that moved, a window that vanished, and a THIRD range appearing anywhere the
+           stride sweep or mchkdiff's pool reaches are all failures, from one comparison. */
         let expected = [];
-        for (let off = 0; off < DBL_SIZE; off++) {
-            let a = (DBL_BASE + off) >>> 0;
-            if (win.addrs.includes(a)) expected.push(a);
+        for (let w of IOPAGE_WINDOWS) {
+            for (let off = 0; off < w.size; off++) {
+                let a = (w.base + off) >>> 0;
+                if (win.addrs.includes(a)) expected.push(a);
+            }
         }
         let ds = decodedHere.map((a) => hex(a)).sort().join(",");
         let es = expected.map((a) => hex(a)).sort().join(",");
         if (ds !== es) {
             failures.push(`PHASE W: this machine decodes {${ds || "(nothing)"}} inside the Qbus I/O ` +
-                `page, expected exactly the doorbell window {${es}} -- every other I/O-page address ` +
-                `must keep bus-faulting exactly as it did before pcjsvax-b8a`);
+                `page, expected exactly ${IOPAGE_WINDOWS.length} window(s) -- ` +
+                `${IOPAGE_WINDOWS.map((w) => w.oracle + " 0x" + hex(w.base) + "..+" + w.size).join(", ")} ` +
+                `-- i.e. {${es}}.  Every other I/O-page address must keep bus-faulting exactly as it ` +
+                `did before that page was decoded at all`);
         }
         if (comparedW < WINDOW_PROBE_FLOOR) {
             failures.push(`PHASE W: only ${comparedW} I/O-page address(es) reached comparison, below ` +

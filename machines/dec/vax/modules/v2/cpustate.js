@@ -398,6 +398,30 @@ export default class CPUStateVAX extends Component {
          */
         this.tmr = null;
 
+        /*
+         * Optional per-instruction device-service hook, or null (pcjsvax-c2c) -- a THIRD slot of the
+         * same shape as `clk` and `tmr` above, and a third for the same stated reason: SIMH schedules
+         * this device on its OWN event-queue unit (pdp11_rq.c's RQ_QUEUE, `sim_activate (units +
+         * RQ_QUEUE, rq_itime)`), unrelated to vax_stddev.c's clk_svc or vax_sysdev.c's tmr_svc.
+         * Folding it into either existing slot would silently coordinate two devices that have no
+         * relationship on real hardware -- see `tmr`'s own comment, which this one mirrors.
+         *
+         * WHAT MAKES THIS HOOK EXACT RATHER THAN APPROXIMATE: it is called at the same point in the
+         * same loop as vax_cpu.c:659's `if (sim_interval <= 0) sim_process_event ();`, and
+         * `nTotalCycles` at that point is the sum over every PREVIOUS instruction of the same
+         * `1 + (extra_bytes >> 5)` that vax_cpu.c:729 charges to sim_interval.  So a device that
+         * schedules against `nTotalCycles + delay` and fires on `nTotalCycles >= deadline` fires on
+         * exactly the instruction SIMH fires on -- measured, not asserted: tests/mscpinitdiff.js
+         * grades the host-visible POLLING ITERATION COUNT at which each answer becomes visible, and
+         * the oracle's own counts (90 against ITIME 450, 2 against I4TIME 10) are what it compares to.
+         *
+         * As with `clk` and `tmr`: a machine builder wires it in, reset() does NOT touch it (a
+         * device's identity is not CPU state), and it is called from exactly one place, stepCPU()'s
+         * loop, immediately after `tmr`'s call.  One slot, so a machine with two such devices
+         * combines them behind one object the way iprdevice.js's makeIprDevice() does.
+         */
+        this.qbus = null;
+
         this.decoder = new VAXDecoder(this);
         this.exc = new VAXExc(this);
         this.fpu = new VAXFloat(this);
@@ -983,6 +1007,10 @@ export default class CPUStateVAX extends Component {
             /* pcjsvax-055: SSCVAX's T0/T1 timers -- a SECOND, independent per-instruction hook; see
                the `tmr` property's own doc comment above for why this is not folded into `clk`'s. */
             if (this.tmr) this.tmr.tick(this);
+
+            /* pcjsvax-c2c: the Qbus device event queue (rq.js's RQ_QUEUE unit) -- a THIRD,
+               independent per-instruction hook; see the `qbus` property's own doc comment. */
+            if (this.qbus) this.qbus.tick(this);
 
             /*
              * vax_cpu.c:729-730.  `sim_interval` is charged BEFORE the fetch, and `extra_bytes`

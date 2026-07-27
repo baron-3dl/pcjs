@@ -69,16 +69,20 @@
  * SCOPE -- THIS IS A QBUS I/O-PAGE BEACHHEAD AND THE WINDOW IS TWO BYTES
  * ============================================================================
  * Nothing in this tree decoded the Qbus I/O page before this file; the whole IOPAGE range sat in
- * BusVAX.RESERVED as reserved-but-undecoded.  bus.js's addIoPage() now installs ONE controller over
- * it, and the ONLY sub-device mounted is DBLVAX, over CQIPCSIZE == 2 bytes.  Every other I/O-page
+ * BusVAX.RESERVED as reserved-but-undecoded.  bus.js's addIoPage() installs ONE controller over it,
+ * and the sub-device this file owns is DBLVAX, over CQIPCSIZE == 2 bytes.  Every other I/O-page
  * address keeps falling through to MemoryVAX.readNone()/writeNone() -- the identical path it took
  * before this file existed, which is vax_io.c's ReadQb()/WriteQb() unbacked case (cq_merr() plus,
  * for reads only, a machine check that never touches ssc_bto; cpustate.js's onBusFault() routes it
  * by address).  tests/dbldiff.js PROBES that window on both engines rather than asserting it, and
  * tests/cqmerrdiff.js -- which grades exactly the unbacked Qbus mechanism -- must stay green.
  *
- * pcjsvax-c2c (MSCP initialisation) will later need 0x20001468..0x2000146B on this same page; the
- * seam is left usable for it and is deliberately NOT built here.
+ * SINCE pcjsvax-c2c THERE IS A SECOND WINDOW on this page: modules/v2/rq.js's RQDX3 controller at
+ * 0x20001468..0x2000146B, built on this same seam and mounted the same way.  It is a separate
+ * device with separate state; what the two share is the ONE controller addIoPage() installs and the
+ * fall-through that leaves the other 8186 bytes faulting.  tests/dbldiff.js's PHASE W is the
+ * assertion that the decoded set is exactly those two windows and nothing else, and it derives that
+ * set from a list rather than from a constant so a third window cannot slip in unnamed.
  *
  * WHAT THIS FILE DOES *NOT* USE, stated because it looks like it should: regblock.js's `REG_MCHK`
  * (pcjsvax-622).  That answer exists for a handler that IS reached and raises MACH_CHECK() itself
