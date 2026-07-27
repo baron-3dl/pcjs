@@ -80,6 +80,14 @@
  * directly, confirming the suite FAILS, then restoring and confirming the file byte-identical --
  * that is what actually closes a coverage gap; a selfcheck mutation is corroboration, not evidence.
  *
+ * pcjsvax-7fe (2026-07-27): round 2 above fixed three of the SEVEN mutations (stp_deleted/
+ * ie_gate_deleted/t0int_write_added) but deliberately left the item's ORIGINAL four alone.  A
+ * follow-up live-injection pass found THREE of those four (timer_never_fires/vector_not_masked/
+ * request_not_cleared_on_ack) still replace-under-test by the same mechanism -- fixed the same way,
+ * each verified the same way (edit ssc.js's shipped source, confirm the entry now genuinely reflects
+ * `orig`'s real behavior instead of a synthetic stand-in's, restore).  vector_resolved_at_install
+ * was the fourth and never had this problem (see above).  All seven now call `orig`.
+ *
  *      node machines/dec/vax/tests/tmrdiff.js [--simh PATH] [--cases N] [--selfcheck]
  */
 
@@ -755,18 +763,57 @@ function proveDeterminism()
  * ------------------------------------------------------------------------------------------- */
 
 const MUTATIONS = {
-    /* named mutation #1: "timer never fires" -- tick() becomes a no-op. */
+    /*
+     * pcjsvax-7fe: named mutation #1: "timer never fires" -- tick() becomes a no-op.  ORIGINALLY a
+     * REPLACE-UNDER-TEST (`SSCVAX.prototype.tick = function() {};` captured `orig` but never called
+     * it): idempotent the instant shipped tick() is ALREADY a no-op, since the hand-written
+     * replacement's OWN no-op behavior is identical to the defect it claims to simulate --
+     * live-injection confirmed the entry read CAUGHT regardless of what shipped tick() actually did.
+     * FIXED to compose: call `orig` for real (so any OTHER divergence in the real, shipped tick() --
+     * not just this one hypothesized shape -- is genuinely exercised), then undo ONLY the "counting
+     * state actually moved" effect, per timer, per call: if `orig` genuinely changed that timer's
+     * TCSR/TIR this call (the correct behavior), put it back exactly as it was before this call,
+     * forcing the observable effect of "this tick did nothing".  If `orig` is ALREADY a no-op (the
+     * real defect), nothing changed, so there is nothing to put back, and the test observes that
+     * real fact directly -- see caseRunModeCountingRom/caseStpClearsRun's own real, oracle-graded
+     * coverage of tick()/RUN-mode counting for the primary evidence; this is the fast corroboration.
+     */
     timer_never_fires() {
         let orig = SSCVAX.prototype.tick;
-        SSCVAX.prototype.tick = function() {};
+        SSCVAX.prototype.tick = function(cpu) {
+            let before0 = { tcsr: this.tcsr[0], tir: this.tir[0] };
+            let before1 = { tcsr: this.tcsr[1], tir: this.tir[1] };
+            orig.call(this, cpu);
+            if (this.tcsr[0] !== before0.tcsr || this.tir[0] !== before0.tir) {
+                this.tcsr[0] = before0.tcsr; this.tir[0] = before0.tir;
+            }
+            if (this.tcsr[1] !== before1.tcsr || this.tir[1] !== before1.tir) {
+                this.tcsr[1] = before1.tcsr; this.tir[1] = before1.tir;
+            }
+        };
         return () => { SSCVAX.prototype.tick = orig; };
     },
-    /* named mutation #2: "vector not masked" -- T0VEC write skips TMR_VEC_MASK. */
+    /*
+     * pcjsvax-7fe: named mutation #2: "vector not masked" -- T0VEC write skips TMR_VEC_MASK.
+     * ORIGINALLY a REPLACE-UNDER-TEST (the `rg === REG_T0VEC` branch never called `orig` at all, so
+     * REG_T1VEC/every other register's real behavior was also bypassed for that instance's whole
+     * lifetime): idempotent the instant shipped writeReg()'s T0VEC case is ALREADY unmasked --
+     * live-injection confirmed the entry read CAUGHT regardless of what shipped writeReg() actually
+     * did with T0VEC.  FIXED to compose: call `orig` for real, then undo ONLY the masking effect --
+     * if `orig` correctly applied TMR_VEC_MASK (the correct behavior), force the RAW, unmasked value
+     * in instead, simulating the mask having been skipped.  If `orig` is ALREADY broken and never
+     * masked it (the real defect), tivr[0] already equals the raw value, so this is a redundant
+     * no-op and the test observes that real fact directly -- see caseVecWriteMask's own real,
+     * oracle-graded coverage of TMR_VEC_MASK-on-write for the primary evidence.
+     */
     vector_not_masked() {
         let orig = SSCVAX.prototype.writeReg;
         SSCVAX.prototype.writeReg = function(rg, val) {
-            if (rg === REG_T0VEC) { this.tivr[0] = val | 0; return true; }
-            return orig.call(this, rg, val);
+            let result = orig.call(this, rg, val);
+            if (rg === REG_T0VEC && this.tivr[0] === ((val & TMR_VEC_MASK) | 0) && this.tivr[0] !== (val | 0)) {
+                this.tivr[0] = val | 0;
+            }
+            return result;
         };
         return () => { SSCVAX.prototype.writeReg = orig; };
     },
@@ -777,23 +824,33 @@ const MUTATIONS = {
            (the closure shape is decided at construction time) -- see caseVectorResolvedAtInstall(). */
         return () => {};
     },
-    /* named mutation #4: "request not cleared on ack" -- reframed for what THIS file owns (not
-       exc.js's deviceVector(), already verified sound and untouched): _tmrCsrWr()'s CLR_INT-on-
-       IE-clear call is skipped entirely. */
+    /*
+     * pcjsvax-7fe: named mutation #4: "request not cleared on ack" -- reframed for what THIS file
+     * owns (not exc.js's deviceVector(), already verified sound and untouched): _tmrCsrWr()'s
+     * CLR_INT-on-IE-clear call is skipped entirely.  ORIGINALLY a REPLACE-UNDER-TEST -- an entire
+     * hand-written re-implementation of _tmrCsrWr() that never called `orig` at all (captured but
+     * dead), omitting only the final clearInterrupt() -- idempotent the instant shipped
+     * _tmrCsrWr() is ALREADY missing that call: live-injection confirmed the entry read CAUGHT
+     * regardless of what shipped _tmrCsrWr() actually did, because the synthetic copy's own
+     * (independently correct) register arithmetic ran either way, masking whatever `orig` really
+     * contained. FIXED to compose: call `orig` for real, then undo ONLY the clearInterrupt() effect
+     * -- if `orig` genuinely just withdrew a pending request (the correct behavior, request bit
+     * true before this call, false after), re-raise it, simulating the clearInterrupt() call having
+     * been skipped.  If `orig` is ALREADY broken and never withdrew it (the real defect), the
+     * request bit is already true before AND after this call, so this branch does not fire, and the
+     * test observes that real fact directly -- see caseIeClearWithdrawsPending's own real,
+     * oracle-graded coverage of this exact withdrawal path for the primary evidence.
+     */
     request_not_cleared_on_ack() {
         let orig = SSCVAX.prototype._tmrCsrWr;
         SSCVAX.prototype._tmrCsrWr = function(tmr, val) {
-            let before = this.tcsr[tmr];
-            this.tcsr[tmr] = (this.tcsr[tmr] & ~(val & TMR_CSR_ERR & TMR_CSR_DON)) | 0;
-            this.tcsr[tmr] = (this.tcsr[tmr] & ~(val & (TMR_CSR_ERR | TMR_CSR_DON))) | 0;
-            this.tcsr[tmr] = ((this.tcsr[tmr] & ~(TMR_CSR_IE | TMR_CSR_STP | TMR_CSR_RUN)) | (val & (TMR_CSR_IE | TMR_CSR_STP | TMR_CSR_RUN))) | 0;
-            if (val & TMR_CSR_XFR) this.tir[tmr] = this.tnir[tmr] | 0;
-            if (val & TMR_CSR_RUN) { /* no-op, see _tmrCsrWr's own comment */ }
-            else if (val & TMR_CSR_SGL) {
-                this._tmrIncr(tmr, 1);
-                if (this.tir[tmr] === 0) this.tir[tmr] = this.tnir[tmr] | 0;
+            let bit = tmr ? INT_V_TMR1 : INT_V_TMR0;
+            let hadReq = this.exc ? !!(this.exc.intReq[IPL_HMIN - IPL_HMIN] & (1 << bit)) : false;
+            orig.call(this, tmr, val);
+            let hasReq = this.exc ? !!(this.exc.intReq[IPL_HMIN - IPL_HMIN] & (1 << bit)) : false;
+            if (this.exc && hadReq && !hasReq) {
+                this.exc.raiseInterrupt(IPL_HMIN, bit);
             }
-            /* the clearInterrupt() call is the ONLY thing omitted */
         };
         return () => { SSCVAX.prototype._tmrCsrWr = orig; };
     },
