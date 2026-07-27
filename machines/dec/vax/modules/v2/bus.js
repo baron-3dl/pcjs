@@ -39,6 +39,7 @@ import Component from "../../../../modules/v2/component.js";
 import State from "../../../../modules/v2/state.js";
 import { DEBUGGER, VAX } from "./defines.js";
 import { makeSscController } from "./ssc.js";
+import { makeRegController } from "./regblock.js";
 
 /**
  * @class BusVAX
@@ -407,21 +408,41 @@ export default class BusVAX extends Component {
     }
 
     /**
-     * addSsc(ssc)
+     * addSsc(ssc, nvr)
      *
-     * Decodes VAX.PHYSMEM.SSC_BASE for the registers SSCVAX implements -- pcjsvax-320.  See
-     * ssc.js's file header for exactly which registers those are and why the rest are not; see
-     * makeSscController()'s doc comment for how everything this does NOT decode (undecoded SSC
-     * sub-registers, NVR, and the unused tail of the physical block SSC and NVR share) keeps
-     * faulting exactly as it did before this method existed, address-by-address rather than by
-     * block granularity.
+     * Decodes VAX.PHYSMEM.SSC_BASE for the registers SSCVAX implements -- pcjsvax-320, extended by
+     * pcjsvax-bfb's own romdiff boundary-advance to also decode NVR (`nvr`, optional -- see
+     * makeSscController()'s doc comment for why one controller has to answer for both ranges: they
+     * share a single physical 8KB bus block).  See ssc.js's file header for exactly which SSC
+     * registers are decoded and why the rest are not; everything neither `ssc` nor `nvr` claims
+     * (undecoded SSC sub-registers, and the unused tail of the shared block) keeps faulting exactly
+     * as it did before this method existed, address-by-address rather than by block granularity.
      *
      * @this {BusVAX}
      * @param {SSCVAX} ssc
+     * @param {NVRVAX} [nvr]
      */
-    addSsc(ssc)
+    addSsc(ssc, nvr)
     {
-        this.addMemory(VAX.PHYSMEM.SSC_BASE >>> 0, VAX.PHYSMEM.SSC_LENGTH, MemoryVAX.TYPE.CONTROLLER, makeSscController(ssc));
+        this.addMemory(VAX.PHYSMEM.SSC_BASE >>> 0, VAX.PHYSMEM.SSC_LENGTH, MemoryVAX.TYPE.CONTROLLER, makeSscController(ssc, nvr));
+    }
+
+    /**
+     * addRegBlock(devices)
+     *
+     * pcjsvax-bfb: decodes VAX.PHYSMEM.REG_BASE for however many of vax_sysdev.c's regtable[]
+     * sub-devices (CQBIC, CMCTL, KA655, CQMAP, CQIPC -- see regblock.js's file header) the caller
+     * has built.  Same pattern as addSsc()/addRom(): one controller installed over the WHOLE
+     * REG_LENGTH span, so anything no device claims keeps faulting exactly as it did before this
+     * method existed, address-by-address -- that fault is what tests/romdiff.js's boundary-advance
+     * uses to name the next undecoded sub-range.
+     *
+     * @this {BusVAX}
+     * @param {Array<{base: number, length: number, dev: Object}>} devices
+     */
+    addRegBlock(devices)
+    {
+        this.addMemory(VAX.PHYSMEM.REG_BASE >>> 0, VAX.PHYSMEM.REG_LENGTH, MemoryVAX.TYPE.CONTROLLER, makeRegController(devices));
     }
 
     /**

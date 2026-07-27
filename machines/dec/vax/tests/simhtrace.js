@@ -68,6 +68,7 @@
 
 import { OPCODES, DROM, DROM_STRIDE, DR, SPEC, MODE } from "../modules/v2/drom.js";
 import { DISPATCH } from "../modules/v2/cpustate.js";
+import MemoryVAX from "../modules/v2/memory.js";
 
 const L_BYTE = 1, L_WORD = 2, L_LONG = 4, L_QUAD = 8, L_OCTA = 16;
 const BSIGN = 0x80, WSIGN = 0x8000, LSIGN = 0x80000000 | 0;
@@ -342,6 +343,7 @@ class SimhTrace {
             regs: Int32Array.from(cpu.regs),
             res: [0, 0, 0, 0, 0, 0],
             completed: false,
+            resultUnreliable: false,
             ok
         };
     }
@@ -392,8 +394,47 @@ class SimhTrace {
         let lnt = (res == RB.B) ? L_BYTE : (res == RB.W) ? L_WORD : L_LONG;
         try {
             if (d.isMemoryDestination()) {
+                /*
+                 * pcjsvax-bfb: the reconstruction's own load-bearing assertion (see the file header
+                 * RESULTS section) is "r is the value the body stored, so reading the destination
+                 * immediately afterwards must return it" -- true for RAM, false by DESIGN for a
+                 * device register that transforms what it stores (a mask, a W1C bit, ...): SIMH's
+                 * own `r` local still holds the RAW value the body computed, but reading the
+                 * register back returns whatever the device's OWN write-side semantics produced,
+                 * which can legitimately differ (first observed: SSC+0x30's OTP register masks to
+                 * 4 bits, `MCOML #E,@#20140030` computes 0xFFFFFFF1 but a readback returns
+                 * 0x00000001).  That is not a bug in the register model -- it is the ENTIRE REASON
+                 * this item's done condition 2 grades device registers with a DIFFERENT, dedicated
+                 * oracle (patch 0006's IPRR/IPRW/REGR/REGW trace, not this generic per-instruction
+                 * reconstruction).  A destination backed by a MemoryVAX.TYPE.CONTROLLER block (every
+                 * device model in this tree, not merely the console) is therefore marked
+                 * resultUnreliable exactly like an unreadable-after-a-store-fault destination
+                 * already is: dropped from BOTH traces by cpudiff.js/romdiff.js's DIFF_DRIVER (see
+                 * `unavailable` below), never silently compared against a value it was never
+                 * promised to reproduce.
+                 *
+                 * MEASURED CORRECTION (veracity re-dispatch, same item): `d.va` is a VIRTUAL
+                 * address (mmu.readData() is what translates it) -- a first version of this check
+                 * called `cpu.bus.getBlock(d.va)` directly, treating an UNTRANSLATED virtual address
+                 * as if it were physical.  Under MAPEN that is not merely "the wrong block", it can
+                 * be an OUT-OF-RANGE block index entirely (`aMemBlocks[hugeIndex]` -> `undefined`),
+                 * and `undefined.type` throws inside this function's own try/catch -- silently
+                 * discarded, leaving `rTrace` STALE from whatever the PREVIOUS result-producing
+                 * instruction left there.  This is exactly the regression cpudiff.js's EHKAA phase
+                 * caught: `MOVAL 800071C5,800206C0` diverged because the destination's result was
+                 * never actually read back.  The fix reads the destination FIRST (mmu.readData()
+                 * itself has already translated it, unconditionally, before this class ever existed)
+                 * and THEN inspects `cpu.mmu.pa` -- the physical address that SAME translation just
+                 * resolved (mmu.js's readData() sets `this.pa` on every call, `MMUVAX.readData()`'s
+                 * own doc comment) -- for the controller check, never a second, independent
+                 * translation of its own.
+                 */
                 this.rTrace = cpu.mmu.readData(d.va, lnt, cpu.accR()) | 0;
                 if (res == RB.Q) this.rhTrace = cpu.mmu.readData((d.va + 4) | 0, L_LONG, cpu.accR()) | 0;
+                let pa = (cpu.mmu.pa >>> 0) & cpu.bus.nBusMask;
+                if (cpu.bus.getBlock(pa).type === MemoryVAX.TYPE.CONTROLLER) {
+                    this.pending.resultUnreliable = true;
+                }
             } else {
                 this.rTrace = cpu.regs[d.rn] | 0;
                 if (res == RB.Q) this.rhTrace = cpu.regs[(d.rn + 1) & 0xF] | 0;
@@ -432,7 +473,7 @@ class SimhTrace {
          * normally; only the reconstructed result value is unavailable, and cpudiff.js drops that
          * one field from BOTH traces at exactly these indices, counts them, and reports the count.
          */
-        if (this.fResults && !p.completed && res >= RB.B && res <= RB.Q) {
+        if (this.fResults && (!p.completed || p.resultUnreliable) && res >= RB.B && res <= RB.Q) {
             this.unavailable.push(this.count);
         }
         if (this.fResults) {

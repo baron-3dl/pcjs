@@ -434,6 +434,23 @@ class VAXExc {
          * instruction restartable.  BPT and XFC read it for the same reason.
          */
         this.faultPC = 0;
+        /*
+         * conpc/conpsl (vax_sysdev.c:237, "console reg"): the PC/PSL the CVAX console halt handler
+         * (con_halt(), vax_sysdev.c:1674-1689) saves and cpu_boot() (vax_sysdev.c:1714-1732)
+         * initializes on every boot -- readable via MFPR CONPC/MFPR CONPSL (MT 42/43), a WRITE to
+         * either is a reserved-operand fault (writeIPR()'s explicit check below).  Discovered as a
+         * romdiff boundary-advance divergence (pcjsvax-bfb): the ROM's fourth and fifth instructions
+         * are `MFPR #2A,44(R1)` / `MFPR #2B,48(R1)` (CONPC/CONPSL), and this module's PRE-EXISTING
+         * default (readIPR() falling through to 0 with no iprDevice installed) silently disagreed
+         * with SIMH's real conpsl -- a CC divergence, not a bus fault, so nothing before this caught
+         * it.  CONPC/CONPSL are NOT off-chip/SSC device state (not in IPR_DEVICE below): con_halt()
+         * and cpu_boot() are CVAX on-chip logic, exactly like ASTLVL/SISR/MAPEN above them in this
+         * same class.  boot() (cpustate.js) sets conpc=0, conpsl=PSL_IS|PSL_IPL1F|CON_PWRUP,
+         * reproducing cpu_boot()'s own two assignments; con_halt() itself (a real user HALT
+         * instruction reaching the console) is out of this item's scope and is not modeled.
+         */
+        this.conpc = 0;
+        this.conpsl = 0;
     }
 
     /**
@@ -614,7 +631,31 @@ class VAXExc {
      * @this {VAXExc}
      * @param {Object} cpu
      */
-    setIRQL(cpu) { this.trpirq = (this.trpirq & TIR_TRAP) | this.evalInt(cpu); }
+    setIRQL(cpu)
+    {
+        /*
+         * pcjsvax-bfb: the ONE per-instruction hook this item adds, and it is deliberately NOT
+         * inside evalInt() or the `if (vec)` dispatch decision below -- those are the reviewed,
+         * "must stay byte-identical" arbitration this item was told not to touch.  This is a
+         * separate, additive call that lets a device (today: the console, console.js) notice a
+         * TIME-BASED completion (real hardware: SIMH's event queue; here: cpu.nTotalCycles, which
+         * this project's own cycle accounting already keeps in exact lockstep with SIMH's
+         * sim_interval -- see cpustate.js's stepCPU() doc comment) and call raiseInterrupt() BEFORE
+         * evalInt() runs, so a device whose completion fires between two polls of its own status
+         * register (not merely in response to one) is still seen on the very next instruction,
+         * matching a real interrupt's asynchronous delivery.  setIRQL() runs at the top of EVERY
+         * stepInstruction() call (see this file's own doc comment on that function) and again after
+         * every trap/interrupt dispatch, so a device's tick() may run more than once per instruction
+         * -- it must be idempotent once its own pending state is cleared, exactly as this file's
+         * OWN dispatch is.  `this.iprDevice` (not a separate slot) is reused deliberately: it is
+         * already the device installed via setIPRDevice(), and every device this item's own boundary
+         * walk needed a tick for (the console) is that same device -- see setIPRDevice()'s doc
+         * comment.  A device with no `tick` method (or no device installed at all) costs one
+         * property check per instruction and nothing else.
+         */
+        if (this.iprDevice && this.iprDevice.tick) this.iprDevice.tick(cpu);
+        this.trpirq = (this.trpirq & TIR_TRAP) | this.evalInt(cpu);
+    }
 
     /**
      * setTrap(cpu, trap)
@@ -1404,6 +1445,8 @@ class VAXExc {
         case MT.SISR: return this.sisr & SISR_MASK;
         case MT.MAPEN: return mmu.mapen & 1;
         case MT.PME:  return this.pme & 1;
+        case MT.CONPC: return this.conpc;
+        case MT.CONPSL: return this.conpsl;
 
         case MT.SIRR:
         case MT.TBIA:
