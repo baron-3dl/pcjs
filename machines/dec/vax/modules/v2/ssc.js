@@ -71,8 +71,10 @@
  *     nvr.js existed -- NVR itself) falls through to the SAME readNone/writeNone/readWordNone/...
  *     the shared empty block would have used -- i.e. a bus fault, dispatched by cpustate.js's
  *     onBusFault() into a real machine check (pcjsvax-446).  THAT fault is what tests/romdiff.js's
- *     probeSimhBackedAt() uses to find and NAME the next boundary -- the same mechanism that named
- *     THIS item's own starting point (SSC+0x0) and, later, NVR's.
+ *     FaultGrader.verdict() grades against the live oracle to find and NAME the next boundary -- the
+ *     same mechanism that named THIS item's own starting point (SSC+0x0) and, later, NVR's.  Since
+ *     pcjsvax-fe7 the fault alone is not the boundary: an address the ORACLE also faults on
+ *     identically is walked past, and only one SIMH SERVICES is named.
  *
  * The bug this replaces: an earlier revision had readReg()/writeReg() return null/false for an
  * uncased-but-in-range register too, which makeSscController() then ALSO routed to readNone/
@@ -742,7 +744,8 @@ export default class SSCVAX {
  * readNone/writeNone exactly as it always did before this item).  Anything neither `ssc` nor `nvr`
  * claims -- undecoded SSC sub-registers and the block's unused tail -- keeps faulting exactly as it
  * did before this method existed, address-by-address rather than by block granularity; that fault
- * is what tests/romdiff.js's probeSimhBackedAt() uses to find and NAME the next boundary.
+ * is what tests/romdiff.js's FaultGrader.verdict() grades against the live oracle to find and NAME
+ * the next boundary (pcjsvax-fe7: a fault the oracle produces identically is walked past instead).
  *
  * @param {SSCVAX} ssc
  * @param {NVRVAX} [nvr]

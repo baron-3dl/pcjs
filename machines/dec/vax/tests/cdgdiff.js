@@ -42,7 +42,7 @@
  * ----------------------------
  * SIMH runs REAL VAX INSTRUCTIONS, deposited into RAM and stepped, with the results read back out
  * of R0..R5 -- the same "only an actual instruction reproduces the real access path" reasoning
- * romdiff.js's verifySscBaseRandom()/probeSimhBackedAt() are built on.  It matters more here than
+ * romdiff.js's verifySscBaseRandom()/FaultGrader.probeSimh() are built on.  It matters more here than
  * usual: SIMH's own `examine`/`deposit` of a CDG address goes through cpu_ex()/cpu_dep(), which
  * DOES reach cdg_rd() -- and would therefore perturb the very CACR this file is measuring between
  * the operation and its readback.  Every observable is captured by an instruction instead.
