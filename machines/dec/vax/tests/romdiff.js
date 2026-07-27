@@ -154,10 +154,10 @@ function findRom(pathArg)
     return p;
 }
 
-function runSimh(bin, script, iniPath)
+function runSimh(bin, script, iniPath, timeoutMs = 5 * 60 * 1000)
 {
     fs.writeFileSync(iniPath, script);
-    return execFileSync(bin, [iniPath], {encoding: "utf8", maxBuffer: 1 << 29, timeout: 5 * 60 * 1000});
+    return execFileSync(bin, [iniPath], {encoding: "utf8", maxBuffer: 1 << 29, timeout: timeoutMs});
 }
 
 /* ------------------------------------------------------------------------------------------- *
@@ -286,13 +286,24 @@ const BoundaryAccounting = {
  * A plain object property (not a bare function) so selfcheck() can patch it the same way it
  * patches BoundaryAccounting.compute() above.
  *
+ * pcjsvax-23c FIX: the original guard was `if (!js.stop || boundary) return null;` -- which was
+ * silently wrong the instant a fault could be ABSORBED rather than thrown (runRomJS() can now
+ * stop the loop on its own via `break`, leaving js.stop null, with a real, confirmed-backed
+ * boundary already found).  The guard now asks "did ANYTHING happen" (a genuine VAXStop, OR a
+ * recorded fault) rather than "did the run throw" -- a run that did neither (ran out of
+ * --max-steps with a totally clean, non-faulting execution) is handled by main()'s OWN separate
+ * "ran out of steps" message, so this function still returns null for that case too, just via an
+ * explicit check rather than by accident.
+ *
  * @param {Object} js as returned by runRomJS()
  * @param {?Object} boundary as computed in main(), or null
- * @returns {?string} a problem string, or null if a boundary was produced (or the run never stopped)
+ * @returns {?string} a problem string, or null if a boundary was produced (or nothing happened at
+ *   all -- see main()'s own "ran out of steps" message for that case)
  */
 const BoundaryRequired = {
     check(js, boundary) {
-        if (!js.stop || boundary) return null;
+        if (boundary) return null;
+        if (!js.stop && js.firstFaultAddr === null) return null;
         if (js.firstFaultAddr === null) {
             return `the JS machine stopped (${js.stop.reason}) without ever recording a bus fault -- ` +
                 `no address to probe, so no boundary can be named; this item's whole point is to name one`;
@@ -368,6 +379,23 @@ function runRomJS(romBytes, opts, magicByte)
     let hst = new SimhTrace();
     cpu.hst = hst;
 
+    /*
+     * pcjsvax-23c FIX: this capture is STICKY across the WHOLE run -- initialized once, here,
+     * outside the loop, and never reset per-iteration.  MEASURED REGRESSION this replaces: the
+     * previous version reset all three to null at the TOP of every loop iteration, so the capture
+     * only survived if the run STOPPED (threw) on the very step that faulted.  That was always
+     * true before pcjsvax-055 purely by circumstance -- SCBB/IS were still 0 that early in boot,
+     * so any machine check cascaded into a double (KSNV-on-KSNV) fault and a genuine VAXStop --
+     * never because a fault that the ROM's OWN handler ABSORBED (dispatched, and continued
+     * executing) was actually impossible.  Once pcjsvax-055 unblocked progress far enough for the
+     * ROM to have set up SCBB for real, the very next undecoded-hardware reference (a real MOVC5
+     * into the CDG range, instruction #392) machine-checked into a handler that absorbed it and
+     * kept going -- and the per-iteration reset erased the only record of it one loop iteration
+     * later, so the run silently continued 82,000 further instructions into ROM error-recovery
+     * code before eventually reaching an unrelated HALT.  `firstFaultAddr === null` inside
+     * onBusFault() below already meant "first one wins, forever" -- the bug was that the OUTER
+     * loop kept lying to it every iteration.
+     */
     let firstFaultAddr = null, firstFaultAccess = null, firstFaultPC = null;
     let realOnBusFault = cpu.onBusFault.bind(cpu);
     cpu.onBusFault = function(addr, access) {
@@ -382,8 +410,17 @@ function runRomJS(romBytes, opts, magicByte)
     let steps = 0, stop = null;
     try {
         while (steps < opts.maxSteps) {
-            firstFaultAddr = null; firstFaultAccess = null; firstFaultPC = null;
             cpu.stepCPU(1); steps++;
+            /*
+             * pcjsvax-23c FIX: stop the run the INSTANT the first undecoded-hardware reference is
+             * seen, whether the ROM's own handler goes on to absorb it or not -- "the next thing to
+             * decode" is defined by this event, not by whatever the ROM does 82,000 instructions
+             * later once it has already run off into a control-flow path no undecoded-hardware item
+             * needs to reproduce.  A fault that instead cascades into a genuine VAXStop (the
+             * previously-only-reachable shape) never reaches this line at all: control jumps
+             * straight to the catch block below from inside stepCPU() itself.
+             */
+            if (firstFaultAddr !== null) break;
         }
     } catch (e) {
         if (!(e instanceof VAXStop)) throw e;
@@ -783,6 +820,18 @@ function verifyFallthroughSemantics(romBytes, simh, opts)
  * @param {number} breakAddr
  * @returns {string} path to the trace
  */
+/*
+ * pcjsvax-23c FIX: a MUCH shorter timeout than runSimh()'s 5-minute default, specific to this call
+ * site.  A CORRECTLY-named boundary is reached in low single-digit seconds (measured: ~2.5s for
+ * the #392/CDG boundary from a cold `boot cpu`) -- this leaves generous headroom while bounding
+ * the worst case (a breakpoint address SIMH's own, non-faulting execution never reaches at all) to
+ * seconds rather than the 5-minute/9.5GB-scratch-directory failure this item measured and fixed.
+ * `set cpu history=100000:<path>` still auto-flushes and does NOT cap total instructions logged
+ * (see docs/design/vax-on-pcjs.md's "Tooling note") -- this timeout is what actually bounds trace
+ * growth now, not the history buffer size.
+ */
+const CAPTURE_TIMEOUT_MS = 60 * 1000;
+
 function captureSimhTrace(simh, opts, breakAddr)
 {
     let tracePath = path.join(opts.scratch, "romdiff-simh.trace");
@@ -796,7 +845,16 @@ function captureSimhTrace(simh, opts, breakAddr)
         "examine PC",
         "exit", ""
     ].join("\n");
-    let out = runSimh(simh, script, path.join(opts.scratch, "romdiff-simh.ini"));
+    let out;
+    try {
+        out = runSimh(simh, script, path.join(opts.scratch, "romdiff-simh.ini"), CAPTURE_TIMEOUT_MS);
+    } catch (e) {
+        throw new Error(`romdiff: SIMH did not reach the breakpoint at ${hex(breakAddr)} within ` +
+            `${CAPTURE_TIMEOUT_MS}ms and was killed (${e.code || e.message}) -- either the breakpoint ` +
+            `address is one real SIMH's OWN execution never visits (a wrong PC computed on the JS ` +
+            `side), or it is genuinely further out than this bound expects; it is not the previous ` +
+            `9.5GB/5-minute failure mode either way.`);
+    }
     if (!/Breakpoint/.test(out)) {
         throw new Error(`romdiff: SIMH never hit the breakpoint at ${hex(breakAddr)} (it may have ` +
             `stopped or errored first); SIMH said:\n` + out);
@@ -1001,7 +1059,9 @@ function verifyMirrorSimh(simh, opts, breakAddr)
     }
     lines.push(`break ${hex(breakAddr)}`, "boot cpu",
                `e -b ${hex((base + 4) >>> 0)}`, `e -b ${hex((base + size + 4) >>> 0)}`, "exit", "");
-    let out = runSimh(simh, lines.join("\n"), path.join(opts.scratch, "romdiff-mirror.ini"));
+    /* pcjsvax-23c: same bounded timeout as captureSimhTrace() -- this call has the identical
+       "breakpoint SIMH's own execution never reaches" risk profile. */
+    let out = runSimh(simh, lines.join("\n"), path.join(opts.scratch, "romdiff-mirror.ini"), CAPTURE_TIMEOUT_MS);
     let vals = [...out.matchAll(/^[0-9A-F]+:\s+([0-9A-F]+)/gm)].map((m) => parseInt(m[1], 16));
     if (vals.length < offsets.length * 2 + 2) {
         throw new Error("romdiff: SIMH mirror probe produced too few results; SIMH said:\n" + out);
@@ -1272,19 +1332,34 @@ function selfcheck(romBytes, opts, magicByte)
                     }
                 } else if (name === "boundary-required-not-enforced") {
                     /*
-                     * Pure-function check with synthetic `js` objects, mirroring the coordinator's
-                     * two live-injection shapes exactly: (1) a stop with NO fault ever recorded, and
+                     * Pure-function check with synthetic `js` objects.  r1/r2 mirror the
+                     * originally-only-reachable shapes: (1) a stop with NO fault ever recorded, and
                      * (2) a stop whose first fault IS recorded but landed on an address the real
-                     * oracle also does not service (boundary === null either way).  The unmutated
-                     * function must flag BOTH as problems; the mutation always returns null.
+                     * oracle also does not service (boundary === null either way).  r3/r4 (pcjsvax-
+                     * 23c) mirror the shape that regression actually measured LIVE: `js.stop` NULL
+                     * because runRomJS() now stops itself on the first recorded fault instead of
+                     * throwing -- r3 is the "genuinely nothing happened" case (must be null, same as
+                     * unmutated), r4 is "a fault WAS recorded but turned out unbacked on the oracle
+                     * too" (must be a problem, exactly like r2's stop-having variant).  The unmutated
+                     * function must flag r1/r2/r4 as problems and pass r3 through as null; the
+                     * mutation always returns null for everything, which only r1/r2/r4 can detect.
                      */
                     let r1 = BoundaryRequired.check({stop: {reason: "synthetic"}, firstFaultAddr: null}, null);
                     let r2 = BoundaryRequired.check({stop: {reason: "synthetic"}, firstFaultAddr: 0x20090000}, null);
-                    if (r1 === null || r2 === null) {
+                    let r3 = BoundaryRequired.check({stop: null, firstFaultAddr: null}, null);
+                    let r4 = BoundaryRequired.check({stop: null, firstFaultAddr: 0x10000000}, null);
+                    if (r1 === null || r2 === null || r4 === null) {
                         caught = true;
                         how = `BoundaryRequired.check() returned null (no problem) for a stop with no named ` +
                             `boundary -- r1(no fault recorded)=${JSON.stringify(r1)}, ` +
-                            `r2(fault also absent on real oracle)=${JSON.stringify(r2)}`;
+                            `r2(fault also absent on real oracle)=${JSON.stringify(r2)}, ` +
+                            `r4(absorbed fault, also absent on real oracle)=${JSON.stringify(r4)}`;
+                    } else if (r3 !== null) {
+                        /* not the mutation this branch grades, but a genuine regression in the same
+                           function is still worth failing loudly on rather than silently passing */
+                        caught = true;
+                        how = `BoundaryRequired.check() flagged a problem for a run where NOTHING ` +
+                            `happened at all (no stop, no fault) -- r3=${JSON.stringify(r3)}, expected null`;
                     }
                 } else if (name === "fallthrough-reverts-to-blanket-fault") {
                     /*
@@ -1371,95 +1446,123 @@ function main()
     let js = runRomJS(romBytes, opts, magicByte);
     console.log("\nROM boot-entry execution");
     console.log(`  instructions executed : ${js.records}`);
-    console.log(`  stopped               : ${js.stop ? js.stop.reason : "(step limit, never stopped)"} ` +
+    /*
+     * pcjsvax-23c FIX: `js.stop` is no longer the only shape "something happened" can take --
+     * runRomJS() now also stops (via its own internal `break`) the instant a bus fault is
+     * recorded, whether or not the ROM's own handler goes on to absorb it.  That case leaves
+     * `js.stop` null, so the OLD "(step limit, never stopped)" label was actively misleading for
+     * it -- the run did not exhaust --max-steps, it stopped on purpose, on a real finding.
+     */
+    let stoppedLabel = js.stop ? js.stop.reason
+        : (js.firstFaultAddr !== null ? "(bus fault captured -- absorbed by the ROM, not thrown)"
+                                       : "(step limit, never stopped)");
+    console.log(`  stopped               : ${stoppedLabel} ` +
         `at PC=${hex(js.pc)} PSL=${hex(js.psl)}` +
         (js.stop && js.stop.detail !== undefined ? ` -- touched ${nameAddress(js.stop.detail)}` : ""));
 
     let boundary = null;
-    if (!js.stop) {
+    /*
+     * MEASURED (veracity re-dispatch, pcjsvax-446; extended pcjsvax-23c to run whenever a fault was
+     * ever recorded, not only when the run also happened to throw): the FIRST bus fault's address,
+     * if there was one, is checked against the real oracle BEFORE anything else -- because if SIMH
+     * itself services that address (SSC/NVR/CDG: backed end-to-end, same category this item's own
+     * calibration already established for tests/mchkdiff.js), then js.pc (the PC AFTER the whole
+     * exception-cascade this item's fix now genuinely dispatches) is NOT a point SIMH's real,
+     * non-faulting execution will ever reach -- it is deep inside JS-only exception machinery.
+     * Bounding the SIMH capture there either never hits the breakpoint in any useful sense, or hits
+     * it by coincidence far later having recorded a different number of instructions -- which is
+     * exactly the "SIMH's capture was shorter than the JS run" confusion this fix replaces with a
+     * named, honest boundary.
+     *
+     * The fix: when the first-fault address is confirmed BACKED, bound the SIMH capture at the
+     * BOUNDARY INSTRUCTION'S OWN PC instead (`firstFaultPC` -- both machines reach that address
+     * identically, since everything before it is unaffected by what pcjsvax-320 has not yet
+     * decoded).  That makes the two traces directly comparable over the LEADING portion (every
+     * instruction before the boundary must still match exactly -- a real divergence there is
+     * still a failure, never swallowed), and the boundary itself is reported by name, not as a
+     * trace-length mismatch.
+     */
+    if (js.firstFaultAddr !== null) {
+        let fWrite = js.firstFaultAccess === VAX.ACCESS.WRITE;
+        if (probeSimhBackedAt(simh, opts, js.firstFaultAddr, fWrite)) {
+            boundary = {addr: js.firstFaultAddr, fWrite, instrPC: js.firstFaultPC};
+        }
+    }
+    /* pcjsvax-23c FIX: "nothing happened at all" (no VAXStop AND no fault ever recorded -- a
+       totally clean run that simply exhausted --max-steps) is its own, separate failure; anything
+       else (a VAXStop, or a recorded fault, with or without a resulting named boundary) goes
+       through BoundaryRequired.check() below instead, wrapped so a downstream failure (e.g. the
+       SIMH capture itself) cannot silently swallow phases 1b/1c/2 the way the unguarded call used
+       to (pcjsvax-23c's own measured regression: an uncaught ETIMEDOUT here killed main() before
+       printing anything, ever). */
+    if (!js.stop && js.firstFaultAddr === null) {
         problems.push(`the JS machine ran all ${opts.maxSteps} steps without reaching a device-register ` +
             `boundary; this item's whole point is to name that boundary, so a run that never finds one ` +
             `is not a pass -- raise --max-steps only after confirming a real boundary is further out`);
     } else {
-        /*
-         * MEASURED (veracity re-dispatch, pcjsvax-446): the FIRST bus fault's address, if there was
-         * one, is checked against the real oracle BEFORE anything else -- because if SIMH itself
-         * services that address (SSC/NVR/CDG: backed end-to-end, same category this item's own
-         * calibration already established for tests/mchkdiff.js), then js.pc (the PC AFTER the
-         * whole exception-cascade this item's fix now genuinely dispatches) is NOT a point SIMH's
-         * real, non-faulting execution will ever reach -- it is deep inside JS-only exception
-         * machinery.  Bounding the SIMH capture there either never hits the breakpoint in any
-         * useful sense, or hits it by coincidence far later having recorded a different number of
-         * instructions -- which is exactly the "SIMH's capture was shorter than the JS run"
-         * confusion this fix replaces with a named, honest boundary.
-         *
-         * The fix: when the first-fault address is confirmed BACKED, bound the SIMH capture at the
-         * BOUNDARY INSTRUCTION'S OWN PC instead (`firstFaultPC` -- both machines reach that address
-         * identically, since everything before it is unaffected by what pcjsvax-320 has not yet
-         * decoded).  That makes the two traces directly comparable over the LEADING portion (every
-         * instruction before the boundary must still match exactly -- a real divergence there is
-         * still a failure, never swallowed), and the boundary itself is reported by name, not as a
-         * trace-length mismatch.
-         */
-        if (js.firstFaultAddr !== null) {
-            let fWrite = js.firstFaultAccess === VAX.ACCESS.WRITE;
-            if (probeSimhBackedAt(simh, opts, js.firstFaultAddr, fWrite)) {
-                boundary = {addr: js.firstFaultAddr, fWrite, instrPC: js.firstFaultPC};
+        try {
+            /* VERACITY FINDING A: a stop that never yields a named boundary is a FAILURE, not a
+               quiet pass -- see BoundaryRequired.check()'s doc comment. */
+            let boundaryProblem = BoundaryRequired.check(js, boundary);
+            if (boundaryProblem) problems.push(boundaryProblem);
+            let breakAddr = boundary ? boundary.instrPC : js.pc;
+            let simhTrace = captureSimhTrace(simh, opts, breakAddr);
+            /*
+             * MEASURED (veracity re-dispatch, pcjsvax-446): the boundary instruction's OWN record in
+             * js.tracePath is a FORCE-FINALIZED partial one WHEN its fault happened inside the
+             * instruction's BODY (runRomJS()'s unconditional `hst.finish(cpu)` call finalizes whatever
+             * hst.record() already started, even though the body itself aborted) -- SIMH's capture,
+             * correctly bounded at that same instruction's start PC, never executes it at all (the
+             * breakpoint fires on FETCH), so that case compares `js.records - 1` records: everything
+             * genuinely completed before the boundary, not `js.records`.
+             *
+             * MEASURED (pcjsvax-320): that is NOT the only shape a boundary can take, and assuming it
+             * unconditionally is what pcjsvax-320 exposed the first time a boundary landed on
+             * SPECIFIER RESOLUTION of the instruction AFTER one that used to be the boundary and now
+             * completes successfully -- a fault reached BEFORE hst.record() ever ran for it, per
+             * cpustate.js's fnExecute ordering (record() fires after specifier resolution, before the
+             * body).  hst.finish(cpu) is then a genuine no-op (simhtrace.js: `if (!p) return;`), so
+             * js.records is ALREADY the exact count of comparable instructions and trimming one more
+             * would silently drop the LAST one that actually completed -- here, the very MOVL storing
+             * to SSC+0x0 this item exists to decode -- out of the SIMH comparison entirely, the one
+             * case this item most needs graded.  `js.finalizedPartial` (measured directly, by whether
+             * hst.finish() changed hst.count -- not assumed from which kind of boundary this is)
+             * distinguishes the two shapes; `comparableRecords` and `boundaryInstrNum` below are the
+             * single computation both the trim and every "instruction #N" label use, so they cannot
+             * drift apart the way the pre-existing code's inlined `js.records`/`js.records - 1` did.
+             */
+            let {comparableRecords, instrNum: boundaryInstrNum} = BoundaryAccounting.compute(js.records, js.finalizedPartial);
+            let maxJsRecords = boundary ? comparableRecords : -1;
+            let cmp = compareTraces(js.tracePath, simhTrace, js.unavailable, opts, maxJsRecords);
+            console.log(`  SIMH breakpoint        : ${hex(breakAddr)} ` +
+                (boundary ? "(the boundary instruction's own PC -- SIMH reaches this identically)"
+                          : "(this run's own stopping PC)"));
+            console.log(`  normalized records     : CMPD-tail=${cmp.normalized_cmpd} zerospec=${cmp.normalized_zerospec} store-faulted=${cmp.normalized_unavailable}`);
+            console.log(`  trace comparison       : ${cmp.match ? "MATCH over all " + cmp.simh_records + " records" : "DIVERGE"}`);
+            if (!cmp.match) {
+                let d = cmp.divergence;
+                problems.push(`TRACE: diverged at instruction ${d.index} (field=${d.field}, PC=${d.pc_a}): ${d.detail}`);
             }
-        }
-        /* VERACITY FINDING A: a stop that never yields a named boundary is a FAILURE, not a quiet
-           pass -- see BoundaryRequired.check()'s doc comment. */
-        let boundaryProblem = BoundaryRequired.check(js, boundary);
-        if (boundaryProblem) problems.push(boundaryProblem);
-        let breakAddr = boundary ? boundary.instrPC : js.pc;
-        let simhTrace = captureSimhTrace(simh, opts, breakAddr);
-        /*
-         * MEASURED (veracity re-dispatch, pcjsvax-446): the boundary instruction's OWN record in
-         * js.tracePath is a FORCE-FINALIZED partial one WHEN its fault happened inside the
-         * instruction's BODY (runRomJS()'s unconditional `hst.finish(cpu)` call finalizes whatever
-         * hst.record() already started, even though the body itself aborted) -- SIMH's capture,
-         * correctly bounded at that same instruction's start PC, never executes it at all (the
-         * breakpoint fires on FETCH), so that case compares `js.records - 1` records: everything
-         * genuinely completed before the boundary, not `js.records`.
-         *
-         * MEASURED (pcjsvax-320): that is NOT the only shape a boundary can take, and assuming it
-         * unconditionally is what pcjsvax-320 exposed the first time a boundary landed on
-         * SPECIFIER RESOLUTION of the instruction AFTER one that used to be the boundary and now
-         * completes successfully -- a fault reached BEFORE hst.record() ever ran for it, per
-         * cpustate.js's fnExecute ordering (record() fires after specifier resolution, before the
-         * body).  hst.finish(cpu) is then a genuine no-op (simhtrace.js: `if (!p) return;`), so
-         * js.records is ALREADY the exact count of comparable instructions and trimming one more
-         * would silently drop the LAST one that actually completed -- here, the very MOVL storing
-         * to SSC+0x0 this item exists to decode -- out of the SIMH comparison entirely, the one
-         * case this item most needs graded.  `js.finalizedPartial` (measured directly, by whether
-         * hst.finish() changed hst.count -- not assumed from which kind of boundary this is)
-         * distinguishes the two shapes; `comparableRecords` and `boundaryInstrNum` below are the
-         * single computation both the trim and every "instruction #N" label use, so they cannot
-         * drift apart the way the pre-existing code's inlined `js.records`/`js.records - 1` did.
-         */
-        let {comparableRecords, instrNum: boundaryInstrNum} = BoundaryAccounting.compute(js.records, js.finalizedPartial);
-        let maxJsRecords = boundary ? comparableRecords : -1;
-        let cmp = compareTraces(js.tracePath, simhTrace, js.unavailable, opts, maxJsRecords);
-        console.log(`  SIMH breakpoint        : ${hex(breakAddr)} ` +
-            (boundary ? "(the boundary instruction's own PC -- SIMH reaches this identically)"
-                      : "(this run's own stopping PC)"));
-        console.log(`  normalized records     : CMPD-tail=${cmp.normalized_cmpd} zerospec=${cmp.normalized_zerospec} store-faulted=${cmp.normalized_unavailable}`);
-        console.log(`  trace comparison       : ${cmp.match ? "MATCH over all " + cmp.simh_records + " records" : "DIVERGE"}`);
-        if (!cmp.match) {
-            let d = cmp.divergence;
-            problems.push(`TRACE: diverged at instruction ${d.index} (field=${d.field}, PC=${d.pc_a}): ${d.detail}`);
-        }
-        if (cmp.simh_records !== cmp.js_records) {
-            problems.push(`TRACE: JS produced ${cmp.js_records} comparable records but only ${cmp.simh_records} ` +
-                `were compared -- SIMH's capture was shorter than the JS run, so some JS instructions never ` +
-                `reached comparison`);
-        }
-        if (boundary) {
-            boundary.instrNum = boundaryInstrNum;
-            console.log(`\n  UNDECODED-HARDWARE BOUNDARY: instruction #${boundaryInstrNum} ` +
-                `(${boundary.fWrite ? "write" : "read"}) touched ${nameAddress(boundary.addr)}, which SIMH ` +
-                `services (ssc_rd/ssc_wr -- backed end-to-end, same category as CDG) but this bus does ` +
-                `not decode yet.  See the next device item, which will move this boundary forward.`);
+            if (cmp.simh_records !== cmp.js_records) {
+                problems.push(`TRACE: JS produced ${cmp.js_records} comparable records but only ${cmp.simh_records} ` +
+                    `were compared -- SIMH's capture was shorter than the JS run, so some JS instructions never ` +
+                    `reached comparison`);
+            }
+            if (boundary) {
+                boundary.instrNum = boundaryInstrNum;
+                console.log(`\n  UNDECODED-HARDWARE BOUNDARY: instruction #${boundaryInstrNum} ` +
+                    `(${boundary.fWrite ? "write" : "read"}) touched ${nameAddress(boundary.addr)}, which SIMH ` +
+                    `services (ssc_rd/ssc_wr -- backed end-to-end, same category as CDG) but this bus does ` +
+                    `not decode yet.  See the next device item, which will move this boundary forward.`);
+            }
+        } catch (e) {
+            /* pcjsvax-23c FIX: this is the whole reason this block is now wrapped -- a failure HERE
+               (most plausibly captureSimhTrace() timing out on a breakpoint real SIMH's own
+               execution never reaches) used to kill main() with an uncaught exception before a
+               single line of PHASE 1b/1c/2 output, or even BoundaryRequired's OWN already-pushed
+               problem string, was ever printed.  Record it and keep going -- the later phases do
+               not depend on this block having succeeded. */
+            problems.push(`TRACE comparison aborted: ${e.message || e}`);
         }
     }
 
@@ -1494,20 +1597,28 @@ function main()
     /* ---- PHASE 2: the mirror ---- */
     let mirrorProblems = verifyMirrorJS(romBytes, opts, magicByte);
     for (let p of mirrorProblems) problems.push("MIRROR (JS): " + p);
-    if (js.stop) {
-        let simhMirror = verifyMirrorSimh(simh, opts, boundary ? boundary.instrPC : js.pc);
-        console.log("\nMirror (upper half == lower half), before and after boot():");
-        for (let r of simhMirror.beforeBoot) {
-            let match = r.primary === r.mirror;
-            console.log(`  +0x${r.off.toString(16).padStart(5, "0")}: SIMH primary=0x${hex(r.primary, 2)} mirror=0x${hex(r.mirror, 2)} ${match ? "" : "<- SIMH ITSELF DISAGREES"}`);
-            if (!match) problems.push(`MIRROR (SIMH): SIMH's own primary/mirror disagree at +0x${r.off.toString(16)}: 0x${hex(r.primary, 2)} vs 0x${hex(r.mirror, 2)}`);
-        }
-        console.log(`  +4 after boot(): SIMH primary=0x${hex(simhMirror.afterBoot.primary4, 2)} mirror=0x${hex(simhMirror.afterBoot.mirror4, 2)}`);
-        if (simhMirror.afterBoot.primary4 !== magicByte) {
-            problems.push(`MIRROR (SIMH): SIMH's own primary +4 after boot is 0x${hex(simhMirror.afterBoot.primary4, 2)}, expected the magic byte 0x${hex(magicByte, 2)}`);
-        }
-        if (simhMirror.afterBoot.mirror4 !== magicByte) {
-            problems.push(`MIRROR (SIMH): SIMH's own mirror +4 after boot is 0x${hex(simhMirror.afterBoot.mirror4, 2)}, expected it to track the magic byte too`);
+    /* pcjsvax-23c: run whenever there is EITHER a genuine VAXStop OR a confirmed-backed boundary
+       (js.stop can now be null in the latter case -- see PHASE 1 above) -- and wrapped in the same
+       spirit as PHASE 1's own try/catch, so a SIMH-side failure here cannot take the rest of the
+       run down with it either. */
+    if (js.stop || boundary) {
+        try {
+            let simhMirror = verifyMirrorSimh(simh, opts, boundary ? boundary.instrPC : js.pc);
+            console.log("\nMirror (upper half == lower half), before and after boot():");
+            for (let r of simhMirror.beforeBoot) {
+                let match = r.primary === r.mirror;
+                console.log(`  +0x${r.off.toString(16).padStart(5, "0")}: SIMH primary=0x${hex(r.primary, 2)} mirror=0x${hex(r.mirror, 2)} ${match ? "" : "<- SIMH ITSELF DISAGREES"}`);
+                if (!match) problems.push(`MIRROR (SIMH): SIMH's own primary/mirror disagree at +0x${r.off.toString(16)}: 0x${hex(r.primary, 2)} vs 0x${hex(r.mirror, 2)}`);
+            }
+            console.log(`  +4 after boot(): SIMH primary=0x${hex(simhMirror.afterBoot.primary4, 2)} mirror=0x${hex(simhMirror.afterBoot.mirror4, 2)}`);
+            if (simhMirror.afterBoot.primary4 !== magicByte) {
+                problems.push(`MIRROR (SIMH): SIMH's own primary +4 after boot is 0x${hex(simhMirror.afterBoot.primary4, 2)}, expected the magic byte 0x${hex(magicByte, 2)}`);
+            }
+            if (simhMirror.afterBoot.mirror4 !== magicByte) {
+                problems.push(`MIRROR (SIMH): SIMH's own mirror +4 after boot is 0x${hex(simhMirror.afterBoot.mirror4, 2)}, expected it to track the magic byte too`);
+            }
+        } catch (e) {
+            problems.push(`MIRROR (SIMH) comparison aborted: ${e.message || e}`);
         }
     }
 

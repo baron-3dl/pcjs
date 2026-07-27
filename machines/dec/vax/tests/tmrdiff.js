@@ -650,6 +650,70 @@ const MUTATIONS = {
             /* the clearInterrupt() call is the ONLY thing omitted */
         };
         return () => { SSCVAX.prototype._tmrCsrWr = orig; };
+    },
+    /*
+     * pcjsvax-055 veracity re-dispatch (coordinator, 2026-07-27): three real defects survived the
+     * original four-mutation suite with exit 0.  Added here, one mutation per finding.
+     */
+    /* #5: STP (stop-on-overflow) deleted entirely from _tmrIncr -- vax_sysdev.c's `if (tmr_csr[tmr]
+       & TMR_CSR_STP) tmr_csr[tmr] &= ~TMR_CSR_RUN;` clause, omitted. A running timer with STP set
+       should stop (RUN clears) on its first overflow; without this clause it keeps running and
+       reloading forever, indistinguishable from STP never having been requested at all. */
+    stp_deleted() {
+        let orig = SSCVAX.prototype._tmrIncr;
+        SSCVAX.prototype._tmrIncr = function(tmr, inc) {
+            let cur = this.tir[tmr] >>> 0;
+            let next = (cur + inc) >>> 0;
+            if (next < cur) {
+                this.tir[tmr] = 0;
+                if (this.tcsr[tmr] & TMR_CSR_DON) this.tcsr[tmr] = (this.tcsr[tmr] | TMR_CSR_ERR) | 0;
+                else this.tcsr[tmr] = (this.tcsr[tmr] | TMR_CSR_DON) | 0;
+                /* the STP -> clear RUN clause is the ONLY thing omitted */
+                if (this.tcsr[tmr] & TMR_CSR_RUN) this.tir[tmr] = this.tnir[tmr] | 0;
+                if ((this.tcsr[tmr] & TMR_CSR_IE) && this.exc) {
+                    this.exc.raiseInterrupt(IPL_HMIN, tmr ? INT_V_TMR1 : INT_V_TMR0);
+                }
+            } else {
+                this.tir[tmr] = next | 0;
+            }
+        };
+        return () => { SSCVAX.prototype._tmrIncr = orig; };
+    },
+    /* #6: the IE gate on raiseInterrupt() deleted from _tmrIncr -- every overflow requests an
+       interrupt unconditionally, IE or not.  vax_sysdev.c's tmr_incr() only calls SET_INT inside
+       `if (tmr_csr[tmr] & TMR_CSR_IE)`; a spurious request with IE clear is invisible to every
+       case in this file that ALSO sets IE (every one of them does, to test dispatch), so this
+       needed its own dedicated, IE-less case to be catchable at all -- see the selfcheck body. */
+    ie_gate_deleted() {
+        let orig = SSCVAX.prototype._tmrIncr;
+        SSCVAX.prototype._tmrIncr = function(tmr, inc) {
+            let cur = this.tir[tmr] >>> 0;
+            let next = (cur + inc) >>> 0;
+            if (next < cur) {
+                this.tir[tmr] = 0;
+                if (this.tcsr[tmr] & TMR_CSR_DON) this.tcsr[tmr] = (this.tcsr[tmr] | TMR_CSR_ERR) | 0;
+                else this.tcsr[tmr] = (this.tcsr[tmr] | TMR_CSR_DON) | 0;
+                if (this.tcsr[tmr] & TMR_CSR_STP) this.tcsr[tmr] = (this.tcsr[tmr] & ~TMR_CSR_RUN) | 0;
+                if (this.tcsr[tmr] & TMR_CSR_RUN) this.tir[tmr] = this.tnir[tmr] | 0;
+                /* the `& TMR_CSR_IE` gate is the ONLY thing omitted -- raiseInterrupt() fires unconditionally */
+                if (this.exc) this.exc.raiseInterrupt(IPL_HMIN, tmr ? INT_V_TMR1 : INT_V_TMR0);
+            } else {
+                this.tir[tmr] = next | 0;
+            }
+        };
+        return () => { SSCVAX.prototype._tmrIncr = orig; };
+    },
+    /* #7: a write case ADDED for T0INT (0x41) -- the exact read/write asymmetry the item's own
+       guidance named as the highest-risk drift (T0INT/T1INT are cased on READ only; vax_sysdev.c's
+       ssc_wr() has no `case 0x41`/`case 0x45` at all).  A write that should silently no-op instead
+       lands in the live TIR. */
+    t0int_write_added() {
+        let orig = SSCVAX.prototype.writeReg;
+        SSCVAX.prototype.writeReg = function(rg, val) {
+            if (rg === REG_T0INT) { this.tir[0] = val | 0; return true; }
+            return orig.call(this, rg, val);
+        };
+        return () => { SSCVAX.prototype.writeReg = orig; };
     }
 };
 
@@ -678,29 +742,85 @@ function selfcheck()
         results.push({ name: "vector_not_masked", caught: ssc.tivr[0] !== (0x7FE & TMR_VEC_MASK) });
     }
     {
-        /* built directly (not via a monkeypatch): install a callback that captures tivr[0] AT
-           CALL TIME (the correct shape) vs. a SECOND VAXExc where the callback captures the
-           value ONCE, immediately, mirroring what a "resolved at install" bug would deliver. */
+        /*
+         * built directly (not via a monkeypatch): install a callback that captures tivr[0] AT
+         * CALL TIME (the correct shape) vs. a SECOND VAXExc where the callback captures the
+         * value ONCE, immediately, mirroring what a "resolved at install" bug would deliver.
+         *
+         * MEASURED BUG, fixed here (coordinator, 2026-07-27): the WRONG source was installed on
+         * bit 99 -- `addInterruptSource()`'s own `this.intVec[lvl-IPL_HMIN][bit] = vec` is a PLAIN
+         * array write (no truncation, genuinely stores at index 99), but `raiseInterrupt()`'s
+         * `this.intReq[...] |= (1 << bit)` is a BITWISE shift, and JS bitwise operators use only
+         * the LOW 5 BITS of the shift count -- `1 << 99 === 1 << 3 === 8`.  So the request bit that
+         * actually got set was bit 3, `deviceVector()`'s scan found REQUEST bit 3 but TABLE index 3
+         * was never installed (the install went to index 99), and `wrongVec` came back 0 via
+         * `if (v === undefined) return 0` -- a DIFFERENT code path than the callback ever running.
+         * The comparison against `liveVec` still happened to flip correctly (0 vs. a nonzero real
+         * vector), but for a reason unrelated to the mutation this case exists to prove -- exactly
+         * the "vacuous comparison arm" class of defect.  Fixed by using bit 25: within the 0-31
+         * range every (un)truncated shift agrees on, so install and raise genuinely refer to the
+         * same slot.  Strengthened further while fixing it: `capturedAtInstall` is now a REAL,
+         * distinguishable OLD vector (0x110, written before the source is installed) rather than
+         * the always-0 fresh-construction default, and `wrongVec` is asserted to equal exactly that
+         * OLD value (not merely "something different from liveVec") -- a coincidental 0 from an
+         * unrelated bug can no longer pass silently.
+         */
         let cpu = new CPUStateVAX({ id: "cpu" });
         let bus = new BusVAX({ busWidth: VAX.PAWIDTH, id: "bus" }, null, null);
         bus.addMemory(0, MEMSIZE, MemoryVAX.TYPE.RAM);
         cpu.setBus(bus);
         cpu.reset();
         let ssc = new SSCVAX(cpu.exc, null);
-        /* SSCVAX's own (correct) wiring already installed a live closure in the constructor above;
-           this second, WRONG source is installed on a private test bit to compare against it,
-           exactly the shape hwintdiff.js's "dynamic_tmr0_reprogrammed" proves against a synthetic
-           prime -- here proved against SSCVAX's REAL storage instead. */
-        let capturedAtInstall = ssc.tivr[0];               // 0 at this point -- the bug's value
-        cpu.exc.addInterruptSource(IPL_HMIN, 99, (c) => capturedAtInstall);   // a spare bit, 99, unused elsewhere
-        ssc.writeReg(REG_T0VEC & 0xFF, 0x1A0);              // program the REAL vector AFTER "install"
-        cpu.exc.raiseInterrupt(IPL_HMIN, 99);
+        const WRONG_BIT = 25;                               // within 0-31; genuinely unused elsewhere here
+        ssc.writeReg(REG_T0VEC & 0xFF, 0x110);               // an OLD, distinguishable vector
+        let capturedAtInstall = ssc.tivr[0];                 // 0x110 -- what a "resolved at install" bug freezes
+        cpu.exc.addInterruptSource(IPL_HMIN, WRONG_BIT, (c) => capturedAtInstall);
+        ssc.writeReg(REG_T0VEC & 0xFF, 0x1A0);               // reprogrammed AFTER "install", BEFORE acknowledge
+        cpu.exc.raiseInterrupt(IPL_HMIN, WRONG_BIT);
         let wrongVec = cpu.exc.deviceVector(cpu, IPL_HMIN);
         /* SSCVAX's OWN live closure (the shipped one, at bit INT_V_TMR0) */
         cpu.exc.raiseInterrupt(IPL_HMIN, INT_V_TMR0);
         let liveVec = cpu.exc.deviceVector(cpu, IPL_HMIN);
-        let caught = (wrongVec !== liveVec) && (liveVec === ((0x1A0 & TMR_VEC_MASK) & QB_VEC_MASK));
+        let wantWrong = (0x110 & TMR_VEC_MASK) & QB_VEC_MASK;
+        let wantLive = (0x1A0 & TMR_VEC_MASK) & QB_VEC_MASK;
+        let caught = (wrongVec === wantWrong) && (liveVec === wantLive) && (wrongVec !== liveVec);
         results.push({ name: "vector_resolved_at_install", caught });
+    }
+    {
+        let restore = MUTATIONS.stp_deleted();
+        let { bus, cpu, ssc } = makeMachine();
+        for (let i = 0; i < 8; i++) bus.setByte(i, NOP_BYTE);
+        ssc.writeReg(REG_T0NI & 0xFF, -1 | 0);
+        ssc.writeReg(REG_T0CSR & 0xFF, (TMR_CSR_XFR | TMR_CSR_RUN | TMR_CSR_STP) | 0);
+        cpu.setPC(0);
+        cpu.stepCPU(1);                    // one tick: TIR -1+1 wraps to 0 -> overflow -> STP should clear RUN
+        restore();
+        let caught = (ssc.tcsr[0] & TMR_CSR_RUN) !== 0;
+        results.push({ name: "stp_deleted", caught });
+    }
+    {
+        let restore = MUTATIONS.ie_gate_deleted();
+        let cpu = new CPUStateVAX({ id: "cpu" });
+        let bus = new BusVAX({ busWidth: VAX.PAWIDTH, id: "bus" }, null, null);
+        bus.addMemory(0, MEMSIZE, MemoryVAX.TYPE.RAM);
+        cpu.setBus(bus);
+        cpu.reset();
+        let ssc = new SSCVAX(cpu.exc, null);
+        ssc.writeReg(REG_T0NI & 0xFF, -1 | 0);
+        ssc.writeReg(REG_T0CSR & 0xFF, (TMR_CSR_XFR | TMR_CSR_SGL) | 0);    // overflow, NO IE
+        restore();
+        let spuriousInt = (cpu.exc.intReq[IPL_HMIN - IPL_HMIN] & (1 << INT_V_TMR0)) !== 0;
+        results.push({ name: "ie_gate_deleted", caught: spuriousInt });
+    }
+    {
+        let restore = MUTATIONS.t0int_write_added();
+        let { ssc } = makeMachine();
+        ssc.writeReg(REG_T0NI & 0xFF, 0x12345678 | 0);
+        ssc.writeReg(REG_T0CSR & 0xFF, TMR_CSR_XFR | 0);        // TIR := TNIR = 0x12345678, no other side effects
+        ssc.writeReg(REG_T0INT & 0xFF, 0xDEADBEEF | 0);         // attempted write to a READ-ONLY register
+        restore();
+        let caught = (ssc.tir[0] >>> 0) !== 0x12345678;
+        results.push({ name: "t0int_write_added", caught });
     }
     {
         let restore = MUTATIONS.request_not_cleared_on_ack();
