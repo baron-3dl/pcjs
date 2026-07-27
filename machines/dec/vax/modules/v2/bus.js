@@ -464,9 +464,13 @@ export default class BusVAX extends Component {
      * addIoPage(devices)
      *
      * pcjsvax-b8a: decodes VAX.PHYSMEM.IOPAGE_BASE -- the KA655's Qbus I/O page -- for however many
-     * Qbus device windows the caller has built.  Today that is exactly ONE, cqipc.js's DBLVAX over
-     * the two bytes of the CQBIC doorbell; the ROM's read of it at instruction #2,424,717 is what
-     * `?91` was (see cqipc.js's header).
+     * Qbus device windows the caller has built.  TWO exist as of pcjsvax-c2c: cqipc.js's DBLVAX over
+     * the two bytes of the CQBIC doorbell (the ROM's read of it at instruction #2,424,717 is what
+     * `?91` was -- see cqipc.js's header), and rq.js's RQVAX over the four bytes of the RQDX3
+     * controller.  Which windows a given MACHINE decodes is that machine builder's list, not this
+     * method's: tests/rommachine.js passes only the doorbell, tests/mscpinitdiff.js only the
+     * controller, and tests/dbldiff.js passes BOTH and asserts -- against the live oracle, address by
+     * address over the whole page -- that the set this tree decodes is exactly those two windows.
      *
      * IT REUSES regblock.js's makeRegController() ON PURPOSE, and the reuse is the point rather than
      * a convenience: that dispatcher's whole contract is "answer for the sub-ranges a device claims,
@@ -479,7 +483,7 @@ export default class BusVAX extends Component {
      *
      * THE I/O PAGE STAYS IN BusVAX.RESERVED, unlike SSC_BASE and CDG_BASE which left that array when
      * they were decoded.  The precedent is deliberately NOT followed, for a reason that is measurable
-     * rather than stylistic: 2 of this range's 8192 bytes are decoded, and TWO instruments derive
+     * rather than stylistic: 6 of this range's 8192 bytes are decoded, and TWO instruments derive
      * their probe pools from BusVAX.RESERVED -- tests/mchkdiff.js and tests/cqmerrdiff.js, the
      * latter of which exists to grade this exact range's unbacked mechanism.  Dropping the entry
      * would delete cqmerrdiff's own subject from its pool and leave a green gate measuring nothing,
