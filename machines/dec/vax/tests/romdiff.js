@@ -553,6 +553,222 @@ function verifySscBaseRandom(simh, opts, seed, n)
 }
 
 /**
+ * FALLTHROUGH_CASES -- the fall-through semantics veracity finding (post-merge re-dispatch).
+ *
+ * WHAT THIS PROVES: an earlier version of ssc.js/cqbic.js/ka655.js's readReg()/writeReg() returned
+ * null/false for ANY register number their own switch did not case, which makeSscController()/
+ * makeRegController() (correctly, at the time) turned into a bus fault.  That is backwards for a
+ * reference INSIDE a decoded device's own span: real KA655 hardware's regtable dispatch (vax_
+ * sysdev.c's ReadReg()/WriteReg(), and vax_io.c's cqbic_wr()) has no `default:` case anywhere in
+ * this tree's scope EXCEPT CQBICVAX's MEAR/SEAR write (a genuine, deliberate bus error) -- every
+ * other "no case matched" is a SILENT NO-OP: the reference completes normally, nothing is stored
+ * (or nothing changes on read), and PC simply advances to the next instruction.  Three concrete,
+ * MEASURED divergences this item's own model had:
+ *
+ *   - A write to KA655's BDR (read-only: ka_wr()'s whole body is `if (rg==0 && aligned) {...}`,
+ *     no else) -- SIMH's PC advances normally, BDR's own readback is UNCHANGED.
+ *   - An UNALIGNED write to KA655's CACR (the SAME `(pa&3)==0` gate rejects it) -- SIMH's PC
+ *     advances normally, CACR's own readback is UNCHANGED by the attempt.
+ *   - A read AND a write of an uncased offset inside the SSC's own decoded span (SSC+0x50, rg=0x14,
+ *     nothing in ssc_rd()/ssc_wr()'s switches names it) -- SIMH reads 0 and accepts the write with
+ *     no state change, no fault either direction.
+ *
+ * Each case below is a REAL instruction sequence, executed for real on the live oracle exactly the
+ * way verifySscBaseRandom()/probeSimhBackedAt() already do ("only an actual instruction reproduces
+ * the real access path"), with SCBB pointed at a NOP-filled handler far from the code so that if
+ * EITHER machine actually machine-checks, PC lands there instead of completing the sequence --
+ * making "did a fault happen" a directly observable, compared fact, not an assumption.
+ *
+ * @typedef {Object} FallthroughCase
+ * @property {string} name
+ * @property {number[]} bytes    the instruction stream (NOPs appended by the runner)
+ * @property {number} steps      exact instruction count in `bytes` (a BYTE count is NOT an
+ *                                instruction count -- see consoledif.js's own history for the bug
+ *                                class this avoids)
+ * @property {number[]} probes   absolute addresses to read back (via `examine -h`) after stepping
+ */
+const FALLTHROUGH_CASES = (function() {
+    const KABASE = (VAX.PHYSMEM.REG_BASE + 0x4000) >>> 0;
+    const KA_BDR = (KABASE + 4) >>> 0;
+    const KA_CACR = KABASE >>> 0;
+    const SSC_UNCASED = (VAX.PHYSMEM.SSC_BASE + 0x50) >>> 0;   // rg=0x14 -- ssc.js does not case it
+    const R_PROBE = 0x00120000;                                 // scratch RAM, distinct from R_CODE
+    const opcMOVL = OPCODES.indexOf("MOVL"), opcMOVB = OPCODES.indexOf("MOVB"), opcTSTL = OPCODES.indexOf("TSTL");
+    if (opcMOVL < 0 || opcMOVB < 0 || opcTSTL < 0) throw new Error("romdiff.js: MOVL/MOVB/TSTL not found in drom.js OPCODES");
+
+    function movlImmToAbs(bytes, immVal, absAddr) {
+        bytes.push(opcMOVL & 0xFF, 0x8F, immVal & 0xFF, (immVal >>> 8) & 0xFF, (immVal >>> 16) & 0xFF, (immVal >>> 24) & 0xFF);
+        bytes.push(0x9F, absAddr & 0xFF, (absAddr >>> 8) & 0xFF, (absAddr >>> 16) & 0xFF, (absAddr >>> 24) & 0xFF);
+    }
+    function movlAbsToAbs(bytes, srcAddr, absAddr) {
+        bytes.push(opcMOVL & 0xFF, 0x9F, srcAddr & 0xFF, (srcAddr >>> 8) & 0xFF, (srcAddr >>> 16) & 0xFF, (srcAddr >>> 24) & 0xFF);
+        bytes.push(0x9F, absAddr & 0xFF, (absAddr >>> 8) & 0xFF, (absAddr >>> 16) & 0xFF, (absAddr >>> 24) & 0xFF);
+    }
+    function movbImmToAbs(bytes, immVal, absAddr) {
+        bytes.push(opcMOVB & 0xFF, 0x8F, immVal & 0xFF);
+        bytes.push(0x9F, absAddr & 0xFF, (absAddr >>> 8) & 0xFF, (absAddr >>> 16) & 0xFF, (absAddr >>> 24) & 0xFF);
+    }
+
+    let cases = [];
+
+    /* KA655 BDR: a longword write, then read BDR back -- must be UNCHANGED, no fault. */
+    {
+        let bytes = [];
+        movlImmToAbs(bytes, 0x00000000, KA_BDR);
+        movlAbsToAbs(bytes, KA_BDR, R_PROBE);
+        cases.push({name: "ka-bdr-write-readonly", bytes, steps: 2, probes: [R_PROBE]});
+    }
+    /* KA655 CACR: an UNALIGNED (offset+2) byte write, then read CACR back (aligned) -- must be
+       UNCHANGED, no fault -- vax_sysdev.c's `(pa & 3) == 0` gate rejects it before ever looking at
+       the data, and there is no else branch to fault on the rejection. */
+    {
+        let bytes = [];
+        movbImmToAbs(bytes, 0xFF, (KA_CACR + 2) >>> 0);
+        movlAbsToAbs(bytes, KA_CACR, R_PROBE);
+        cases.push({name: "ka-cacr-unaligned-write", bytes, steps: 2, probes: [R_PROBE]});
+    }
+    /* SSC uncased offset: TSTL (read, sets CC on the value -- probes CC via PSL, not a memory
+       probe) then a write-then-readback round trip, both against the SAME uncased register. */
+    {
+        let bytes = [];
+        bytes.push(opcTSTL & 0xFF, 0x9F, SSC_UNCASED & 0xFF, (SSC_UNCASED >>> 8) & 0xFF, (SSC_UNCASED >>> 16) & 0xFF, (SSC_UNCASED >>> 24) & 0xFF);
+        cases.push({name: "ssc-uncased-read", bytes, steps: 1, probes: [], probePsl: true});
+    }
+    {
+        let bytes = [];
+        movlImmToAbs(bytes, 0xFFFFFFFF | 0, SSC_UNCASED);
+        movlAbsToAbs(bytes, SSC_UNCASED, R_PROBE);
+        cases.push({name: "ssc-uncased-write-then-read", bytes, steps: 2, probes: [R_PROBE]});
+    }
+
+    return cases;
+})();
+
+/**
+ * verifyFallthroughSemantics(simh, opts)
+ *
+ * Runs every FALLTHROUGH_CASES entry for real on the live oracle AND on this machine's own JS
+ * (built fresh per case via makeMachine(), PC/PSL overridden to the scratch code exactly like
+ * romdiff.js's MUTATIONS/selfcheck already do), and requires BOTH: (1) neither machine faults
+ * (PC does not land in the NOP-filled handler page), and (2) every probed register/PSL value
+ * matches exactly.  A case that only checks "no fault" without also checking the resulting VALUE
+ * would not catch a stub that avoids faulting by inventing a wrong stored value -- see this file's
+ * own MUTATIONS section for the same discipline applied to the SSC base register.
+ *
+ * @param {Uint8Array} romBytes
+ * @param {string} simh
+ * @param {Object} opts
+ * @returns {Array.<string>} problems (empty if none)
+ */
+function verifyFallthroughSemantics(romBytes, simh, opts)
+{
+    const R_SCBB = 0x00100000, R_HANDLER = 0x00102000, R_CODE = 0x00104000, R_KSP = 0x00110000;
+    const NOP_BYTE = OPCODES.indexOf("NOP") & 0xFF;
+    if (NOP_BYTE < 0) throw new Error("romdiff.js: NOP not found in drom.js OPCODES");
+    const MARK = "FALLTHROUGH_";
+    let problems = [];
+
+    /* ---- SIMH side: one script, all cases, `reset all` between them (matches every other batched
+       phase in this file). ---- */
+    let lines = ["set cpu 16m", "set cpu simhalt"];
+    for (let c of FALLTHROUGH_CASES) {
+        lines.push("reset all");
+        lines.push(`deposit SCBB ${hex(R_SCBB)}`, `deposit -l ${hex(R_SCBB + 4)} ${hex(R_HANDLER)}`);
+        lines.push(`deposit KSP ${hex(R_KSP)}`);
+        for (let k = 0; k < 16; k++) lines.push(`deposit -b ${hex(R_HANDLER + k)} ${NOP_BYTE.toString(16)}`);
+        for (let k = 0; k < c.bytes.length + 4; k++) lines.push(`deposit -b ${hex(R_CODE + k)} 0`);
+        for (let i = 0; i < c.bytes.length; i++) lines.push(`deposit -b ${hex(R_CODE + i)} ${c.bytes[i].toString(16)}`);
+        for (let k = 0; k < 4; k++) lines.push(`deposit -b ${hex((R_CODE + c.bytes.length + k) | 0)} ${NOP_BYTE.toString(16)}`);
+        lines.push(`deposit PSL 0`, `deposit PC ${hex(R_CODE)}`);
+        lines.push(`echo ${MARK}${c.name}`);
+        lines.push(`step ${c.steps}`, "examine -h PC");
+        if (c.probePsl) lines.push("examine -h PSL");
+        for (let p of c.probes) lines.push(`examine -h ${hex(p)}`);
+    }
+    lines.push("exit", "");
+    let out = runSimh(simh, lines.join("\n") + "\n", path.join(opts.scratch, "romdiff-fallthrough.ini"));
+
+    let simhResults = new Map();
+    {
+        let out_lines = out.split("\n");
+        let i = 0;
+        while (i < out_lines.length) {
+            let m = out_lines[i].match(new RegExp(MARK + "(\\S+)"));
+            if (!m) { i++; continue; }
+            let name = m[1];
+            let c = FALLTHROUGH_CASES.find((cc) => cc.name === name);
+            let want = 1 + (c.probePsl ? 1 : 0) + c.probes.length;      // PC, [PSL], probes
+            i++;
+            let vals = [];
+            while (i < out_lines.length && vals.length < want) {
+                if (out_lines[i].indexOf(MARK) >= 0) break;
+                let vm = out_lines[i].match(/^\S+:\s+([0-9A-Fa-f]+)/);
+                if (vm) vals.push(parseInt(vm[1], 16) >>> 0);
+                i++;
+            }
+            simhResults.set(name, vals);
+        }
+    }
+
+    /* ---- JS side: fresh machine per case, same instruction bytes, same layout. ---- */
+    for (let c of FALLTHROUGH_CASES) {
+        let simhVals = simhResults.get(c.name);
+        let want = 1 + (c.probePsl ? 1 : 0) + c.probes.length;
+        if (!simhVals || simhVals.length < want) {
+            problems.push(`FALLTHROUGH ${c.name}: SIMH produced ${simhVals ? simhVals.length : 0}/${want} readback(s) -- case did not reach comparison`);
+            continue;
+        }
+        let simhPC = simhVals[0];
+        let simhFaulted = simhPC >= R_HANDLER && simhPC < R_HANDLER + 16;
+        if (simhFaulted) {
+            problems.push(`FALLTHROUGH ${c.name}: the REAL ORACLE ITSELF machine-checked (PC=${hex(simhPC)}) -- this case's own premise (SIMH tolerates this reference) is wrong; fix the fixture, not the model`);
+            continue;
+        }
+
+        let {bus, cpu} = makeMachine(romBytes);
+        cpu.exc.scbb = R_SCBB;
+        cpu.exc.stk[0] = R_KSP;                 // KERN
+        cpu.regs.fill(0);
+        cpu.regs[14] = R_KSP;
+        for (let k = 0; k < 16; k++) bus.setByte(R_HANDLER + k, NOP_BYTE);
+        for (let k = 0; k < c.bytes.length + 4; k++) bus.setByte((R_CODE + k) | 0, 0);
+        for (let i2 = 0; i2 < c.bytes.length; i2++) bus.setByte((R_CODE + i2) | 0, c.bytes[i2]);
+        for (let k = 0; k < 4; k++) bus.setByte((R_CODE + c.bytes.length + k) | 0, NOP_BYTE);
+        cpu.psl = 0;
+        cpu.regs[15] = R_CODE;
+
+        let jsFaulted = false, stopReason = null;
+        try {
+            for (let s = 0; s < c.steps; s++) cpu.stepCPU(1);
+        } catch (e) {
+            jsFaulted = true;
+            stopReason = e && e.reason ? e.reason : String(e);
+        }
+        let jsPC = cpu.regs[15] >>> 0;
+        if (!jsFaulted) jsFaulted = jsPC >= R_HANDLER && jsPC < R_HANDLER + 16;
+
+        if (jsFaulted) {
+            problems.push(`FALLTHROUGH ${c.name}: JS machine-checked where the real oracle did not (PC=${hex(jsPC)}${stopReason ? `, ${stopReason}` : ""}) -- this is the exact class of divergence this case exists to catch`);
+            continue;
+        }
+        if ((jsPC >>> 0) !== (simhPC >>> 0)) {
+            problems.push(`FALLTHROUGH ${c.name}: PC js=${hex(jsPC)} simh=${hex(simhPC)}`);
+        }
+        let idx = 1;
+        if (c.probePsl) {
+            let jsPsl = cpu.psl >>> 0, simhPsl = simhVals[idx++];
+            if (jsPsl !== simhPsl) problems.push(`FALLTHROUGH ${c.name}: PSL js=${hex(jsPsl)} simh=${hex(simhPsl)}`);
+        }
+        for (let p of c.probes) {
+            let jsVal = bus.getLong(p) >>> 0, simhVal = simhVals[idx++];
+            if (jsVal !== simhVal) problems.push(`FALLTHROUGH ${c.name}: probe@${hex(p)} js=${hex(jsVal)} simh=${hex(simhVal)}`);
+        }
+    }
+
+    return problems;
+}
+
+/**
  * captureSimhTrace(simh, opts, breakAddr)
  *
  * A REAL `boot cpu`, bounded by a breakpoint -- see the file header for why.
@@ -926,6 +1142,23 @@ const MUTATIONS = {
         let orig = BoundaryRequired.check;
         BoundaryRequired.check = () => null;
         return () => { BoundaryRequired.check = orig; };
+    },
+    /*
+     * pcjsvax-bfb VERACITY FINDING (post-merge re-dispatch): reverts SSCVAX's fall-through fix to
+     * its ORIGINAL, broken shape -- every uncased register faults again, INCLUDING the genuine
+     * hardware gaps (SSC+0x50, KA655 BDR/misaligned-CACR) FALLTHROUGH_CASES exists to grade.  This
+     * is the exact regression the live verifyFallthroughSemantics() phase (run on every ordinary
+     * invocation, not merely --selfcheck) was built to catch; this mutation proves that phase would
+     * actually catch it, fast, without spending another live SIMH round trip on every selfcheck run
+     * -- the check below calls SSCVAX's OWN readReg()/writeReg() directly against a genuine gap
+     * (rg=0x14, matching the SSC+0x50 fixture) and asserts they no longer return the silent
+     * (0 / true) answer FALLTHROUGH_CASES's own live grading already proved correct.
+     */
+    "fallthrough-reverts-to-blanket-fault": (cpu, bus) => {
+        let origRead = SSCVAX.prototype.readReg, origWrite = SSCVAX.prototype.writeReg;
+        SSCVAX.prototype.readReg = function(rg) { return null; };
+        SSCVAX.prototype.writeReg = function(rg, val) { return false; };
+        return () => { SSCVAX.prototype.readReg = origRead; SSCVAX.prototype.writeReg = origWrite; };
     }
 };
 
@@ -1047,6 +1280,24 @@ function selfcheck(romBytes, opts, magicByte)
                         how = `BoundaryRequired.check() returned null (no problem) for a stop with no named ` +
                             `boundary -- r1(no fault recorded)=${JSON.stringify(r1)}, ` +
                             `r2(fault also absent on real oracle)=${JSON.stringify(r2)}`;
+                    }
+                } else if (name === "fallthrough-reverts-to-blanket-fault") {
+                    /*
+                     * SSC+0x50 (rg=0x14) is a GENUINE hardware gap -- verifyFallthroughSemantics()'s
+                     * live "ssc-uncased-write-then-read" case already proved the real oracle accepts
+                     * a reference there with no fault.  Through the REAL bus path (matching ssc-base-
+                     * not-decoded's own established pattern), the unmutated code must not fault; the
+                     * mutation reverts to the pre-fix blanket behavior, which does.
+                     */
+                    let addr = (VAX.PHYSMEM.SSC_BASE + 0x50) >>> 0;
+                    bus.setLong(addr, 0xFFFFFFFF | 0);
+                    let faultedOnWrite = bus.checkFault();
+                    bus.getLong(addr);
+                    let faultedOnRead = bus.checkFault();
+                    if (faultedOnWrite || faultedOnRead) {
+                        caught = true;
+                        how = `SSC+0x50 (a genuine hardware gap, per verifyFallthroughSemantics()'s own live ` +
+                            `oracle grading) faulted -- write=${faultedOnWrite} read=${faultedOnRead}`;
                     }
                 }
             } finally {
@@ -1220,6 +1471,19 @@ function main()
         console.log(`\nSSC BASE REGISTER MASK (randomized, ${sscCases} cases, real oracle): ` +
             `${sscProblems.length ? "DIVERGED" : "MATCH"}`);
         for (let p of sscProblems) problems.push(p);
+    }
+
+    /* ---- PHASE 1c: fall-through semantics (uncased-register / read-only-write / misaligned-write
+       silent-no-op, NOT a fault), against the real oracle -- veracity finding, post-merge
+       re-dispatch.  A FIXED, exhaustively enumerated case list (FALLTHROUGH_CASES) -- nothing here
+       scales with a --cases flag, so there is no floor to enforce; standing rule 4 is satisfied by
+       construction (see this file's own coverage-floor convention elsewhere for the flag-driven
+       shape this is deliberately NOT using, matching hwintdiff.js's own fixed-matrix precedent). */
+    {
+        let fallthroughProblems = verifyFallthroughSemantics(romBytes, simh, opts);
+        console.log(`\nFALL-THROUGH SEMANTICS (${FALLTHROUGH_CASES.length} fixed cases, real oracle): ` +
+            `${fallthroughProblems.length ? "DIVERGED" : "MATCH"}`);
+        for (let p of fallthroughProblems) problems.push(p);
     }
 
     /* ---- PHASE 2: the mirror ---- */

@@ -14,6 +14,25 @@
  * = BDR (boot/diagnostic register, READ-ONLY -- ka_wr()'s whole body is gated on `rg==0`, there is
  * no BDR write case at all, matching real hardware: BDR reflects boot-time switch/jumper state).
  *
+ * VERACITY FINDING (pcjsvax-bfb re-dispatch) -- "no case" WAS RECORDED CORRECTLY AND CONCLUDED
+ * WRONG: an earlier version of this paragraph observed exactly the fact above -- ka_wr()'s body is
+ * `if ((rg == 0) && ((pa & 3) == 0)) { ka_cacr = ...; }` WITH NO ELSE -- and then had writeReg()
+ * below return `false` for every case that gate excludes, which this project's convention (see
+ * ssc.js's readNone/writeNone routing) turns into a BUS FAULT.  That is backwards.  "No case" in a
+ * C switch/if with no else/default means the C FUNCTION RETURNS NORMALLY HAVING DONE NOTHING -- the
+ * caller's PC advances, no exception is raised.  It does NOT mean "this reference is invalid" --
+ * that would require SIMH's OWN machine-check machinery to be invoked explicitly, which ka_wr()
+ * never does.  MEASURED against the real oracle: a longword write to BDR (@KABASE+4) leaves SIMH's
+ * PC advancing normally with BDR's readback UNCHANGED (0x00000080, BDR_BRKENB); an UNALIGNED write
+ * to CACR (@KABASE+2) likewise advances PC normally with CACR's own readback unaffected by the
+ * write attempt.  Neither dispatches to the handler a genuine machine check would use.  This is the
+ * SAME class of defect ssc.js's readReg()/writeReg() had (see that file's veracity-finding comment)
+ * -- "the switch has no case for this" was conflated with "this access must fault" everywhere in
+ * this tree's first pass, when only ONE register anywhere in these three files (CQBICVAX's MEAR/
+ * SEAR, cqbic.js) is a genuine, deliberate bus error on write.  writeReg() below now returns `true`
+ * (silent accept, matching vax_io.c's own no-else/no-default shape) for BOTH the wrong-register and
+ * the misaligned-CACR case; graded by tests/romdiff.js's verifyFallthroughSemantics().
+ *
  * NOT MODELED: the cache-diagnostic (CDG) side effects CACR's CEN/DIAG bits would otherwise gate --
  * this item's boundary never reaches CDG (VAX.PHYSMEM.CDG_BASE, a SEPARATE, still-undecoded range;
  * see mchkdiff.js's calibration note "CDG_BASE is backed END TO END... 100% expected divergence").
@@ -61,7 +80,10 @@ export default class KA655VAX {
     /**
      * @this {KA655VAX}
      * @param {number} rg
-     * @returns {?number}
+     * @returns {number} the register's value, or 0 if `rg` is not CACR/BDR (see the file header --
+     *   this device's declared span is exactly {CACR, BDR}, so this default is unreachable through
+     *   regblock.js's dispatch today, but is 0 rather than null for the same reason ssc.js's/
+     *   cqbic.js's readReg() are: ka_rd() itself has no `default:` and falls through to `return 0`.
      */
     readReg(rg)
     {
@@ -69,32 +91,38 @@ export default class KA655VAX {
         case REG_CACR: return this.cacr;
         case REG_BDR:  return this.bdr;
         }
-        return null;
+        return 0;
     }
 
     /**
      * writeReg(rg, val, fAligned)
      *
-     * vax_sysdev.c:1211: `if ((rg == 0) && ((pa & 3) == 0))` -- CACR accepts ONLY an ALIGNED
-     * longword write (the byte/word merge every other register in this tree does via a `t = ...rd()`
-     * read-modify step is deliberately NOT reproduced here: real hardware's own gate excludes
-     * anything but an aligned longword before it ever looks at the data).  BDR is read-only: no
-     * `rg == 1` case exists in ka_wr() at all.
+     * vax_sysdev.c:1211: `if ((rg == 0) && ((pa & 3) == 0)) { ka_cacr = ...; }` -- CACR accepts ONLY
+     * an ALIGNED longword write (the byte/word merge every other register in this tree does via a
+     * `t = ...rd()` read-modify step is deliberately NOT reproduced here: real hardware's own gate
+     * excludes anything but an aligned longword before it ever looks at the data).  BDR is
+     * read-only: no `rg == 1` case exists in ka_wr() at all.
+     *
+     * VERACITY FINDING: BOTH of those are SILENT NO-OPS on real hardware -- a write to BDR, and an
+     * unaligned write to CACR, leave SIMH's PC advancing normally with the register's own readback
+     * UNCHANGED.  See the file header's veracity-finding paragraph for the measurement and for why
+     * an earlier version of this function returned `false` (fault) here instead.  This function
+     * therefore ALWAYS returns `true`: there is no register in this device that is a genuine bus
+     * error to write (unlike cqbic.js's MEAR/SEAR) -- only "applied" and "silently ignored".
      *
      * @this {KA655VAX}
      * @param {number} rg
      * @param {number} val
      * @param {boolean} fAligned true for an aligned longword write, matching `(pa & 3) == 0`
-     * @returns {boolean}
+     * @returns {boolean} always true -- see above.
      */
     writeReg(rg, val, fAligned)
     {
         if (rg === REG_CACR && fAligned) {
             this.cacr = (this.cacr & ~(val & CACR_W1C)) | CACR_FIXED;
             this.cacr = (this.cacr & ~CACR_RW) | (val & CACR_RW);
-            return true;
         }
-        return false;
+        return true;
     }
 
     /**
@@ -111,14 +139,12 @@ export default class KA655VAX {
     readWord(addr)
     {
         let v = this.readReg(((addr >>> 0) - KA_BASE) >>> 2);
-        if (v === null) return null;
         return (v >>> ((addr & 2) ? 16 : 0)) & 0xFFFF;
     }
 
     readByte(addr)
     {
         let v = this.readReg(((addr >>> 0) - KA_BASE) >>> 2);
-        if (v === null) return null;
         return (v >>> ((addr & 3) << 3)) & 0xFF;
     }
 

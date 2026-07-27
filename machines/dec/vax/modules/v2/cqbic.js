@@ -96,9 +96,18 @@ export default class CQBICVAX {
     /**
      * readReg(rg)
      *
+     * VERACITY FINDING (pcjsvax-bfb re-dispatch, same class as ssc.js's readReg()): cqbic_rd()'s
+     * switch (vax_io.c:470-491) has no `default:` label either -- `switch (rg) { ...5 cases...; }
+     * return 0;` -- so an `rg` this file does not case is a SILENT 0, never a fault.  Currently
+     * UNREACHABLE in practice (regblock.js's addRegBlock() registers this device over exactly
+     * `length: 0x14` = CQBICSIZE = these 5 registers and nothing more, so `rg` is always in [0,5)
+     * by construction of the caller), but returning 0 here rather than null keeps this file correct
+     * if that registration is ever widened, and matches the same "no default means silent, not
+     * fault" contract ssc.js's readReg()/writeReg() now document explicitly.
+     *
      * @this {CQBICVAX}
      * @param {number} rg
-     * @returns {?number}
+     * @returns {number}
      */
     readReg(rg)
     {
@@ -109,7 +118,7 @@ export default class CQBICVAX {
         case REG_SEAR: return this.sear & CQSEAR_MASK;
         case REG_MBR:  return this.mbr & CQMBR_MASK;
         }
-        return null;
+        return 0;
     }
 
     /**
@@ -117,13 +126,22 @@ export default class CQBICVAX {
      *
      * vax_io.c:495-527.  `case 2: case 3:` (MEAR/SEAR) are READ-ONLY latches on real hardware: a
      * program WRITE to either one is itself a bus error (`cq_merr()` + a synchronous machine check,
-     * vax_io.c:518-520) -- reproduced here by returning false (the caller's bus-fault path, exactly
-     * as an undecoded register would), not by storing anything.
+     * vax_io.c:518-520) -- reproduced here by returning false (the caller's bus-fault path).  THIS
+     * IS THE ONLY CASE IN THIS ENTIRE DEVICE FILE THAT GENUINELY FAULTS ON WRITE -- do not confuse
+     * it with "uncased register" (the trailing default below, and the KA655/SSC equivalents in
+     * ka655.js/ssc.js), which is a SILENT NO-OP, not a fault.  Conflating the two -- "no case
+     * matched" and "this specific register is a deliberate bus error" -- into a single `false`
+     * return was exactly the veracity finding this re-dispatch fixes elsewhere in this codebase
+     * (ka655.js's BDR, ssc.js's uncased offsets); it happens to have been RIGHT here by construction
+     * only because MEAR/SEAR really do fault and every other rg reaching this switch is cased.
      *
      * @this {CQBICVAX}
      * @param {number} rg
      * @param {number} val
-     * @returns {boolean}
+     * @returns {boolean} true for a handled write (cased and applied); false ONLY for MEAR/SEAR,
+     *   which must genuinely fault -- never returned for "not cased" (see readReg()'s doc comment;
+     *   the trailing default below returns true, a silent accept, matching cqbic_wr()'s own
+     *   default-less switch).
      */
     writeReg(rg, val)
     {
@@ -136,12 +154,12 @@ export default class CQBICVAX {
             return true;
         case REG_MEAR:
         case REG_SEAR:
-            return false;                        // vax_io.c: cq_merr() + MACH_CHECK -- a bus error
+            return false;                        // vax_io.c: cq_merr() + MACH_CHECK -- a REAL bus error, not a fallthrough
         case REG_MBR:
             this.mbr = (val & CQMBR_MASK) | 0;
             return true;
         }
-        return false;
+        return true;
     }
 
     /**
@@ -155,14 +173,12 @@ export default class CQBICVAX {
     readWord(addr)
     {
         let v = this.readReg(((addr >>> 0) - CQBIC_BASE) >>> 2);
-        if (v === null) return null;
         return (v >>> ((addr & 2) ? 16 : 0)) & 0xFFFF;
     }
 
     readByte(addr)
     {
         let v = this.readReg(((addr >>> 0) - CQBIC_BASE) >>> 2);
-        if (v === null) return null;
         return (v >>> ((addr & 3) << 3)) & 0xFF;
     }
 
