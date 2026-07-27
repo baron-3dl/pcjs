@@ -60,6 +60,26 @@
  * Every named floor below FAILS the run if unmet and does not shrink with a smaller --cases value
  * (the fixed matrix is a fixed list, not a sample).
  *
+ * A NEW FAILURE SHAPE FOR THIS PROJECT -- READ BEFORE ADDING A --selfcheck MUTATION HERE
+ * ------------------------------------------------------------------------------------------
+ * pcjsvax-055 veracity round 2 (coordinator, 2026-07-27): a --selfcheck mutation that REPLACES the
+ * shipped method under test with an independent, hand-written copy is IDEMPOTENT -- and therefore
+ * WORTHLESS -- the instant the shipped method is ALREADY broken in the same way the mutation
+ * simulates.  `let orig = SSCVAX.prototype.X; SSCVAX.prototype.X = function(...) {...};` captures
+ * `orig` but never CALLS it, so the assertion only ever checks "does my own synthetic stand-in
+ * behave the way I built it to" -- true by construction, regardless of what the real, shipped code
+ * does.  Three mutations here (stp_deleted/ie_gate_deleted/t0int_write_added) were built exactly
+ * this way and printed "CAUGHT" while the corresponding defect was live-injected into ssc.js's
+ * REAL source -- worse than a silent gap, because it ACTIVELY CERTIFIES coverage that does not
+ * exist.  The fix (see the MUTATIONS object's own doc comment, and vector_resolved_at_install,
+ * which never had this problem because it reads a live closure over `this` rather than replacing
+ * anything): a mutation must CALL `orig` and surgically undo or force only the ONE effect it names,
+ * so that if `orig` is already broken the same way, the wrapper's extra step is a no-op and the
+ * test observes `orig`'s OWN real behavior -- never a synthetic replica's.  PROOF, not assertion:
+ * every mutation added or fixed under this finding was verified by editing ssc.js's shipped source
+ * directly, confirming the suite FAILS, then restoring and confirming the file byte-identical --
+ * that is what actually closes a coverage gap; a selfcheck mutation is corroboration, not evidence.
+ *
  *      node machines/dec/vax/tests/tmrdiff.js [--simh PATH] [--cases N] [--selfcheck]
  */
 
@@ -207,7 +227,13 @@ const covered = {
     dispatchMaskChainT0: false, dispatchT1: false,
     errOnSecondOverflow: false,
     ieClearWithdrawsPending: false,
-    runModeCountingRom: false
+    runModeCountingRom: false,
+    /* veracity round 2 (coordinator, 2026-07-27): these three floors did not exist at all -- see
+       caseStpClearsRun()/caseOverflowNoIeNoInterrupt()/caseT0IntWriteNoOp()'s own doc comments for
+       the measured, live-injection-confirmed gap each one closes. */
+    stpClearsRun: false,
+    overflowNoIeNoInterrupt: false,
+    t0intWriteNoOp: false
 };
 
 /* ------------------------------------------------------------------------------------------- *
@@ -496,6 +522,123 @@ function caseRunModeCountingRom(bin, scratch, failures)
     covered.runModeCountingRom = true;
 }
 
+/**
+ * caseStpClearsRun(bin, scratch, failures)
+ *
+ * pcjsvax-055 veracity round 2 (coordinator, 2026-07-27): NO case anywhere in this file (nor in
+ * timerdiff.js/hwintdiff.js) ever set TMR_CSR_STP -- vax_sysdev.c's tmr_incr() clause
+ * `if (tmr_csr[tmr] & TMR_CSR_STP) tmr_csr[tmr] &= ~TMR_CSR_RUN;` was therefore completely
+ * unexercised by anything graded against the live oracle.  LIVE-INJECTION CONFIRMED: deleting that
+ * clause from ssc.js's real, shipped _tmrIncr() left this whole suite at exit 0 with every floor
+ * green, identical to a correct build.  STP only has an observable effect on a timer that is
+ * ACTUALLY RUNNING (SGL's own RUN-is-never-set branch makes STP a no-op there, since there is
+ * nothing for it to stop) -- this case therefore runs from the ROM address window like
+ * caseRunModeCountingRom(), with TNIR=-1 so exactly ONE tick overflows it, keeping the tick-count
+ * arithmetic (see that case's own doc comment on why readback steps tick too) as simple as
+ * possible: only ONE dedicated NOP is needed before RUN is already cleared, so the two readback
+ * steps that follow tick 0 additional times (tick() checks RUN before calling _tmrIncr() at all).
+ *
+ * @param {string} bin
+ * @param {string} scratch
+ * @param {Array<string>} failures
+ */
+function caseStpClearsRun(bin, scratch, failures)
+{
+    let tag = "stp_clears_run_t0";
+    let code = [];
+    movlImmToAbs(code, -1, sscAddr(REG_T0NI));
+    movlImmToAbs(code, 0x1D0, sscAddr(REG_T0VEC));
+    movlImmToAbs(code, TMR_CSR_XFR | TMR_CSR_IE | TMR_CSR_RUN | TMR_CSR_STP, sscAddr(REG_T0CSR));
+    const SETUP_INSTRS = 3;
+    code.push(NOP_BYTE);                                    // 1 dedicated tick: TNIR=-1 overflows immediately
+    movlAbsToReg(code, sscAddr(REG_T0CSR), 0);
+    movlAbsToReg(code, sscAddr(REG_T0INT), 1);
+    /* masked throughout (IPL_HMIN=0x14): IE stays set (STP/RUN are independent RW bits, not W1C --
+       only RUN itself gets cleared by the overflow), so a request is genuinely raised and pending. */
+    let { js, simh } = runFixedCase(bin, scratch, tag, code, { steps: SETUP_INSTRS + 1 + 2, rom: true, ipl: 0x14 });
+    checkExact(failures, tag, js.R0, simh.R0, "R0 (T0CSR after overflow with STP set)");
+    checkExact(failures, tag, js.R1, simh.R1, "R1 (T0INT/TIR after overflow with STP set)");
+    /* STP clears ONLY the RUN bit -- IE and STP themselves are ordinary RW config bits, not W1C,
+       and are untouched by the overflow itself; RUN's clearance is also what prevents any further
+       reload-and-continue, so TIR stays at 0 rather than being reloaded from TNIR. */
+    let wantCsr = (TMR_CSR_DON | TMR_CSR_IE | TMR_CSR_STP) >>> 0;
+    if ((js.R0 >>> 0) !== wantCsr) {
+        failures.push(`${tag}: JS CSR=${hex(js.R0)}, expected DON|IE|STP (RUN cleared by STP)=${hex(wantCsr)}`);
+    }
+    if (js.R1 !== 0) {
+        failures.push(`${tag}: JS TIR=${hex(js.R1)}, expected 0 (RUN cleared by STP, so no reload-and-continue)`);
+    }
+    covered.stpClearsRun = true;
+}
+
+/**
+ * caseOverflowNoIeNoInterrupt(bin, scratch, failures)
+ *
+ * pcjsvax-055 veracity round 2: EVERY overflow-triggering case elsewhere in this file sets IE (to
+ * also test dispatch or CSR readback), so `if (tmr_csr[tmr] & TMR_CSR_IE)` guarding
+ * exc.raiseInterrupt() inside _tmrIncr() was never exercised in its FALSE state.  LIVE-INJECTION
+ * CONFIRMED: deleting that gate (raising unconditionally on every overflow) left this whole suite
+ * at exit 0. SGL overflow with IE deliberately clear, then ONE more step at PSL<IPL>=0 (unmasked)
+ * -- if a request was wrongly raised, that step dispatches to R_HANDLER instead of running the
+ * trailing NOP; if none was raised (correct), PC simply advances past it.
+ *
+ * @param {string} bin
+ * @param {string} scratch
+ * @param {Array<string>} failures
+ */
+function caseOverflowNoIeNoInterrupt(bin, scratch, failures)
+{
+    let tag = "overflow_no_ie_no_interrupt_t0";
+    let code = [];
+    movlImmToAbs(code, -1, sscAddr(REG_T0NI));
+    movlImmToAbs(code, 0x1F0, sscAddr(REG_T0VEC));
+    movlImmToAbs(code, TMR_CSR_XFR | TMR_CSR_SGL, sscAddr(REG_T0CSR));   // overflow, IE deliberately CLEAR
+    movlAbsToReg(code, sscAddr(REG_T0CSR), 0);
+    let { js, simh } = runFixedCase(bin, scratch, tag, code, {
+        steps: 5, scbVec: 0x1F0, iplSchedule: [0x14, 0x14, 0x14, 0x14, 0]
+    });
+    checkExact(failures, tag, js.R0, simh.R0, "R0 (T0CSR after overflow with IE clear)");
+    checkExact(failures, tag, js.PC, simh.PC, "PC (must NOT be R_HANDLER -- IE was never set, nothing to dispatch)");
+    let wantCsr = TMR_CSR_DON >>> 0;
+    if ((js.R0 >>> 0) !== wantCsr) {
+        failures.push(`${tag}: JS CSR=${hex(js.R0)}, expected DON only (no IE)=${hex(wantCsr)}`);
+    }
+    if ((js.PC >>> 0) === R_HANDLER) {
+        failures.push(`${tag}: JS dispatched to R_HANDLER on an overflow with IE clear -- the IE gate on raiseInterrupt() is missing`);
+    }
+    covered.overflowNoIeNoInterrupt = true;
+}
+
+/**
+ * caseT0IntWriteNoOp(bin, scratch, failures)
+ *
+ * pcjsvax-055 veracity round 2: no case anywhere in this file ever attempted a WRITE to T0INT
+ * (0x41) -- the exact read/write asymmetry the item's own guidance named as the single highest-
+ * risk edit (T0INT is cased on READ only; vax_sysdev.c's ssc_wr() has no `case 0x41` at all).
+ * LIVE-INJECTION CONFIRMED: adding a write case that lands the value in TIR left this whole suite
+ * at exit 0.  A distinguishable, non-trivial TIR value (via XFR, no RUN/SGL/IE side effects) must
+ * survive an attempted MOVL write to T0INT completely unmolested.
+ *
+ * @param {string} bin
+ * @param {string} scratch
+ * @param {Array<string>} failures
+ */
+function caseT0IntWriteNoOp(bin, scratch, failures)
+{
+    let tag = "t0int_write_noop";
+    let code = [];
+    movlImmToAbs(code, 0x5A5A5A5A | 0, sscAddr(REG_T0NI));
+    movlImmToAbs(code, TMR_CSR_XFR, sscAddr(REG_T0CSR));            // TIR := TNIR = 0x5A5A5A5A, nothing else
+    movlImmToAbs(code, 0xDEADBEEF | 0, sscAddr(REG_T0INT));         // attempted write to a READ-ONLY register
+    movlAbsToReg(code, sscAddr(REG_T0INT), 0);
+    let { js, simh } = runFixedCase(bin, scratch, tag, code, { steps: 4 });
+    checkExact(failures, tag, js.R0, simh.R0, "R0 (T0INT/TIR readback after an attempted write to it)");
+    if ((js.R0 >>> 0) !== 0x5A5A5A5A) {
+        failures.push(`${tag}: JS TIR=${hex(js.R0)}, expected 0x5A5A5A5A (the write to T0INT must silently no-op)`);
+    }
+    covered.t0intWriteNoOp = true;
+}
+
 function phaseFixed(bin, scratch)
 {
     let failures = [];
@@ -508,6 +651,9 @@ function phaseFixed(bin, scratch)
     caseErrOnSecondOverflow(bin, scratch, failures);
     caseIeClearWithdrawsPending(bin, scratch, failures);
     caseRunModeCountingRom(bin, scratch, failures);
+    caseStpClearsRun(bin, scratch, failures);
+    caseOverflowNoIeNoInterrupt(bin, scratch, failures);
+    caseT0IntWriteNoOp(bin, scratch, failures);
     return failures;
 }
 
@@ -652,8 +798,37 @@ const MUTATIONS = {
         return () => { SSCVAX.prototype._tmrCsrWr = orig; };
     },
     /*
-     * pcjsvax-055 veracity re-dispatch (coordinator, 2026-07-27): three real defects survived the
-     * original four-mutation suite with exit 0.  Added here, one mutation per finding.
+     * pcjsvax-055 veracity re-dispatch (coordinator, 2026-07-27): three real defects (STP deleted,
+     * the IE gate deleted, a T0INT write case wrongly added) survived the original four-mutation
+     * suite with exit 0 -- AND, on the FIRST attempt to fix them, survived AGAIN, because the fix
+     * replaced `SSCVAX.prototype.X` with an entirely independent hand-written copy that never once
+     * called the real, shipped `orig`.  MECHANISM, worth carrying forward: a mutation that REPLACES
+     * the method under test is IDEMPOTENT when the shipped method is ALREADY broken in the same
+     * way -- `orig` is captured but never invoked, so the assertion only ever checks "does my own
+     * synthetic stand-in behave the way I built it to", which is true by construction regardless of
+     * what the real code does.  Demonstrated live: injecting each of these three defects directly
+     * into ssc.js's shipped source and running --selfcheck printed "CAUGHT" for all three, because
+     * the synthetic replacement papered over the real bug instead of exposing it -- a WORSE failure
+     * mode than an untested gap, because it actively certifies coverage that does not exist.
+     *
+     * THE FIX, for #5/#6/#7 below: each mutation now CALLS `orig` first (so whatever the shipped
+     * code actually does -- correct or already-broken -- genuinely happens), then surgically undoes
+     * or forces only the ONE specific effect the named defect removes or adds.  If `orig` is
+     * correct, the wrapper introduces the defect.  If `orig` is ALREADY broken the same way, the
+     * wrapper's extra step is a no-op (there is nothing left to undo, or the forced effect was
+     * already present) and the test still observes the wrong symptom -- CORRECTLY, because it is
+     * now `orig`'s OWN behavior being observed, not a synthetic stand-in's.  This is the same
+     * "read/compose over the shipped path rather than replace it" idiom vector_resolved_at_install
+     * already used (a live closure over `this`, never monkeypatched at all).
+     *
+     * NEITHER FIX above is a substitute for REAL COVERAGE, though -- these three defects are now
+     * ALSO caught, independently of --selfcheck entirely, by three real oracle-graded PHASE 1 cases
+     * (caseStpClearsRun/caseOverflowNoIeNoInterrupt/caseT0IntWriteNoOp) with their own coverage
+     * floors, added in the SAME fix.  Verified by literally editing ssc.js's shipped source to
+     * reintroduce each defect, one at a time, and confirming the ORDINARY (non-selfcheck) run fails
+     * on the corresponding new case, then restoring and confirming the file is byte-identical again.
+     * That is what actually closed the gap; the selfcheck mutations below are the fast, JS-only
+     * corroboration, not the primary evidence.
      */
     /* #5: STP (stop-on-overflow) deleted entirely from _tmrIncr -- vax_sysdev.c's `if (tmr_csr[tmr]
        & TMR_CSR_STP) tmr_csr[tmr] &= ~TMR_CSR_RUN;` clause, omitted. A running timer with STP set
@@ -662,19 +837,14 @@ const MUTATIONS = {
     stp_deleted() {
         let orig = SSCVAX.prototype._tmrIncr;
         SSCVAX.prototype._tmrIncr = function(tmr, inc) {
-            let cur = this.tir[tmr] >>> 0;
-            let next = (cur + inc) >>> 0;
-            if (next < cur) {
-                this.tir[tmr] = 0;
-                if (this.tcsr[tmr] & TMR_CSR_DON) this.tcsr[tmr] = (this.tcsr[tmr] | TMR_CSR_ERR) | 0;
-                else this.tcsr[tmr] = (this.tcsr[tmr] | TMR_CSR_DON) | 0;
-                /* the STP -> clear RUN clause is the ONLY thing omitted */
-                if (this.tcsr[tmr] & TMR_CSR_RUN) this.tir[tmr] = this.tnir[tmr] | 0;
-                if ((this.tcsr[tmr] & TMR_CSR_IE) && this.exc) {
-                    this.exc.raiseInterrupt(IPL_HMIN, tmr ? INT_V_TMR1 : INT_V_TMR0);
-                }
-            } else {
-                this.tir[tmr] = next | 0;
+            let hadRun = !!(this.tcsr[tmr] & TMR_CSR_RUN);
+            orig.call(this, tmr, inc);
+            /* undo ONLY the STP-clears-RUN effect: if `orig` just cleared RUN specifically because
+               STP was set (the correct behavior), put RUN back.  If `orig` is ALREADY broken and
+               never cleared it, this branch does not fire -- RUN is already (wrongly) still set,
+               and the test observes that real fact directly. */
+            if (hadRun && (this.tcsr[tmr] & TMR_CSR_STP) && !(this.tcsr[tmr] & TMR_CSR_RUN)) {
+                this.tcsr[tmr] = (this.tcsr[tmr] | TMR_CSR_RUN) | 0;
             }
         };
         return () => { SSCVAX.prototype._tmrIncr = orig; };
@@ -687,18 +857,15 @@ const MUTATIONS = {
     ie_gate_deleted() {
         let orig = SSCVAX.prototype._tmrIncr;
         SSCVAX.prototype._tmrIncr = function(tmr, inc) {
-            let cur = this.tir[tmr] >>> 0;
-            let next = (cur + inc) >>> 0;
-            if (next < cur) {
-                this.tir[tmr] = 0;
-                if (this.tcsr[tmr] & TMR_CSR_DON) this.tcsr[tmr] = (this.tcsr[tmr] | TMR_CSR_ERR) | 0;
-                else this.tcsr[tmr] = (this.tcsr[tmr] | TMR_CSR_DON) | 0;
-                if (this.tcsr[tmr] & TMR_CSR_STP) this.tcsr[tmr] = (this.tcsr[tmr] & ~TMR_CSR_RUN) | 0;
-                if (this.tcsr[tmr] & TMR_CSR_RUN) this.tir[tmr] = this.tnir[tmr] | 0;
-                /* the `& TMR_CSR_IE` gate is the ONLY thing omitted -- raiseInterrupt() fires unconditionally */
-                if (this.exc) this.exc.raiseInterrupt(IPL_HMIN, tmr ? INT_V_TMR1 : INT_V_TMR0);
-            } else {
-                this.tir[tmr] = next | 0;
+            let hadOverflow = !!(this.tcsr[tmr] & (TMR_CSR_DON | TMR_CSR_ERR));
+            orig.call(this, tmr, inc);
+            let hasOverflow = !!(this.tcsr[tmr] & (TMR_CSR_DON | TMR_CSR_ERR));
+            /* an overflow genuinely just happened (DON/ERR newly set by `orig`) -- force the
+               request regardless of IE, undoing exactly the `& TMR_CSR_IE` gate.  raiseInterrupt()
+               is idempotent (an OR of one bit), so if `orig` is ALREADY broken and raised it
+               unconditionally itself, this is a harmless no-op layered on top of the real bug. */
+            if (!hadOverflow && hasOverflow && this.exc) {
+                this.exc.raiseInterrupt(IPL_HMIN, tmr ? INT_V_TMR1 : INT_V_TMR0);
             }
         };
         return () => { SSCVAX.prototype._tmrIncr = orig; };
@@ -710,8 +877,12 @@ const MUTATIONS = {
     t0int_write_added() {
         let orig = SSCVAX.prototype.writeReg;
         SSCVAX.prototype.writeReg = function(rg, val) {
+            let result = orig.call(this, rg, val);
+            /* force the write to land regardless of what `orig` did -- if `orig` already had this
+               defect (a real `case REG_T0INT` landing the value), this is a redundant, harmless
+               no-op on top of the real bug; the test still observes the real, wrong TIR value. */
             if (rg === REG_T0INT) { this.tir[0] = val | 0; return true; }
-            return orig.call(this, rg, val);
+            return result;
         };
         return () => { SSCVAX.prototype.writeReg = orig; };
     }
