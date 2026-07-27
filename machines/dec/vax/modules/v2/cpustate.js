@@ -920,6 +920,27 @@ export default class CPUStateVAX extends Component {
     {
         this.nBurstCycles = this.nStepCycles = nMinCycles;
         this.fStopped = false;
+        /*
+         * vax_cpu.c:514, `in_ie = 0`.  SIMH resets this UNCONDITIONALLY at the top of every
+         * sim_instr() call -- i.e. every SCP `step` command -- regardless of what the PREVIOUS
+         * call left it at.  stepCPU() is that same per-call boundary (one call here == one `step`
+         * from SCP), so it must do the same reset.  Without it: exc.js's intexc() sets
+         * `this.inIE = 1` at its own entry and clears it only on normal completion; if intexc()
+         * itself throws (its parameter/frame pushes go through mmu.writeData(), which faults on a
+         * corrupted or unbacked stack pointer), the throw skips the clear and `inIE` is left stuck
+         * at 1 -- forever, across every LATER stepCPU() call in this process, because nothing else
+         * ever clears it.  A subsequent, otherwise perfectly ordinary fault then hits takeFault()'s
+         * `if (this.inIE) throw ... INIE` guard immediately, before intexc() is even attempted,
+         * and a step that should have dispatched a normal exception stops the machine instead.
+         * pcjsvax-1be; reproduced directly against real SIMH (see cpudiff.js's phaseInIEReset(),
+         * PHASE 3, "INIE-RESET"): a step that hits STOP_INIE via a failed dispatch, followed by a
+         * second, unrelated step whose only fault is an ordinary unbacked write, must MATCH SIMH's
+         * second step succeeding -- not carry the first step's stuck flag into it.  `exc.reset()`
+         * also clears `inIE` (its own doc comment), but that is the FULL "clear my state" reset
+         * between differential CASES, a different and unrelated boundary from the per-call one
+         * this fixes.
+         */
+        this.exc.inIE = 0;
 
         while (this.nStepCycles > 0) {
             /*
