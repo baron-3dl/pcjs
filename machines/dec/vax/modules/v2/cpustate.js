@@ -105,6 +105,7 @@ const nSP = 14, nPC = 15;
 
 const PSL_IS = 1 << 26;
 const PSL_IPL1F = 0x1F << 16;
+const CON_PWRUP = 0x0300;                   // vaxmod_defs.h:87 -- boot()'s conpsl, see exc.js
 const AST_MAX = 4;                          // vax_cpu.c cpu_reset(): ASTLVL = 4
 
 /**
@@ -744,6 +745,13 @@ export default class CPUStateVAX extends Component {
         this.setPC(VAX.PHYSMEM.ROM_BASE);
         this.psl = (PSL_IS | PSL_IPL1F) >>> 0;
         this.bus.setByteDirect((VAX.PHYSMEM.ROM_BASE + 4) >>> 0, magicByte & 0xFF);
+        /*
+         * vax_sysdev.c:1719-1721, cpu_boot()'s own two conpc/conpsl assignments -- pcjsvax-bfb's
+         * own romdiff boundary-advance (see exc.js's conpc/conpsl doc comment): the ROM's fourth and
+         * fifth instructions read them via MFPR CONPC/MFPR CONPSL before ever touching a device.
+         */
+        this.exc.conpc = 0;
+        this.exc.conpsl = (PSL_IS | PSL_IPL1F | CON_PWRUP) >>> 0;
     }
 
     /* --------------------------------------------------------------------------------------- *

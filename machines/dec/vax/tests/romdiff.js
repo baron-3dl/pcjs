@@ -89,6 +89,10 @@ import CPUStateVAX, { VAXStop, ROM_MAGIC_BYTE } from "../modules/v2/cpustate.js"
 import SimhTrace, { nonStoringResultOpcodes } from "./simhtrace.js";
 import { OPCODES, DROM, DROM_STRIDE, DR } from "../modules/v2/drom.js";
 import SSCVAX from "../modules/v2/ssc.js";
+import NVRVAX from "../modules/v2/nvr.js";
+import CQBICVAX from "../modules/v2/cqbic.js";
+import KA655VAX from "../modules/v2/ka655.js";
+import ConsoleVAX from "../modules/v2/console.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -173,9 +177,22 @@ function makeMachine(romBytes)
     let bus = new BusVAX({busWidth: VAX.PAWIDTH, id: "bus"}, null, null);
     bus.addMemory(0, MEMSIZE, MemoryVAX.TYPE.RAM);
     bus.addRom(romBytes);
-    bus.addSsc(new SSCVAX());
+    /* SSCVAX's REG_BTO and CQBICVAX's DSER/MEAR are the SAME state pcjsvax-446/d22 already track on
+       cpu.exc (sscBto/cqDser/cqMear) -- see ssc.js's and cqbic.js's file headers -- so both devices
+       are constructed with a `cpu.exc` reference.  CPUStateVAX's constructor builds `exc` before
+       setBus() is ever called, so cpu can be constructed first here without a bus yet attached. */
     let cpu = new CPUStateVAX({id: "cpu"});
+    /* ConsoleVAX (pcjsvax-bfb) models RXCS/RXDB/TXCS/TXDB ONCE and is wired into BOTH address
+       paths: setIPRDevice() below (the IPR path) and SSCVAX's third constructor argument (the SSC
+       mirror) -- see console.js's and ssc.js's file headers. */
+    let consoleDev = new ConsoleVAX(cpu.exc);
+    bus.addSsc(new SSCVAX(cpu.exc, consoleDev), new NVRVAX());
+    bus.addRegBlock([
+        {base: VAX.PHYSMEM.REG_BASE >>> 0, length: 0x14, dev: new CQBICVAX(cpu.exc)},
+        {base: (VAX.PHYSMEM.REG_BASE + 0x4000) >>> 0, length: 8, dev: new KA655VAX()}
+    ]);
     cpu.setBus(bus);
+    cpu.exc.setIPRDevice(consoleDev);
     return {bus, cpu};
 }
 

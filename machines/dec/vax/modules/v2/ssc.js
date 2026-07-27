@@ -102,6 +102,8 @@
  */
 
 import { VAX } from "./defines.js";
+import { NVR_BASE, NVR_LENGTH } from "./nvr.js";
+import { SSCBTO_BTO, SSCBTO_RWT } from "./exc.js";
 
 const SSC_BASE = VAX.PHYSMEM.SSC_BASE >>> 0;
 const SSC_LENGTH = VAX.PHYSMEM.SSC_LENGTH;
@@ -111,20 +113,83 @@ const SSC_LENGTH = VAX.PHYSMEM.SSC_LENGTH;
  * writes).  Only the registers this item decodes get a name; see the file header for the rest.
  */
 const REG_BASE = 0x00;
+const REG_CNF  = 0x04;
+const REG_BTO  = 0x08;
+const REG_OTP  = 0x0C;
+const REG_ADS0M = 0x4C;
+const REG_ADS0K = 0x4D;
+const REG_ADS1M = 0x50;
+const REG_ADS1K = 0x51;
+const REG_RXCS = 0x20;
+const REG_RXDB = 0x21;
+const REG_TXCS = 0x22;
+const REG_TXDB = 0x23;
+
+/* SSC bus-timeout register, vax_sysdev.c:179-183 and :1279-1280/1376-1378 (ssc_rd/ssc_wr case
+   0x08) -- pcjsvax-bfb's own romdiff boundary-advance, instruction #28 (a READ of SSC+0x20).  NOT
+   new state: pcjsvax-446 already models this exact register on VAXExc (`cpu.exc.sscBto`,
+   exc.js's busTimeout()) for the machine-check side of an unbacked register-space reference --
+   vax_sysdev.c's `ssc_bto` is the SAME C global both busTimeout()'s equivalent (ReadReg/WriteReg's
+   `default:` case) and ssc_rd()/ssc_wr()'s case 0x08 touch.  So SSCVAX reads/writes THROUGH `exc`
+   (a constructor argument, optional -- a caller that never wires it simply cannot reach this
+   register, exactly as an undecoded one would) rather than keeping a second, divergeable copy. */
+const SSCBTO_INTV = 0x00FFFFFF;                 // interval, NI (not implemented) -- plain RW storage
+const SSCBTO_W1C = (SSCBTO_BTO | SSCBTO_RWT) | 0;
+const SSCBTO_RW  = SSCBTO_INTV;
 
 /* SSC base register, vax_sysdev.c:144-145. */
 const SSCBASE_MBO = 0x20000000 | 0;             // must-be-one bits
 const SSCBASE_RW  = 0x1FFFFC00;                 // the only bits software can actually change
+
+/* SSC configuration register, vax_sysdev.c:149-157 and :1274-1277/1370-1373 (ssc_rd/ssc_wr case
+   0x04) -- pcjsvax-bfb's own romdiff boundary-advance, instruction #27 of the ROM's boot-entry
+   trace (a READ of SSC+0x10, physical 0x20140010).  SSCCNF_BLO ("battery low", W1C) starts SET:
+   vax_sysdev.c's nvr_reset() ORs it in whenever NVR's backing store is freshly allocated
+   (`if (nvr == NULL) { ...; ssc_cnf |= SSCCNF_BLO; }`, vax_sysdev.c:679-684) and nvr_attach()
+   clears it once a real file is attached -- this project's harnesses never attach a persistent NVR
+   file, so every run models the "fresh, no backing file" state, exactly as nvr.js's own NVRVAX
+   models a freshly-zeroed array every construction. */
+const SSCCNF_BLO = 0x80000000 | 0;
+const SSCCNF_W1C = SSCCNF_BLO;
+const SSCCNF_RW  = 0x0BF7F777;
+
+/* SSC output port register, vax_sysdev.c:187 (SSCOTP_MASK) and :1282-1283/1381-1382 (ssc_rd/
+   ssc_wr case 0x0C) -- pcjsvax-bfb's own romdiff boundary-advance, instruction #3 of the ROM's
+   boot-entry trace (a READ of SSC+0x30, PC=2004002F).  No IE/W1C bits: a plain 4-bit RW field. */
+const SSCOTP_MASK = 0x0000000F;
+
+/* SSC address-strobe compare registers (ADS0M/ADS0K/ADS1M/ADS1K), vax_sysdev.c:226 (SSCADS_MASK)
+   and :1336-1345/1442-1454 (ssc_rd/ssc_wr cases 0x4C/0x4D/0x50/0x51) -- pcjsvax-bfb's own romdiff
+   boundary-advance, instruction #29 (a READ of SSC+0x130 = ADS0M).  DELIBERATELY NOT the SSC T0/T1
+   TIMER registers themselves (+0x100..+0x11C, TMR_CSR/TMR_TNIR/TMR_TIVR): those are genuine
+   counting/interrupt-delivering state -- concurrent work (pcjsvax-954) owns the per-instruction
+   timer machinery those need, and this item's own scope (the console) has no reason to race it.
+   ADS0M/ADS0K/ADS1M/ADS1K are a DIFFERENT, much simpler animal despite living in the same address
+   neighborhood: plain masked RW storage with NO counting, NO interrupt, NO side effect of any kind
+   on either the read or the write side -- vax_sysdev.c's own bodies are a bare `return
+   ssc_adsm[i]` / `ssc_adsm[i] = val & SSCADS_MASK`. Decoding them here does not touch, anticipate,
+   or duplicate anything the timer item needs. */
+const SSCADS_MASK = (0x3FFFFFFC | 0);
 
 /**
  * @class SSCVAX
  */
 export default class SSCVAX {
     /**
-     * SSCVAX()
+     * SSCVAX(exc, console)
+     *
+     * @param {Object} [exc] the owning CPU's VAXExc -- REG_BTO reads/writes cpu.exc.sscBto through
+     *   it (see the SSCBTO_* doc comment above); omit it and SSC+0x08 falls through to a bus fault
+     *   exactly like any other undecoded register.
+     * @param {Object} [console] pcjsvax-bfb's ConsoleVAX (console.js) -- rg 0x20/0x21/0x22/0x23
+     *   (RXCS/RXDB/TXCS/TXDB) delegate to its sscRead()/sscWrite(), the SAME register state exc.js's
+     *   setIPRDevice() seam exposes -- see console.js's file header.  Omit it and those four
+     *   registers fall through to a bus fault exactly like any other undecoded register.
      */
-    constructor()
+    constructor(exc, console)
     {
+        this.exc = exc || null;
+        this.console = console || null;
         this.reset();
     }
 
@@ -148,6 +213,10 @@ export default class SSCVAX {
     reset()
     {
         this.base = SSC_BASE | 0;
+        this.otp = 0;                          // vax_sysdev.c:1790, sysd_powerup(): ssc_otp = 0
+        this.cnf = SSCCNF_BLO;                 // vax_sysdev.c:684, nvr_reset() -- see REG_CNF's doc
+        this.adsm = [0, 0];                    // vax_sysdev.c:253, ssc_adsm[2] = { 0 }
+        this.adsk = [0, 0];                    // vax_sysdev.c:254, ssc_adsk[2] = { 0 }
     }
 
     /**
@@ -167,6 +236,29 @@ export default class SSCVAX {
         switch (rg) {
         case REG_BASE:
             return this.base;
+        case REG_CNF:
+            return this.cnf;
+        case REG_BTO:
+            return this.exc ? this.exc.sscBto : null;
+        case REG_OTP:
+            return this.otp & SSCOTP_MASK;
+        case REG_ADS0M: return this.adsm[0];
+        case REG_ADS0K: return this.adsk[0];
+        case REG_ADS1M: return this.adsm[1];
+        case REG_ADS1K: return this.adsk[1];
+        /*
+         * pcjsvax-bfb: RXCS/RXDB/TXCS delegate to the console device -- see console.js's sscRead()
+         * doc comment.  TXDB (0x23) has NO case at all in vax_sysdev.c's REAL ssc_rd() switch (only
+         * ssc_wr() lists it) -- the implicit `return 0;` at the end of that switch applies
+         * UNCONDITIONALLY, matching ssc.js's own file header ("even an rg value ssc_rd()/ssc_wr()'s
+         * switch does not list falls through to return 0... not a fault"), so this returns 0
+         * directly rather than asking the console device (which has no sscRead() case for it
+         * either, by the same reasoning -- see that function's own doc comment).
+         */
+        case REG_RXCS: case REG_RXDB: case REG_TXCS:
+            return this.console ? this.console.sscRead(rg) : null;
+        case REG_TXDB:
+            return 0;
         }
         return null;
     }
@@ -189,6 +281,33 @@ export default class SSCVAX {
         switch (rg) {
         case REG_BASE:
             this.base = ((val & SSCBASE_RW) | SSCBASE_MBO) | 0;
+            return true;
+        case REG_CNF:
+            this.cnf = (this.cnf & ~(val & SSCCNF_W1C)) | 0;
+            this.cnf = ((this.cnf & ~SSCCNF_RW) | (val & SSCCNF_RW)) | 0;
+            return true;
+        case REG_BTO:
+            if (!this.exc) return false;
+            this.exc.sscBto = (this.exc.sscBto & ~(val & SSCBTO_W1C)) | 0;
+            this.exc.sscBto = ((this.exc.sscBto & ~SSCBTO_RW) | (val & SSCBTO_RW)) | 0;
+            return true;
+        case REG_OTP:
+            this.otp = val & SSCOTP_MASK;
+            return true;
+        case REG_ADS0M: this.adsm[0] = (val & SSCADS_MASK) | 0; return true;
+        case REG_ADS0K: this.adsk[0] = (val & SSCADS_MASK) | 0; return true;
+        case REG_ADS1M: this.adsm[1] = (val & SSCADS_MASK) | 0; return true;
+        case REG_ADS1K: this.adsk[1] = (val & SSCADS_MASK) | 0; return true;
+        /*
+         * pcjsvax-bfb: RXCS/TXCS/TXDB delegate to the console device.  RXDB (0x21) has NO case in
+         * vax_sysdev.c's REAL ssc_wr() switch (matching WriteIPR()'s own `case MT_RXDB: break;` --
+         * input is read-only from software on both address paths) -- a silent no-op, UNCONDITIONALLY
+         * (see REG_TXDB's read-side comment above for the identical reasoning in the other
+         * direction).
+         */
+        case REG_RXCS: case REG_TXCS: case REG_TXDB:
+            return this.console ? this.console.sscWrite(rg, val) : false;
+        case REG_RXDB:
             return true;
         }
         return false;
@@ -270,7 +389,7 @@ export default class SSCVAX {
 }
 
 /**
- * makeSscController(ssc)
+ * makeSscController(ssc, nvr)
  *
  * A MemoryVAX controller (see bus.js's makeRomAliasController() for the same pattern applied to
  * the ROM mirror): `getControllerBuffer()` supplies no backing array (every access is computed,
@@ -279,18 +398,29 @@ export default class SSCVAX {
  * writeLong -- called as `block.readByte(off, addr)`, so `this` inside them is the MemoryVAX
  * block, which is what makes `this.readNone`/`this.writeNone`/... (inherited from
  * MemoryVAX.prototype) the right fallback: the EXACT function the shared empty block would have
- * used for this address, before this controller existed.  See the file header's "WHAT HAPPENS TO
- * EVERYTHING ELSE" section for why that fallback fires for NVR, the block's unused tail, AND any
- * SSC sub-register this file does not decode -- three different reasons, one identical, correct,
- * bus-fault-and-let-romdiff-name-it outcome.
+ * used for this address, before this controller existed.
+ *
+ * `nvr` (pcjsvax-bfb) is a SECOND device, NVRVAX (see nvr.js), checked whenever `ssc` does not
+ * claim the address -- vax_sysdev.c installs nvr_rd()/nvr_wr() as a SEPARATE regtable entry from
+ * ssc_rd()/ssc_wr() (vax_sysdev.c:1004 vs :1006), but both land in the SAME physical 8KB bus block
+ * this controller answers for (SSC_BASE=0x20140000, NVR_BASE=0x20140400, PCjs block size 0x2000),
+ * so one controller has to route to both.  `nvr` is optional (existing callers -- and any test that
+ * only cares about the SSC base register -- pass none, and NVR then still falls through to
+ * readNone/writeNone exactly as it always did before this item).  Anything neither `ssc` nor `nvr`
+ * claims -- undecoded SSC sub-registers and the block's unused tail -- keeps faulting exactly as it
+ * did before this method existed, address-by-address rather than by block granularity; that fault
+ * is what tests/romdiff.js's probeSimhBackedAt() uses to find and NAME the next boundary.
  *
  * @param {SSCVAX} ssc
+ * @param {NVRVAX} [nvr]
  * @returns {Object}
  */
-export function makeSscController(ssc)
+export function makeSscController(ssc, nvr)
 {
     const LOW = SSC_BASE, HIGH = (SSC_BASE + SSC_LENGTH) >>> 0;
     function inRange(addr) { return addr >= LOW && addr < HIGH; }
+    const NVR_LOW = nvr ? NVR_BASE : 0, NVR_HIGH = nvr ? (NVR_BASE + NVR_LENGTH) >>> 0 : 0;
+    function nvrInRange(addr) { return !!nvr && addr >= NVR_LOW && addr < NVR_HIGH; }
 
     return {
         getControllerBuffer(addr) { return [null, 0]; },
@@ -301,12 +431,16 @@ export function makeSscController(ssc)
                     if (inRange(addr)) {
                         let v = ssc.readByte(addr);
                         if (v !== null) return v;
+                    } else if (nvrInRange(addr)) {
+                        let v = nvr.readByte(addr);
+                        if (v !== null) return v;
                     }
                     return this.readNone(off, addr);
                 },
                 function writeByte(off, b, addr) {
                     addr = addr >>> 0;
                     if (inRange(addr) && ssc.writeByte(addr, b)) return;
+                    if (nvrInRange(addr) && nvr.writeByte(addr, b)) return;
                     this.writeNone(off, b, addr);
                 },
                 function readWord(off, addr) {
@@ -314,12 +448,16 @@ export function makeSscController(ssc)
                     if (inRange(addr)) {
                         let v = ssc.readWord(addr);
                         if (v !== null) return v;
+                    } else if (nvrInRange(addr)) {
+                        let v = nvr.readWord(addr);
+                        if (v !== null) return v;
                     }
                     return this.readWordNone(off, addr);
                 },
                 function writeWord(off, w, addr) {
                     addr = addr >>> 0;
                     if (inRange(addr) && ssc.writeWord(addr, w)) return;
+                    if (nvrInRange(addr) && nvr.writeWord(addr, w)) return;
                     this.writeNone(off, w, addr);
                 },
                 function readLong(off, addr) {
@@ -327,12 +465,16 @@ export function makeSscController(ssc)
                     if (inRange(addr)) {
                         let v = ssc.readLong(addr);
                         if (v !== null) return v;
+                    } else if (nvrInRange(addr)) {
+                        let v = nvr.readLong(addr);
+                        if (v !== null) return v;
                     }
                     return this.readLongNone(off, addr);
                 },
                 function writeLong(off, l, addr) {
                     addr = addr >>> 0;
                     if (inRange(addr) && ssc.writeLong(addr, l)) return;
+                    if (nvrInRange(addr) && nvr.writeLong(addr, l)) return;
                     this.writeNone(off, l, addr);
                 }
             ];
