@@ -12,12 +12,17 @@
  * ============================================================================
  * WHAT THIS IS, AND WHAT IT IS NOT
  * ============================================================================
- * pcjsvax-c2c, the first of pcjsvax-6a5's children.  `open-simh/PDP11/pdp11_rq.c` is ~3,600 lines;
- * THIS FILE IS THE INITIALISATION STATE MACHINE ONLY -- rq_rd(), rq_wr(), rq_reset(), rq_step4(),
- * rq_fatal(), and the `csta < CST_UP` branch of rq_quesvc(), plus exactly as much of the CST_UP
- * branch as an IP-read poll of an EMPTY command ring reaches.  MSCP packet processing, disk I/O,
- * the response ring, attention/unit-available messages and interrupt delivery are NOT here; each
- * is named in the EXCLUSIONS section below with the fence that keeps a graded case from reaching it.
+ * pcjsvax-c2c (the UQSSP initialisation state machine) and pcjsvax-0b4 (the command/response RING
+ * MACHINERY on top of it), the first two of pcjsvax-6a5's children.  `open-simh/PDP11/pdp11_rq.c`
+ * is ~3,600 lines; THIS FILE IS:
+ *   rq_rd(), rq_wr(), rq_reset(), rq_step4(), rq_fatal(), rq_init_int(), rq_ring_int();
+ *   BOTH branches of rq_quesvc();
+ *   rq_deqf/rq_deqh/rq_enqh/rq_enqt, rq_getpkt/rq_putpkt, rq_getdesc/rq_putdesc, rq_putr;
+ *   rq_mscp()'s dispatch, and the only three arms of it that need NO unit and NO transfer --
+ *     rq_scc(), the OP_CCD/OP_DAP/OP_FLU no-ops, and the illegal-opcode default.
+ * DISK I/O, the twelve unit-bearing MSCP commands, attention/unit-available messages and interrupt
+ * DELIVERY are NOT here; each is named in the EXCLUSIONS section below with the fence that keeps a
+ * graded case from reaching it.
  *
  * TWO 16-BIT REGISTERS, NOT FOUR.  `IOLN_RQ` is 004 (pdp11_rq.c:1212) and rq_rd()/rq_wr() decode
  * `(PA >> 1) & 01`: IP at +0, SA at +2.  Measured on the live oracle, `SHOW QBA IOSPACE` prints
@@ -67,22 +72,44 @@
  * succession leave the second one's answer arriving on the FIRST one's schedule.
  *
  * ============================================================================
+ * THE RESPONSE RING COMES FIRST IN MEMORY
+ * ============================================================================
+ * rq_step4() does `cp->rq.ba = cp->comm; cp->cq.ba = cp->comm + cp->rq.lnt;` -- `rq` is the
+ * RESPONSE ring and it is laid down at the base, with the COMMAND ring above it.  That is the
+ * opposite of the order the names suggest and of the order the host writes them in, and it is the
+ * single easiest thing to get backwards in this file.  Measured on the live oracle: with a
+ * one-descriptor ring pair at comm = 0x2000, `SHOW RQ RINGS` prints `Command ring, base = 2004`
+ * and `Response ring, base = 2000`.
+ *
+ * RING INDEX ARITHMETIC IS A MASK, NOT A MODULO.  `ring->idx = (ring->idx + 4) & (ring->lnt - 1)`
+ * and the previous slot is `(ring->idx - 4) & (ring->lnt - 1)` -- correct only because `lnt` is
+ * `4 << code`, a power of two.  Note `idx - 4` is computed in uint32 in the C and therefore
+ * borrows to 0xFFFFFFFC at idx 0; JS's int32 `&` reproduces that exactly, which is why there is no
+ * `>>> 0` in front of it.
+ *
+ * ============================================================================
  * SCOPE EXCLUSIONS -- each with the fence that makes it unreachable, not merely unvisited
  * ============================================================================
- *   MSCP PACKET PROCESSING.  rq_quesvc()'s CST_UP branch runs the unit queues, then rq_getpkt(),
- *     then the response queue.  Implemented here: the unit-queue scan (every unit is idle in this
- *     item's configuration -- no disk is ever attached), rq_getpkt()'s descriptor fetch, and its
- *     `(desc & UQ_DESC_OWN) == 0` branch, which is the only one an empty ring can take.  If a
- *     descriptor ever arrives with OWN set, quesvc() throws RQUnimplemented by name rather than
- *     inventing an answer.  mscpinitdiff.js additionally asserts on the ORACLE that PBSY and
- *     RESP stayed 0 and FREE stayed 1 in every graded case, so a case that reached packet
- *     processing on the oracle fails the run instead of quietly grading a different program.
- *   INTERRUPTS.  rq_init_int() raises a controller interrupt only when the host's S1 data has BOTH
- *     SA_S1H_IE and a non-zero SA_S1H_VEC.  This file records the request in `irq` (as the C's
- *     `cp->irq`) and wires it to nothing; `irq` is not in SIMH's rq_reg[] so it is not examinable
- *     either.  mscpinitdiff.js FAILS the run if any graded case supplies an s1dat with IE and VEC
- *     both set, so the unwired path is unreachable rather than untested.  Vector computation
+ *   THE TWELVE UNIT-BEARING MSCP COMMANDS.  rq_mscp()'s switch dispatches OP_ABO/AVL/FMT/GCS/GUS/
+ *     ONL/SUC and OP_ACC/CMP/ERS/RD/WR to handlers that need a UNIT (rq_getucb) and, for the last
+ *     five, a disk transfer.  No unit is ever attached in this file's differentials, so those arms
+ *     throw RQUnimplemented BY NAME rather than inventing an answer, and MSCP_UNIT_OPS below is the
+ *     list -- derived from the same OP table the dispatch is, so it cannot drift.  They are
+ *     pcjsvax-f52's work.  tests/mscpringdiff.js FAILS the run if any graded case sends one.
+ *   THE UNIT QUEUES.  rq_quesvc()'s `for (i = 0; i < RQ_NUMDR; i++)` scan over `uptr->pktq` is
+ *     transcribed, but nothing in this file's scope can ever put a packet on a unit queue (only the
+ *     unit-bearing commands above defer), so the body is a throw, not a branch.
+ *   INTERRUPT DELIVERY.  rq_init_int() raises a controller interrupt when the host's S1 data has
+ *     BOTH SA_S1H_IE and a non-zero SA_S1H_VEC; rq_ring_int() raises one on SA_S1H_VEC ALONE --
+ *     THE TWO CONDITIONS DIFFER, and pcjsvax-aef exists because of it.  This file records the
+ *     request in `irq` (as the C's `cp->irq`) and wires it to nothing; `irq` is not in SIMH's
+ *     rq_reg[] so it is not examinable either.  mscpinitdiff.js FAILS the run if any graded case
+ *     supplies an s1dat with IE and VEC both set; mscpringdiff.js is stricter and FAILS if VEC is
+ *     non-zero at all, because rq_ring_int() does not test IE.  Vector computation
  *     (`dibp->vec = (s1dat & SA_S1H_VEC) << 2`) IS reproduced, in `vec`, because it is pure state.
+ *     What IS implemented and graded is rq_ring_int()'s OTHER half: the one-word flag it DMAs to
+ *     `comm + ring->ioff`, and the fact that it IGNORES a failure of that write (the C casts the
+ *     Map_WriteW result to void and says so in a comment).
  *   rq_tmrsvc(), THE HOST-ACCESS TIMER.  `sim_activate_after (units + RQ_TIMER, 1000000)` is a
  *     WALL-CLOCK schedule (one second), not an instruction count, and nothing in this tree maps
  *     wall-clock to instructions.  It is not implemented.  `hat`/`htmo` are still modelled as state
@@ -99,11 +126,33 @@
  *     per-INSTANCE and `cnum` is a constructor argument, so a second controller would be
  *     configuration -- one more `new RQVAX(...)` and one more entry in an addIoPage() list -- rather
  *     than more code in this file.
- *   THE ROM MACHINE.  pcjsvax-c2c does NOT wire this controller into tests/rommachine.js.  The ROM's
- *     self-test 53 currently fails identically on both engines with no disk attached, and
- *     tests/conoutdiff.js's 115-byte agreement is the measurement that says so; changing what the
- *     ROM finds on the I/O page is a change to that measurement and belongs to whichever of
- *     pcjsvax-6a5's children owns it, with conoutdiff re-read rather than assumed.
+ *   THE ROM MACHINE.  Neither pcjsvax-c2c nor pcjsvax-0b4 wires this controller into
+ *     tests/rommachine.js.  The ROM's self-test 53 currently fails identically on both engines with
+ *     no disk attached, and tests/conoutdiff.js's agreement is the measurement that says so;
+ *     changing what the ROM finds on the I/O page is a change to that measurement and belongs to
+ *     whichever of pcjsvax-6a5's children owns it, with conoutdiff re-read rather than assumed.
+ *     (conoutdiff's matched-byte COUNT varies run to run -- HANDOFF.md 3 -- so the thing to re-read
+ *     is its FLOOR and its first diverging byte, never the headline number.)
+ *
+ * ============================================================================
+ * THE ORDERED REQUEST TRACE
+ * ============================================================================
+ * `set rq debug=REQ` prints one line per controller event, and pcjsvax-0b4's parent criterion is
+ * "every command issued, every response returned, IN ORDER, with matching fields".  `reqLog` below
+ * is that stream, appended at EXACTLY the six points sim_debug(DBG_REQ, ...) fires in the C
+ * (pdp11_rq.c:1670, 1700, 1839, 1865, 2848 and 3073) and formatted identically, so
+ * tests/mscpringdiff.js can compare two SEQUENCES rather than two end states.  It is a diagnostic
+ * stream, not device state: nothing in this file ever reads it, and reset() does not clear it
+ * (SIMH's debug output is not reset either).  Its one non-obvious field is `poll started, PC=%X`,
+ * whose PC is the C's OLDPC -- `#define OLDPC fault_PC` on the VAX arm (pdp11_rq.c:108) -- i.e. the
+ * start PC of the instruction performing the IP read.
+ *
+ * ONLY THE ORDER AND THE TEXT ARE COMPARABLE, not the timestamps, and that is a property of the
+ * ORACLE rather than a concession here.  scp.c:13836-13900 COLLAPSES consecutive identical debug
+ * lines into the first one plus `same as above (N times)`, stamping the collapsed line with the
+ * time of the LAST occurrence -- so the individual timestamps of a repeated event are not present
+ * in SIMH's own output to compare against.  A `t` is recorded anyway because it costs nothing and
+ * because a future item that patches the oracle's debug path would want it.
  */
 
 import { VAX } from "./defines.js";
@@ -167,6 +216,7 @@ const PE_ICI        = 14;                       // inv conn ident
 const PE_PIE        = 20;                       // prot incompat
 const PE_PPF        = 21;                       // prg/poll err
 const PE_MRE        = 22;                       // map reg rd err
+const PE_NSR        = 478;                      // no such rsrc -- the free packet list ran dry
 
 const SA_COMM_QQ    = -8;                       // unused
 const SA_COMM_PI    = -6;                       // purge int
@@ -180,6 +230,106 @@ const UQ_DESC_OWN   = 0x80000000;               // ownership
 const UQ_DESC_F     = 0x40000000;               // flag
 const UQ_ADDR       = 0x003FFFFE;               // addr, word aligned
 const UQ_HDR_OFF    = -4;                       // offset
+
+/* The UQSSP packet HEADER -- the two words that live at `descriptor address + UQ_HDR_OFF`, i.e.
+   BELOW the address the descriptor names.  A packet fetched from the descriptor address itself
+   instead is off by exactly these four bytes, which is a mutation mscpringdiff.js carries. */
+const UQ_HLNT       = 0;                        // length
+const UQ_HCTC       = 1;                        // credits, type, CID
+const UQ_HCTC_V_CR  = 0;                        // credits
+const UQ_HCTC_M_CR  = 0xF;
+const UQ_HCTC_V_TYP = 4;                        // type
+const UQ_HCTC_M_TYP = 0xF;
+const UQ_TYP_SEQ    = 0;                        // sequential
+const UQ_TYP_DAT    = 1;                        // datagram
+const UQ_HCTC_V_CID = 8;                        // conn ID
+const UQ_HCTC_M_CID = 0xFF;
+const UQ_CID_MSCP   = 0;                        // MSCP
+const UQ_CID_TMSCP  = 1;                        // TMSCP
+const UQ_CID_DUP    = 2;                        // DUP
+const UQ_CID_DIAG   = 0xFF;                     // diagnostic
+
+/* ------------------------------------------------------------------------------------------- *
+ * pdp11_mscp.h -- the MSCP protocol itself                                                      *
+ * ------------------------------------------------------------------------------------------- */
+
+/** The 21 MSCP OPCODES (pdp11_mscp.h:42-62), name -> value, in the header's order.  PUBLISHED as a
+    table rather than written as 21 `const`s for two reasons: rq_mscp()'s dispatch below is built
+    FROM it (so the scope lives in code, HANDOFF.md standing rule 7), and tests/mscpscope.js
+    re-derives the same table from the header on every differential run and FAILS on any difference
+    (standing rule 5 -- this project's CIS opcode count went 7 -> 11 -> 17 -> 23 and every
+    hand-derived value was wrong). */
+const OP = {
+    ABO: 1, GCS: 2, GUS: 3, SCC: 4, AVL: 8, ONL: 9, SUC: 10, DAP: 11,
+    ACC: 16, CCD: 17, ERS: 18, FLU: 19, ERG: 22, CMP: 32, RD: 33, WR: 34,
+    WTM: 36, POS: 37, FMT: 47, AVA: 64, END: 0x80
+};
+
+/** The 23 MSCP STATUS codes (pdp11_mscp.h:144-166), same discipline.  ST.V_SUB and ST.V_INV are
+    SHIFT POSITIONS rather than status values and are in the table because they are in the header's
+    run of `#define ST_...` lines -- the extraction is mechanical, and a table that quietly dropped
+    the two that "are not really status codes" would be a hand-curated list again. */
+const ST = {
+    SUC: 0, CMD: 1, ABO: 2, OFL: 3, AVL: 4, MFE: 5, WPR: 6, CMP: 7, DAT: 8, HST: 9,
+    CNT: 10, DRV: 11, FMT: 12, BOT: 13, TMK: 14, RDT: 16, POL: 17, SXC: 18, LED: 19,
+    BBR: 20, DIA: 31, V_SUB: 5, V_INV: 8
+};
+
+const I_OPCD        = 8 << ST.V_INV;            // inv opcode
+const I_VRSN        = 12 << ST.V_INV;           // inv version
+
+/** rq_cmdname[] (pdp11_rq.c:1106-1135), DERIVED rather than transcribed: the C's table is non-empty
+    at exactly the indices an OP_ code names, and it is indexed `cmd & 0x3f`, so OP_AVA (64) folds
+    onto index 0 and its name is unreachable -- reproduced, not tidied. */
+const CMD_NAMES = (function() {
+    let t = new Array(64).fill("");
+    for (let n of Object.keys(OP)) if (OP[n] < 64) t[OP[n]] = n;
+    return t;
+})();
+
+/* Command packet header (pdp11_mscp.h:212-225) */
+const CMD_REFL      = 2;                        // ref #
+const CMD_REFH      = 3;
+const CMD_UN        = 4;                        // unit #
+const CMD_OPC       = 6;                        // opcode
+const CMD_MOD       = 7;                        // modifier
+const CMD_OPC_V_OPC = 0;
+const CMD_OPC_M_OPC = 0xFF;
+
+/* Response packet header (pdp11_mscp.h:227-238).  RSP_OPF is word 6 -- THE SAME WORD as CMD_OPC,
+   which is why rq_putpkt() can read back the END flag rq_putr() just wrote with GETP(CMD_OPC,OPC). */
+const RSP_LNT       = 12;
+const RSP_OPF       = 6;                        // opcd,flg
+const RSP_STS       = 7;                        // status
+const RSP_OPF_V_OPC = 0;
+const RSP_OPF_V_FLG = 8;
+
+/* SET CONTROLLER CHARACTERISTICS (pdp11_mscp.h:360-375) */
+const SCC_LNT       = 32;
+const SCC_MSV       = 8;                        // MSCP version
+const SCC_CFL       = 9;                        // flags
+const SCC_TMO       = 10;                       // timeout
+const SCC_VER       = 11;                       // ctrl version
+const SCC_CIDA      = 12;                       // ctrl ID
+const SCC_CIDB      = 13;
+const SCC_CIDC      = 14;
+const SCC_CIDD      = 15;
+const SCC_MBCL      = 16;                       // max byte count
+const SCC_MBCH      = 17;
+const SCC_VER_V_SVER = 0;
+const SCC_VER_V_HVER = 8;
+const SCC_CIDD_V_MOD = 0;
+const SCC_CIDD_V_CLS = 8;
+
+/* Read/write packet words -- referenced ONLY by the DBG_REQ trace line, which prints them for every
+   command whatever the opcode (pdp11_rq.c:1865).  That is why a command packet's untouched tail
+   shows up in the trace, and why the trace is evidence that the WHOLE 64 bytes round-tripped. */
+const RW_BCL        = 8;
+const RW_BCH        = 9;
+const RW_BAL        = 10;
+const RW_BAH        = 11;
+const RW_LBNL       = 16;
+const RW_LBNH       = 17;
 
 /* pdp11_mscp.h:100 */
 const CF_RPL        = 0x8000;                   // ctrl bad blk repl
@@ -204,8 +354,11 @@ const CST_DEAD      = 8;                        // fatal error
 const CST_NAMES = ["CST_S1", "CST_S1_WR", "CST_S2", "CST_S3", "CST_S3_PPA", "CST_S3_PPB",
                    "CST_S4", "CST_UP", "CST_DEAD"];
 
+const RQ_CLASS      = 1;                        // RQ class: mass storage controllers
+const RQ_HVER       = 1;                        // hardware version
 const RQ_SVER       = 3;                        // software version
 const RQ_DHTMO      = 60;                       // def host timeout
+const RQ_DCTMO      = 120;                      // def ctrl timeout
 const RQ_NUMDR      = 4;                        // def # drives
 const RQ_NPKTS      = 32;                       // # packets (pwr of 2)
 const RQ_M_NPKTS    = RQ_NPKTS - 1;
@@ -241,6 +394,26 @@ const CTLR_TAB = [
 ];
 const RQDX3_CTYPE   = CTLR_TAB.findIndex((c) => c.name === "RQDX3");
 
+/* ------------------------------------------------------------------------------------------- *
+ * rq_mscp()'s DISPATCH, as three disjoint name sets over the OP table above (standing rule 7:    *
+ * scope lives in code, not comments).  tests/mscpscope.js extracts the `case OP_x:` labels from   *
+ * rq_mscp()'s own switch in pdp11_rq.c and FAILS the run unless UNIT_OPS + NOP_OPS is EXACTLY     *
+ * that set -- so an opcode the C handles and this file does not cannot fall silently through to   *
+ * the illegal-opcode default, which is the failure mode HANDOFF.md standing rule 7 records.       *
+ * ------------------------------------------------------------------------------------------- */
+
+/** Dispatched by the C to a handler that needs a UNIT (and, for the last five, a disk transfer).
+    Out of pcjsvax-0b4's scope; each throws RQUnimplemented by name.  pcjsvax-f52 owns them. */
+const MSCP_UNIT_OPS = ["ABO", "AVL", "FMT", "GCS", "GUS", "ONL", "SUC", "ACC", "CMP", "ERS", "RD", "WR"];
+
+/** Dispatched by the C to the switch's own no-op arm: `cmd |= OP_END; sts = ST_SUC`. */
+const MSCP_NOP_OPS  = ["CCD", "DAP", "FLU"];
+
+/** SET CONTROLLER CHARACTERISTICS -- the one command with a real handler here.  It is the only
+    MSCP command that needs neither an attached unit nor a transfer, which is exactly why
+    pcjsvax-0b4 uses it as the vehicle for grading the ring machinery and nothing else. */
+const MSCP_SCC_OP   = "SCC";
+
 /** vax_io.c:155-style autoconfiguration, VERIFIED rather than assumed: `IOBA_AUTO` leaves the RQ
     DIB's base to pdp11_io_lib.c, and tests/mscpinitdiff.js re-reads `SHOW QBA IOSPACE` from the live
     oracle on every run and FAILS if the RQ row's base or length disagrees with these two constants.
@@ -251,6 +424,9 @@ const IOLN_RQ       = 4;                        // pdp11_rq.c:1212, IOLN_RQ == 0
 
 /** Thrown by name rather than answered: see the SCOPE EXCLUSIONS section of the file header. */
 class RQUnimplemented extends Error {}
+
+/** printf's `%04X`, which is what every field of the DBG_REQ trace is printed with. */
+function h4(v) { return (v & 0xFFFF).toString(16).toUpperCase().padStart(4, "0"); }
 
 /**
  * @class RQVAX
@@ -292,6 +468,18 @@ export default class RQVAX {
         this.pakLink = new Uint16Array(RQ_NPKTS);
         this.pakData = new Uint16Array(RQ_NPKTS * RQ_PKT_SIZE_W);
         this.units = Array.from({length: RQ_NUMDR}, () => ({cpkt: 0, pktq: 0}));
+
+        /* The DMA staging buffers.  Allocated ONCE per controller rather than per operation:
+           HANDOFF.md standing rule 14 is about exactly this kind of per-operation allocation, and a
+           64-byte array built inside rq_getpkt() would be built once per MSCP command. */
+        this.descBuf = new Uint8Array(4);
+        this.pktBuf = new Uint8Array(RQ_PKT_SIZE);
+        this.flagBuf = new Uint8Array(2);
+
+        /** The `set rq debug=REQ` stream -- see the file header.  A diagnostic, not device state:
+            nothing here reads it and neither reset() nor powerUp() clears it, because SIMH's debug
+            output survives `reset -p all` too.  Its consumer truncates it. */
+        this.reqLog = [];
 
         this.powerUp();
     }
@@ -434,11 +622,17 @@ export default class RQVAX {
      * RQ_TIMER's are `UNIT_IDLE|UNIT_DIS`, so the C's loop would stop AT it, which is one more
      * reason the wall-clock timer's absence here is not observable.
      *
-     * The loop bound is not paranoia dressed as a constant: rq_quesvc() re-arms its own unit when it
-     * has more to do (`if (pkt) sim_activate (uptr, rq_qtime)`), which in the C is a genuine
-     * possibility and would make this loop run again.  It cannot happen in pcjsvax-c2c's scope --
-     * that branch needs a packet -- so a bound that is exceeded means the state machine is looping,
-     * and saying so by name beats hanging the differential.
+     * THE LOOP BOUND IS LOAD-BEARING AND THE C HAS NONE.  rq_quesvc() re-arms its own unit whenever
+     * `pkt` is non-zero, so the C's drain runs again -- correctly, while there is work.  But a
+     * response queue whose ring the host never grants is work that never finishes: the thread
+     * dequeues the packet, fails to place it, pushes it back and re-arms, forever.  *** THE REAL
+     * SIMULATOR HANGS IN ITS HALT INSTRUCTION IF A HOST HALTS WITH A DEFERRED RESPONSE AND NO FREE
+     * RESPONSE DESCRIPTOR *** -- measured, not deduced, and the reason tests/mscpringdiff.js's
+     * response-ring-full case grants the descriptor BEFORE it halts.  Naming that by exception here
+     * beats hanging the differential in sympathy with the oracle.
+     *
+     * The bound is `RQ_NPKTS * 2 + 4`: at most every packet in the pool can be delivered, each
+     * costing its own service plus the re-arm, with slack for the poll that finds the ring empty.
      *
      * @this {RQVAX}
      * @param {Object} cpu
@@ -447,9 +641,11 @@ export default class RQVAX {
     {
         this.cpu = cpu;
         for (let n = 0; this.queDue !== null; n++) {
-            if (n > RQ_NPKTS) {
+            if (n > RQ_NPKTS * 2 + 4) {
                 throw new Error("rq.js: drainOnHalt() ran " + n + " services without the queue " +
-                    "going idle -- rq_quesvc() is re-arming itself, which pcjsvax-c2c's scope cannot reach");
+                    "going idle -- rq_quesvc() is re-arming itself without making progress.  The " +
+                    "usual cause is a deferred response with no host-owned response descriptor, " +
+                    "which hangs the real simulator's HALT the same way.");
             }
             this.queDue = null;
             this.quesvc();
@@ -476,6 +672,11 @@ export default class RQVAX {
             if (this.csta === CST_S3_PPB) {                 /* waiting for poll? */
                 this.step4();
             } else if (this.csta === CST_UP) {              /* if up */
+                /* OLDPC is `fault_PC` on the VAX arm (pdp11_rq.c:108) -- the start PC of the
+                   instruction doing the read, not the PC after it.  `this.cpu` is whatever tick()
+                   last saw, and tick() runs at the top of every instruction, so it is current. */
+                this.traceReq("poll started, PC=" +
+                    ((this.cpu ? this.cpu.faultPC : 0) >>> 0).toString(16).toUpperCase());
                 this.pip = 1;                               /* poll host */
                 this.activateQueue(this.qtime);
             }
@@ -499,6 +700,7 @@ export default class RQVAX {
     {
         if (((pa >>> 1) & 1) === 0) {                       /* IP */
             this.reset();                                   /* init device */
+            this.traceReq("initialization started");
             return;
         }
         this.saw = data & 0xFFFF;                           /* SA */
@@ -706,6 +908,7 @@ export default class RQVAX {
      */
     fatal(err)
     {
+        this.traceReq("fatal err=" + (err >>> 0).toString(16).toUpperCase());
         this.reset();                                       /* reset device */
         this.sa = (SA_ER | err) & 0xFFFF;                   /* SA = dead code */
         this.csta = CST_DEAD;                               /* state = dead */
@@ -767,6 +970,7 @@ export default class RQVAX {
 
             case CST_S4:                                    /* need S4 reply */
                 if (this.saw & SA_S4H_GO) {                 /* go set? */
+                    this.traceReq("initialization complete");
                     this.csta = CST_UP;                     /* we're up */
                     this.sa = 0;                            /* clear SA */
                     /* sim_activate_after (units + RQ_TIMER, 1000000) -- the wall-clock host-access
@@ -782,31 +986,436 @@ export default class RQVAX {
 
         /* csta == CST_UP (or CST_DEAD, which reaches here only if a queue event outlived a fatal --
            it cannot, because fatal() calls reset(), which cancels it).
-           The C carries a local `pkt` through this whole half and re-arms the unit at the end when
-           it is non-zero.  Every statement that can make it non-zero -- rq_deqh() off a unit queue,
-           rq_getpkt() off an owned descriptor, rq_deqh() off the response queue -- is a throw here,
-           so a faithful transcription of the tail would be a branch nothing can take.  pcjsvax-855's
-           lesson is the reason it is absent rather than transcribed: an unreachable branch that
-           looks like coverage is worse than a stated gap.  Each of the three is named below. */
-        for (let u of this.units) {
+           `pkt` is the C's own local, and its value at the BOTTOM is what decides whether the queue
+           thread re-arms.  Two things about it are easy to get wrong and both are graded:
+             - rq_mscp() SUCCEEDING leaves `pkt` non-zero even though rq_putpkt() has already freed
+               the packet, so a completed command still costs a SECOND queue service (the one that
+               finds the ring empty and clears `pip`).
+             - the response-queue arm REASSIGNS `pkt`, so draining a deferred response re-arms too. */
+        let pkt = 0;
+        for (let u of this.units) {                         /* chk unit q's */
             if (u.cpkt || u.pktq === 0) continue;
-            throw new RQUnimplemented("rq.js: a unit queue is non-empty -- MSCP packet processing " +
-                "is pcjsvax-6a5's later children, not pcjsvax-c2c");
+            throw new RQUnimplemented("rq.js: a unit queue is non-empty -- only the twelve " +
+                "unit-bearing MSCP commands defer, and none of them is implemented here (pcjsvax-f52)");
         }
-        if (this.pip) {                                     /* polling? */
-            let desc = this.getDesc(this.cq);
-            if (desc === null) return;                      /* rq_getdesc failed -> fatal, thread ends */
-            if (desc & UQ_DESC_OWN) {
-                throw new RQUnimplemented("rq.js: the host owns a command descriptor -- MSCP packet " +
-                    "processing is pcjsvax-6a5's later children, not pcjsvax-c2c");
-            }
-            this.pip = 0;                                   /* discontinue poll */
+        if ((pkt === 0) && this.pip) {                      /* polling? */
+            let got = this.getPkt();                        /* get host pkt */
+            if (!got.ok) return;
+            pkt = got.pkt;
+            if (pkt) {                                      /* got one? */
+                this.traceReq("cmd=" + h4(this.pd(pkt, CMD_OPC)) +
+                    "(" + CMD_NAMES[this.pd(pkt, CMD_OPC) & 0x3F].padStart(3) + "), mod=" +
+                    h4(this.pd(pkt, CMD_MOD)) + ", unit=" + this.pd(pkt, CMD_UN) +
+                    ", bc=" + h4(this.pd(pkt, RW_BCH)) + h4(this.pd(pkt, RW_BCL)) +
+                    ", ma=" + h4(this.pd(pkt, RW_BAH)) + h4(this.pd(pkt, RW_BAL)) +
+                    ", lbn=" + h4(this.pd(pkt, RW_LBNH)) + h4(this.pd(pkt, RW_LBNL)));
+                if (this.getp(pkt, UQ_HCTC, UQ_HCTC_V_TYP, UQ_HCTC_M_TYP) !== UQ_TYP_SEQ) {
+                    this.fatal(PE_PIE);                     /* not seq -- term thread */
+                    return;
+                }
+                let cnid = this.getp(pkt, UQ_HCTC, UQ_HCTC_V_CID, UQ_HCTC_M_CID);
+                if (cnid === UQ_CID_MSCP) {                 /* MSCP packet? */
+                    if (!this.mscp(pkt, true)) return;      /* proc, q non-seq */
+                } else if (cnid === UQ_CID_DUP) {           /* DUP packet? */
+                    this.putr(pkt, OP.END, 0, ST.CMD | I_OPCD, RSP_LNT, UQ_TYP_SEQ);
+                    if (!this.putPkt(pkt, true)) return;    /* ill cmd */
+                } else {
+                    this.fatal(PE_ICI);                     /* no, term thread */
+                    return;
+                }
+            } else this.pip = 0;                            /* discontinue poll */
         }
-        if (this.rspq) {
-            throw new RQUnimplemented("rq.js: the response queue is non-empty -- MSCP packet " +
-                "processing is pcjsvax-6a5's later children, not pcjsvax-c2c");
+        if (this.rspq) {                                    /* resp q? */
+            pkt = this.deqh(this, "rspq");                  /* get top of q */
+            if (!this.putPkt(pkt, false)) return;           /* send to host */
+        }
+        if (pkt) this.activateQueue(this.qtime);            /* more to do? */
+    }
+
+    /* --------------------------------------------------------------------------------------- *
+     * The packet pool: rq_deqf / rq_deqh / rq_enqh / rq_enqt (pdp11_rq.c:2765-2820).            *
+     *                                                                                           *
+     * The C passes `uint16 *lh` -- a POINTER to whichever list head is being manipulated         *
+     * (cp->freq, cp->rspq, uptr->pktq).  JS has no such pointer, so each of these takes the      *
+     * OWNING OBJECT and the FIELD NAME instead.  That is a mechanical substitution, not a model  *
+     * change: `enqh(this, "freq", p)` and `enqh(unit, "pktq", p)` are the C's two call shapes.   *
+     * --------------------------------------------------------------------------------------- */
+
+    /**
+     * deqf()
+     *
+     * rq_deqf() -- dequeue the head of the FREE list, fatal if there is none.  `pbsy` is
+     * incremented HERE and decremented only in rq_putpkt()'s successful arm, so a packet that is
+     * fetched and then lost to a fatal leaves `pbsy` non-zero until rq_reset() clears it.
+     *
+     * PACKET 0 IS NOT ON THE FREE LIST and must never be handed out: rq_reset() sets `pak[0].link`
+     * to 0 and starts `freq` at 1, and 0 is the LIST TERMINATOR everywhere in this file.  A pool
+     * that handed out 0 would make `enqh` a no-op and `if (pkt)` false, so the packet would vanish
+     * silently -- which is why mscpringdiff.js carries `packet-0-handed-out-as-free` as a mutation.
+     *
+     * @this {RQVAX}
+     * @returns {?number} the packet index, or null if the controller went fatal (PE_NSR)
+     */
+    deqf()
+    {
+        if (this.freq === 0) {                              /* no free pkts?? */
+            this.fatal(PE_NSR);
+            return null;
+        }
+        this.pbsy = this.pbsy + 1;                          /* cnt busy pkts */
+        let pkt = this.freq;                                /* head of list */
+        this.freq = this.pakLink[this.freq];                /* next */
+        return pkt;
+    }
+
+    /**
+     * deqh(obj, key) -- rq_deqh(), dequeue the head of any list.
+     * @this {RQVAX}
+     * @param {Object} obj
+     * @param {string} key
+     * @returns {number} the packet, or 0 if the list was empty
+     */
+    deqh(obj, key)
+    {
+        let ptr = obj[key];                                 /* head of list */
+        if (ptr) obj[key] = this.pakLink[ptr];              /* next */
+        return ptr;
+    }
+
+    /**
+     * enqh(obj, key, pkt) -- rq_enqh(), push onto the head.
+     * @this {RQVAX}
+     * @param {Object} obj
+     * @param {string} key
+     * @param {number} pkt
+     */
+    enqh(obj, key, pkt)
+    {
+        if (pkt === 0) return;                              /* any pkt? */
+        this.pakLink[pkt] = obj[key];                       /* link is old lh */
+        obj[key] = pkt;                                     /* pkt is new lh */
+    }
+
+    /**
+     * enqt(obj, key, pkt) -- rq_enqt(), append at the tail by chasing the links.
+     * @this {RQVAX}
+     * @param {Object} obj
+     * @param {string} key
+     * @param {number} pkt
+     */
+    enqt(obj, key, pkt)
+    {
+        if (pkt === 0) return;                              /* any pkt? */
+        this.pakLink[pkt] = 0;                              /* it will be tail */
+        if (obj[key] === 0) obj[key] = pkt;                 /* if empty, enqh */
+        else {
+            let ptr = obj[key];                             /* chase to end */
+            while (this.pakLink[ptr]) ptr = this.pakLink[ptr];
+            this.pakLink[ptr] = pkt;                        /* enq at tail */
         }
     }
+
+    /* --------------------------------------------------------------------------------------- *
+     * Packet field access.  `pak[p].d[w]` is a uint16 array in the C and a flat Uint16Array here. *
+     * --------------------------------------------------------------------------------------- */
+
+    /**
+     * pd(pkt, w) / spd(pkt, w, v) -- read / write `cp->pak[pkt].d[w]`.
+     * @this {RQVAX}
+     * @param {number} pkt
+     * @param {number} w
+     * @returns {number}
+     */
+    pd(pkt, w) { return this.pakData[pkt * RQ_PKT_SIZE_W + w] & 0xFFFF; }
+
+    spd(pkt, w, v) { this.pakData[pkt * RQ_PKT_SIZE_W + w] = v & 0xFFFF; }
+
+    /**
+     * getp(pkt, w, shift, mask) -- the C's GETP(p,w,f) macro, `(d[w] >> w##_V_##f) & w##_M_##f`.
+     * The shift and mask are passed rather than pasted because JS has no token concatenation; every
+     * call site below names the same two constants the C's macro would have expanded to.
+     *
+     * @this {RQVAX}
+     * @param {number} pkt
+     * @param {number} w
+     * @param {number} shift
+     * @param {number} mask
+     * @returns {number}
+     */
+    getp(pkt, w, shift, mask) { return (this.pd(pkt, w) >>> shift) & mask; }
+
+    /* --------------------------------------------------------------------------------------- *
+     * MSCP command dispatch                                                                     *
+     * --------------------------------------------------------------------------------------- */
+
+    /**
+     * mscp(pkt, q)
+     *
+     * rq_mscp() (pdp11_rq.c:1926-1981).  The switch is expressed as membership in the three name
+     * sets derived from the OP table at the top of this file, so the dispatch and the scope are the
+     * same object -- HANDOFF.md standing rule 7, earned by two modules whose headers disagreed
+     * about who owned six opcodes.
+     *
+     * `q` is the C's `t_bool q`, "may this command be deferred onto a unit queue".  It is threaded
+     * through to keep the signature honest even though every handler that USES it is excluded here.
+     *
+     * @this {RQVAX}
+     * @param {number} pkt
+     * @param {boolean} q
+     * @returns {boolean} the C's OK/ERR -- false ends the queue thread
+     */
+    mscp(pkt, q)
+    {
+        let cmd = this.getp(pkt, CMD_OPC, CMD_OPC_V_OPC, CMD_OPC_M_OPC);
+        let name = RQVAX.OP_NAME_OF[cmd];
+        if (name !== undefined && RQVAX.MSCP_UNIT_OPS.indexOf(name) >= 0) {
+            throw new RQUnimplemented("rq.js: MSCP command OP_" + name + " (" + cmd + ") needs an " +
+                "attached UNIT -- the twelve unit-bearing commands are pcjsvax-f52's work, not " +
+                "pcjsvax-0b4's");
+        }
+        if (name === MSCP_SCC_OP) return this.scc(pkt, q);  /* set ctrl char */
+        let sts;
+        if (name !== undefined && RQVAX.MSCP_NOP_OPS.indexOf(name) >= 0) {
+            cmd = cmd | OP.END;                             /* set end flag */
+            sts = ST.SUC;                                   /* success */
+        } else {
+            cmd = OP.END;                                   /* set end op */
+            sts = ST.CMD | I_OPCD;                          /* ill op */
+        }
+        this.putr(pkt, cmd, 0, sts, RSP_LNT, UQ_TYP_SEQ);
+        return this.putPkt(pkt, true);
+    }
+
+    /**
+     * scc(pkt, q)
+     *
+     * rq_scc() (pdp11_rq.c:2166-2198).  Two things here are the C and look like defects:
+     *   - the failure arm sets `cmd = 0`, so the response's opcode word is `0 | OP_END` == 0x0080
+     *     rather than `OP_SCC | OP_END`.  A host cannot tell WHICH command failed from the opcode.
+     *   - `cflgs` takes the host's whole 16-bit word ORed under CF_RPL, with NO CF_MSK filter, so
+     *     bits the header says are unassigned survive into the controller and back out again.  The
+     *     C's own comment calls it a "hack ctrl flgs".
+     * `htmo` is rounded UP BY TWO when non-zero, and a zero timeout is stored as zero rather than
+     * being rejected -- which is what makes `HAT` observable at 0 rather than at the default 60.
+     *
+     * @this {RQVAX}
+     * @param {number} pkt
+     * @param {boolean} q
+     * @returns {boolean}
+     */
+    scc(pkt, q)
+    {
+        let sts, cmd;
+        if (this.pd(pkt, SCC_MSV)) {                        /* MSCP ver = 0? */
+            sts = ST.CMD | I_VRSN;                          /* no, lose */
+            cmd = 0;
+        } else {
+            sts = ST.SUC;                                   /* success */
+            cmd = this.getp(pkt, CMD_OPC, CMD_OPC_V_OPC, CMD_OPC_M_OPC);
+            this.cflgs = (this.cflgs & CF_RPL) | this.pd(pkt, SCC_CFL);
+            this.htmo = this.pd(pkt, SCC_TMO);              /* set timeout */
+            if (this.htmo) this.htmo = this.htmo + 2;       /* if nz, round up */
+            this.spd(pkt, SCC_CFL, this.cflgs);             /* return flags */
+            this.spd(pkt, SCC_TMO, RQ_DCTMO);               /* ctrl timeout */
+            this.spd(pkt, SCC_VER, (RQVAX.RQ_HVER << SCC_VER_V_HVER) |
+                                   (RQVAX.RQ_SVER << SCC_VER_V_SVER));
+            this.spd(pkt, SCC_CIDA, 0);                     /* ctrl ID */
+            this.spd(pkt, SCC_CIDB, 0);
+            this.spd(pkt, SCC_CIDC, 0);
+            this.spd(pkt, SCC_CIDD, (RQVAX.RQ_CLASS << SCC_CIDD_V_CLS) |
+                                    (RQVAX.CTLR_TAB[this.ctype].model << SCC_CIDD_V_MOD));
+            this.spd(pkt, SCC_MBCL, 0);                     /* max bc */
+            this.spd(pkt, SCC_MBCH, 0);
+        }
+        this.putr(pkt, cmd | OP.END, 0, sts, SCC_LNT, UQ_TYP_SEQ);
+        return this.putPkt(pkt, true);
+    }
+
+    /**
+     * putr(pkt, cmd, flg, sts, lnt, typ)
+     *
+     * rq_putr() (pdp11_rq.c:2967-2977) -- overwrite the four header/response words IN PLACE, over
+     * the command the host sent.  Everything it does NOT touch (the reference number at CMD_REFL/H,
+     * the unit at CMD_UN, and every word past the ones a handler wrote) is the host's own data
+     * travelling back out, which is why the response the host reads back is evidence that the whole
+     * 64-byte packet round-tripped rather than just the fields a test looks at.
+     *
+     * Note UQ_HCTC is written with the credit field CLEAR; rq_putpkt() ORs the credits in later.
+     *
+     * @this {RQVAX}
+     * @param {number} pkt
+     * @param {number} cmd
+     * @param {number} flg
+     * @param {number} sts
+     * @param {number} lnt
+     * @param {number} typ
+     */
+    putr(pkt, cmd, flg, sts, lnt, typ)
+    {
+        this.spd(pkt, RSP_OPF, (cmd << RSP_OPF_V_OPC) | (flg << RSP_OPF_V_FLG));
+        this.spd(pkt, RSP_STS, sts);
+        this.spd(pkt, UQ_HLNT, lnt);                        /* length */
+        this.spd(pkt, UQ_HCTC, (typ << UQ_HCTC_V_TYP) | (UQ_CID_MSCP << UQ_HCTC_V_CID));
+    }
+
+    /* --------------------------------------------------------------------------------------- *
+     * Packet and descriptor handling                                                            *
+     * --------------------------------------------------------------------------------------- */
+
+    /**
+     * getPkt()
+     *
+     * rq_getpkt() (pdp11_rq.c:2818-2836).  The C returns OK/ERR and writes the packet through an
+     * out-parameter; this returns both, because a JS function cannot.  Note the ORDER, all of which
+     * is observable: the descriptor is fetched FIRST (so an empty ring costs no packet), the free
+     * packet is taken SECOND (so a full pool goes PE_NSR only when there was work to do), `hat` is
+     * disabled THIRD, and the descriptor is released LAST -- after the read, so a packet-read
+     * failure leaves the descriptor still owned by the controller.
+     *
+     * THE PACKET IS AT `desc & UQ_ADDR` PLUS UQ_HDR_OFF, i.e. FOUR BYTES BELOW the address the
+     * descriptor names, and RQ_PKT_SIZE (64) bytes are read WHATEVER the command is -- the length
+     * word in the packet is not consulted.  Both are mutations mscpringdiff.js carries, because
+     * both are invisible to any test that only checks the fields a command defines.
+     *
+     * @this {RQVAX}
+     * @returns {{ok: boolean, pkt: number}}
+     */
+    getPkt()
+    {
+        let desc = this.getDesc(this.cq);                   /* get cmd desc */
+        if (desc === null) return {ok: false, pkt: 0};
+        if ((desc & UQ_DESC_OWN) === 0) return {ok: true, pkt: 0};      /* none */
+        let pkt = this.deqf();                              /* get cmd pkt */
+        if (pkt === null) return {ok: false, pkt: 0};
+        /* `cp->hat = 0` DISABLES THE HOST-ACCESS TIMER while a command is in flight, and it is
+           STATE THIS ITEM CANNOT OBSERVE: rq_putpkt() sets `hat = htmo` again as soon as `pbsy`
+           returns to zero, rq_reset() sets it on every fatal, and the only window in which it is 0
+           is inside a single rq_quesvc() call -- which a host can only look at by halting, and a
+           halt drains the event queue.  It is reproduced because it is the C; it is named here and
+           in tests/mscpringdiff.js's exclusion list because nothing in pcjsvax-0b4's scope can
+           falsify it.  It becomes observable when rq_tmrsvc()'s wall-clock timer is modelled. */
+        this.hat = 0;                                       /* dsbl hst timer */
+        let addr = this.descAddr(desc);                     /* get Q22 addr */
+        if (this.cqbic.mapReadW(this.hdrAddr(addr), RQ_PKT_SIZE, this.pktBuf)) {
+            this.fatal(PE_PRE);                             /* read pkt */
+            return {ok: false, pkt};
+        }
+        let base = pkt * RQ_PKT_SIZE_W;
+        for (let i = 0; i < RQ_PKT_SIZE_W; i++) {
+            this.pakData[base + i] = this.pktBuf[i * 2] | (this.pktBuf[i * 2 + 1] << 8);
+        }
+        return {ok: this.putDesc(this.cq, desc), pkt};      /* release desc */
+    }
+
+    /**
+     * hdrAddr(addr)
+     *
+     * `addr + UQ_HDR_OFF` -- the packet's header address, four bytes BELOW the descriptor's own.
+     * Split out as a method so mscpringdiff.js's --selfcheck can perturb the offset without
+     * substituting a copy of rq_getpkt()/rq_putpkt() (HANDOFF.md standing rule 11); both call it and
+     * neither has another source for the address.  The C computes it in uint32, so an `addr` below
+     * 4 borrows to the top of the address space rather than going negative; `>>> 0` reproduces that.
+     *
+     * @this {RQVAX}
+     * @param {number} addr
+     * @returns {number}
+     */
+    hdrAddr(addr) { return (addr + UQ_HDR_OFF) >>> 0; }
+
+    /**
+     * descAddr(desc)
+     *
+     * `desc & UQ_ADDR` -- the Q22 buffer address a descriptor names.  UQ_ADDR is 0x003FFFFE, so it
+     * strips FOUR things and not two: the ownership bit, the flag bit, EVERY bit above 21 (the Qbus
+     * is a 22-bit address space), and the ODD-BYTE BIT 0 (a UQSSP descriptor addresses words).  A
+     * host that sets bit 0 or bit 22 is not making an error the controller reports -- the bits are
+     * simply discarded -- which is why tests/mscpringdiff.js posts a descriptor with both set.
+     * Published for the same reason as hdrAddr(), and used by BOTH rq_getpkt() and rq_putpkt() so
+     * that a mutation of it perturbs the read and the write together.
+     *
+     * IT IS ALSO, MEASURABLY, REDUNDANT.  cqbic.js's mapReadW()/mapWriteW() open with
+     * `ba & QBMAMASK & ~1`, which is vax_io.c:774/807 exactly, so every bit UQ_ADDR removes is
+     * removed again before the address reaches memory -- and no host program can distinguish a
+     * controller that applies this mask from one that does not.  tests/mscpringdiff.js records that
+     * finding where it belongs: it keeps the case that posts a descriptor with those bits set (the
+     * controller accepts it and RELEASES IT WITH THEM STILL SET, because rq_putdesc() rewrites the
+     * whole word without re-masking) and it carries NO mutation for the mask, because two were
+     * written and both were measured to survive.  The mask stays because it is the C.
+     *
+     * @this {RQVAX}
+     * @param {number} desc
+     * @returns {number}
+     */
+    descAddr(desc) { return (desc & UQ_ADDR) >>> 0; }
+
+    /**
+     * putPkt(pkt, qt)
+     *
+     * rq_putpkt() (pdp11_rq.c:2843-2877), including the C's own "clever hack about credits": the
+     * controller hands the host ALL of its credits on the FIRST end packet (up to 14, plus the
+     * implicit one that every packet carries) and exactly one per response thereafter.  So the
+     * first response's UQ_HCTC credit field is 15 and CRED drops 15 -> 1; the second is 2 and CRED
+     * drops to 0; every one after that is 1.  A model that never decrements CRED produces 15 every
+     * time and is caught by the second response, never the first.
+     *
+     * `qt` decides which END of the response queue a packet goes on when the ring is FULL: TRUE
+     * (from rq_mscp) appends, FALSE (from the queue thread re-trying a deferred response) pushes
+     * back onto the head so ORDER is preserved across the retry.
+     *
+     * @this {RQVAX}
+     * @param {number} pkt
+     * @param {boolean} qt
+     * @returns {boolean}
+     */
+    putPkt(pkt, qt)
+    {
+        if (pkt === 0) return true;                         /* any packet? */
+        this.traceReq("rsp=" + h4(this.pd(pkt, RSP_OPF)) + ", sts=" + h4(this.pd(pkt, RSP_STS)));
+        let desc = this.getDesc(this.rq);                   /* get rsp desc */
+        if (desc === null) return false;
+        if ((desc & UQ_DESC_OWN) === 0) {                   /* not valid? */
+            if (qt) this.enqt(this, "rspq", pkt);           /* normal? q tail */
+            else this.enqh(this, "rspq", pkt);              /* resp q call */
+            this.activateQueue(this.qtime);                 /* activate q thrd */
+            return true;
+        }
+        let addr = this.descAddr(desc);                     /* get Q22 addr */
+        let lnt = this.responseLength(pkt);                 /* size, with hdr */
+        if ((this.getp(pkt, UQ_HCTC, UQ_HCTC_V_TYP, UQ_HCTC_M_TYP) === UQ_TYP_SEQ) &&
+            (this.getp(pkt, CMD_OPC, CMD_OPC_V_OPC, CMD_OPC_M_OPC) & OP.END)) {
+            let cr = (this.credits >= 14) ? 14 : this.credits;       /* max 14 credits */
+            this.credits = this.credits - cr;               /* decr credits */
+            this.spd(pkt, UQ_HCTC, this.pd(pkt, UQ_HCTC) | ((cr + 1) << UQ_HCTC_V_CR));
+        }
+        let base = pkt * RQ_PKT_SIZE_W;
+        for (let i = 0; i < RQ_PKT_SIZE_W; i++) {
+            this.pktBuf[i * 2] = this.pakData[base + i] & 0xFF;
+            this.pktBuf[i * 2 + 1] = (this.pakData[base + i] >>> 8) & 0xFF;
+        }
+        if (this.cqbic.mapWriteW(this.hdrAddr(addr), lnt, this.pktBuf)) {
+            this.fatal(PE_PWE);                             /* write pkt */
+            return false;
+        }
+        this.enqh(this, "freq", pkt);                       /* pkt is free */
+        this.pbsy = this.pbsy - 1;                          /* decr busy cnt */
+        if (this.pbsy === 0) this.hat = this.htmo;          /* idle? strt hst tmr */
+        return this.putDesc(this.rq, desc);                 /* release desc */
+    }
+
+    /**
+     * responseLength(pkt)
+     *
+     * `cp->pak[pkt].d[UQ_HLNT] - UQ_HDR_OFF` -- the MSCP message length the handler wrote, PLUS the
+     * four header bytes, because the DMA starts four bytes below the descriptor's address.  Taking
+     * it as `d[UQ_HLNT]` alone writes four bytes too few and leaves the last longword of the
+     * response as whatever the host left there, which is a mutation mscpringdiff.js carries and
+     * which no comparison of the fields a command defines can see.
+     *
+     * @this {RQVAX}
+     * @param {number} pkt
+     * @returns {number}
+     */
+    responseLength(pkt) { return (this.pd(pkt, UQ_HLNT) - UQ_HDR_OFF) >>> 0; }
 
     /**
      * getDesc(ring)
@@ -823,7 +1432,6 @@ export default class RQVAX {
     getDesc(ring)
     {
         let addr = (ring.ba + ring.idx) >>> 0;
-        if (!this.descBuf) this.descBuf = new Uint8Array(4);
         if (this.cqbic.mapReadW(addr, 4, this.descBuf)) {   /* fetch desc */
             this.fatal(PE_QRE);                             /* err? dead */
             return null;
@@ -831,6 +1439,121 @@ export default class RQVAX {
         return ((this.descBuf[0] | (this.descBuf[1] << 8) |
                  (this.descBuf[2] << 16) | (this.descBuf[3] << 24)) >>> 0);
     }
+
+    /**
+     * putDesc(ring, desc)
+     *
+     * rq_putdesc() (pdp11_rq.c:2897-2921) -- hand a descriptor back to the host and decide whether
+     * to poke the ring's interrupt word.  Four separable things happen and each is graded:
+     *
+     *   1. The value written back is `(desc & ~UQ_DESC_OWN) | UQ_DESC_F`.  OWN is CLEARED (the host
+     *      owns the slot again) and F is SET WHETHER OR NOT the host had set it -- so a host that
+     *      posts a descriptor without F still gets one back with F, and still gets NO interrupt.
+     *   2. The interrupt test reads the descriptor the HOST posted, not the one just written.
+     *   3. `ring->lnt <= 4` -- a ONE-DESCRIPTOR ring -- interrupts unconditionally, because there is
+     *      no "previous" slot to look at.  Any larger ring reads the previous slot and interrupts
+     *      only if the HOST still owns it, i.e. only on an empty-to-non-empty / full-to-not-full
+     *      transition.  Both arms are graded, both ways.
+     *   4. The index advances LAST, and only on success -- a fatal leaves it where it was.
+     *
+     * `(ring->idx - 4) & (ring->lnt - 1)` is computed in uint32 in the C, so at idx 0 it borrows to
+     * 0xFFFFFFFC and the mask picks the LAST slot.  JS's `&` runs its operands through ToInt32, so
+     * `(0 - 4) & 15` is 12 here exactly as it is there -- and `idx - 4` WITHOUT the mask is a
+     * different address at wrap, which is a mutation mscpringdiff.js carries.
+     *
+     * @this {RQVAX}
+     * @param {Object} ring
+     * @param {number} desc the descriptor as the HOST posted it
+     * @returns {boolean}
+     */
+    putDesc(ring, desc)
+    {
+        let newd = this.releasedDesc(desc);
+        let addr = (ring.ba + ring.idx) >>> 0;
+        this.descBuf[0] = newd & 0xFF;                      /* 32b to 16b, LE */
+        this.descBuf[1] = (newd >>> 8) & 0xFF;
+        this.descBuf[2] = (newd >>> 16) & 0xFF;
+        this.descBuf[3] = (newd >>> 24) & 0xFF;
+        if (this.cqbic.mapWriteW(addr, 4, this.descBuf)) {  /* store desc */
+            this.fatal(PE_QWE);                             /* err? dead */
+            return false;
+        }
+        if (desc & UQ_DESC_F) {                             /* was F set? */
+            if (ring.lnt <= 4) this.ringInt(ring);          /* lnt = 1? intr */
+            else {                                          /* prv desc */
+                let prva = (ring.ba + this.prevSlot(ring)) >>> 0;
+                if (this.cqbic.mapReadW(prva, 4, this.descBuf)) {       /* read prv */
+                    this.fatal(PE_QRE);
+                    return false;
+                }
+                let prvd = ((this.descBuf[0] | (this.descBuf[1] << 8) |
+                             (this.descBuf[2] << 16) | (this.descBuf[3] << 24)) >>> 0);
+                if (prvd & UQ_DESC_OWN) this.ringInt(ring);
+            }
+        }
+        ring.idx = this.nextSlot(ring);
+        return true;
+    }
+
+    /**
+     * releasedDesc(desc) / prevSlot(ring) / nextSlot(ring)
+     *
+     * The three arithmetic decisions inside rq_putdesc(), published as methods so --selfcheck can
+     * PERTURB them without substituting a copy of rq_putdesc() itself (HANDOFF.md standing rule 11).
+     * Each is on the shipped path and rq_putdesc() above has no other source for its value.
+     *
+     * @this {RQVAX}
+     * @param {number} desc
+     * @returns {number}
+     */
+    releasedDesc(desc) { return ((desc & ~UQ_DESC_OWN) | UQ_DESC_F) >>> 0; }
+
+    prevSlot(ring) { return (ring.idx - 4) & (ring.lnt - 1); }
+
+    nextSlot(ring) { return (ring.idx + 4) & (ring.lnt - 1); }
+
+    /**
+     * ringInt(ring)
+     *
+     * rq_ring_int() (pdp11_rq.c:3005-3014).  A one-WORD flag of 1 is DMAd to `comm + ring->ioff`
+     * -- comm-4 for the command ring (SA_COMM_CI), comm-2 for the response ring (SA_COMM_RI), i.e.
+     * BELOW the communications region proper, which is why rq_step4() zeroes from `comm + SA_COMM_CI`
+     * rather than from `comm`.
+     *
+     * *** THE RESULT OF THAT WRITE IS DISCARDED. ***  The C casts it to `(void)` and its own comment
+     * says "note that NXMs are ignored!".  So a ring interrupt whose flag word lands on an
+     * unmapped page does NOT take the controller fatal, does NOT set the port error, and leaves the
+     * ring index advancing normally -- which is the opposite of every other DMA in this file and is
+     * a graded case rather than a footnote.
+     *
+     * The interrupt REQUEST itself (rq_setint) is recorded in `irq` and wired nowhere -- see the
+     * file header's exclusion.  Note the condition is SA_S1H_VEC ALONE: unlike rq_init_int() it does
+     * NOT test SA_S1H_IE, which is why mscpringdiff.js fences on VEC rather than on IE.
+     *
+     * @this {RQVAX}
+     * @param {Object} ring
+     */
+    ringInt(ring)
+    {
+        let iadr = (this.comm + ring.ioff) >>> 0;           /* addr intr wd */
+        this.flagBuf[0] = 1;
+        this.flagBuf[1] = 0;
+        this.cqbic.mapWriteW(iadr, 2, this.flagBuf);        /* write flag -- RESULT IGNORED */
+        if (this.s1dat & SA_S1H_VEC) this.irq = 1;          /* if enb, intr */
+    }
+
+    /**
+     * traceReq(line)
+     *
+     * One `sim_debug (DBG_REQ, ...)` line.  See the file header: this is a diagnostic stream, and
+     * the five call sites are the five the C has.  Kept unbounded rather than ring-buffered because
+     * its consumer truncates it per case; a run that never truncates it is a run whose consumer is
+     * not the differential, and mscpringdiff.js asserts an absolute heap bound over the whole pass.
+     *
+     * @this {RQVAX}
+     * @param {string} line
+     */
+    traceReq(line) { this.reqLog.push({t: this.cpu ? this.cpu.nTotalCycles : 0, line}); }
 
     /**
      * plf()
@@ -866,6 +1589,22 @@ export default class RQVAX {
         for (let p = this.freq; p && out.length <= RQ_NPKTS; p = this.pakLink[p]) out.push(p);
         return out;
     }
+
+    /**
+     * respQueue()
+     *
+     * The DEFERRED response list as `SHOW RQ RESPQ` walks it -- same discipline as freeQueue(), and
+     * non-empty only while the host owns no response descriptor.  Bounded for the same reason.
+     *
+     * @this {RQVAX}
+     * @returns {Array.<number>}
+     */
+    respQueue()
+    {
+        let out = [];
+        for (let p = this.rspq; p && out.length <= RQ_NPKTS; p = this.pakLink[p]) out.push(p);
+        return out;
+    }
 }
 
 /* Published as class data so tests/mscpinitdiff.js's --selfcheck can PERTURB the shipped
@@ -873,6 +1612,20 @@ export default class RQVAX {
    these is read by the methods above at call time, never captured in a closure. */
 RQVAX.CTLR_TAB = CTLR_TAB;
 RQVAX.RQ_SVER  = RQ_SVER;
+RQVAX.RQ_HVER  = RQ_HVER;
+RQVAX.RQ_CLASS = RQ_CLASS;
+RQVAX.OP = OP;
+RQVAX.ST = ST;
+/** value -> name, inverted from OP so the dispatch never carries a second list of numbers. */
+RQVAX.OP_NAME_OF = (function() {
+    let m = {};
+    for (let n of Object.keys(OP)) m[OP[n]] = n;
+    return m;
+})();
+RQVAX.MSCP_UNIT_OPS = MSCP_UNIT_OPS;
+RQVAX.MSCP_NOP_OPS = MSCP_NOP_OPS;
+RQVAX.MSCP_SCC_OP = MSCP_SCC_OP;
+RQVAX.CMD_NAMES = CMD_NAMES;
 RQVAX.RQUnimplemented = RQUnimplemented;
 
 export {
@@ -884,9 +1637,19 @@ export {
     SA_S2C_PT, SA_S2C_V_EC, SA_S2C_M_EC, SA_S2H_CLO, SA_S2H_PI,
     SA_S3C_V_EC, SA_S3C_M_EC, SA_S3H_PP, SA_S3H_CHI,
     SA_S4C_V_MOD, SA_S4C_V_VER, SA_S4H_CS, SA_S4H_NN, SA_S4H_SF, SA_S4H_LF, SA_S4H_GO,
-    PE_PRE, PE_PWE, PE_QRE, PE_QWE, PE_HAT, PE_ICI, PE_PIE, PE_PPF, PE_MRE,
+    PE_PRE, PE_PWE, PE_QRE, PE_QWE, PE_HAT, PE_ICI, PE_PIE, PE_PPF, PE_MRE, PE_NSR,
     SA_COMM_QQ, SA_COMM_PI, SA_COMM_CI, SA_COMM_RI, SA_COMM_MAX,
     UQ_DESC_OWN, UQ_DESC_F, UQ_ADDR, UQ_HDR_OFF,
-    CF_RPL, CF_ATN, RQ_SVER, RQ_DHTMO, RQ_NUMDR, RQ_NPKTS, RQ_M_NPKTS, RQ_PKT_SIZE_W, RQ_PKT_SIZE,
+    UQ_HLNT, UQ_HCTC, UQ_HCTC_V_CR, UQ_HCTC_M_CR, UQ_HCTC_V_TYP, UQ_HCTC_M_TYP,
+    UQ_HCTC_V_CID, UQ_HCTC_M_CID, UQ_TYP_SEQ, UQ_TYP_DAT,
+    UQ_CID_MSCP, UQ_CID_TMSCP, UQ_CID_DUP, UQ_CID_DIAG,
+    OP, ST, I_OPCD, I_VRSN, CMD_NAMES, MSCP_UNIT_OPS, MSCP_NOP_OPS, MSCP_SCC_OP,
+    CMD_REFL, CMD_REFH, CMD_UN, CMD_OPC, CMD_MOD, CMD_OPC_V_OPC, CMD_OPC_M_OPC,
+    RSP_LNT, RSP_OPF, RSP_STS, RSP_OPF_V_OPC, RSP_OPF_V_FLG,
+    SCC_LNT, SCC_MSV, SCC_CFL, SCC_TMO, SCC_VER, SCC_CIDA, SCC_CIDB, SCC_CIDC, SCC_CIDD,
+    SCC_MBCL, SCC_MBCH, SCC_VER_V_SVER, SCC_VER_V_HVER, SCC_CIDD_V_MOD, SCC_CIDD_V_CLS,
+    RW_BCL, RW_BCH, RW_BAL, RW_BAH, RW_LBNL, RW_LBNH,
+    CF_RPL, CF_ATN, RQ_CLASS, RQ_HVER, RQ_SVER, RQ_DHTMO, RQ_DCTMO,
+    RQ_NUMDR, RQ_NPKTS, RQ_M_NPKTS, RQ_PKT_SIZE_W, RQ_PKT_SIZE,
     RQ_ITIME, RQ_ITIME4, RQ_QTIME, RQ_XTIME
 };
