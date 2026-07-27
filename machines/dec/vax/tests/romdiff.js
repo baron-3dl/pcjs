@@ -93,6 +93,9 @@ import NVRVAX from "../modules/v2/nvr.js";
 import CQBICVAX from "../modules/v2/cqbic.js";
 import KA655VAX from "../modules/v2/ka655.js";
 import ConsoleVAX from "../modules/v2/console.js";
+import ClkVAX, { IPL_CLK_ABS, INT_V_CLK } from "../modules/v2/clk.js";
+import { makeIprDevice } from "../modules/v2/iprdevice.js";
+import { SCB } from "../modules/v2/exc.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -184,15 +187,22 @@ function makeMachine(romBytes)
     let cpu = new CPUStateVAX({id: "cpu"});
     /* ConsoleVAX (pcjsvax-bfb) models RXCS/RXDB/TXCS/TXDB ONCE and is wired into BOTH address
        paths: setIPRDevice() below (the IPR path) and SSCVAX's third constructor argument (the SSC
-       mirror) -- see console.js's and ssc.js's file headers. */
+       mirror) -- see console.js's and ssc.js's file headers.
+       ClkVAX (pcjsvax-954) owns MT.ICCS/MT.TODR.  exc.js's setIPRDevice() accepts only ONE device,
+       so both are combined behind iprdevice.js's makeIprDevice() -- see that file's header for why
+       clk is NOT also ticked through it (cpu.clk already ticks it once per instruction via
+       cpustate.js's own hook; ticking it again here would double clk_svc's effective rate). */
     let consoleDev = new ConsoleVAX(cpu.exc);
+    let clk = new ClkVAX(cpu.exc);
     bus.addSsc(new SSCVAX(cpu.exc, consoleDev), new NVRVAX());
     bus.addRegBlock([
         {base: VAX.PHYSMEM.REG_BASE >>> 0, length: 0x14, dev: new CQBICVAX(cpu.exc)},
         {base: (VAX.PHYSMEM.REG_BASE + 0x4000) >>> 0, length: 8, dev: new KA655VAX()}
     ]);
     cpu.setBus(bus);
-    cpu.exc.setIPRDevice(consoleDev);
+    cpu.exc.setIPRDevice(makeIprDevice(clk, consoleDev));
+    cpu.exc.addInterruptSource(IPL_CLK_ABS, INT_V_CLK, SCB.INTTIM);
+    cpu.clk = clk;
     return {bus, cpu};
 }
 

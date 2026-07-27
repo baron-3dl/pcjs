@@ -57,9 +57,11 @@ import MemoryVAX from "../modules/v2/memory.js";
 import { VAX } from "../modules/v2/defines.js";
 import VAXCpu, { DISPATCH } from "../modules/v2/cpu.js";
 import { OPCODES } from "../modules/v2/drom.js";
-import VAXExc, { executeExc, MT, IPL_HMIN, PSL_V_IPL, KERN } from "../modules/v2/exc.js";
+import VAXExc, { executeExc, MT, IPL_HMIN, PSL_V_IPL, KERN, SCB } from "../modules/v2/exc.js";
 import SSCVAX from "../modules/v2/ssc.js";
 import ConsoleVAX, { SCB_TTI, SCB_TTO, TTI_BIT, TTO_BIT, CSR_DONE, CSR_IE } from "../modules/v2/console.js";
+import ClkVAX, { IPL_CLK_ABS, INT_V_CLK } from "../modules/v2/clk.js";
+import { makeIprDevice } from "../modules/v2/iprdevice.js";
 
 function hex(v, n = 8) { return ((v >>> 0).toString(16).toUpperCase()).padStart(n, "0"); }
 
@@ -121,15 +123,31 @@ class ConsoleCpu extends VAXCpu {
     stepOne() { let r = this.exc.stepInstruction(this, (opc, d, c) => this.executeOne(opc, d, c)); this.nTotalCycles++; return r; }
 }
 
+/**
+ * makeMachine()
+ *
+ * pcjsvax-bfb, post-merge reconciliation with pcjsvax-954: ClkVAX (clk.js) owns MT.ICCS/MT.TODR;
+ * ConsoleVAX owns MT.RXCS/RXDB/TXCS/TXDB.  exc.js's setIPRDevice() accepts only one device, so both
+ * are combined behind iprdevice.js's makeIprDevice() -- see that file's header, and console.js's
+ * own updated file header, for why the two are not merged into one object and why clk is NOT ticked
+ * through the aggregate (this harness's ConsoleCpu never calls cpustate.js's stepCPU() at all, so
+ * clk.tick() is never invoked here either way -- consistent with hwintdiff.js's HwIntCpu, and
+ * harmless since nothing in this file exercises ICCS/TODR ticking behavior; that is timerdiff.js's
+ * job). `clk` is constructed and wired here purely so this file proves the SAME aggregate pattern
+ * romdiff.js's production machine uses, not a console-only shortcut that would leave TODR/ICCS
+ * silently unreachable in this harness.
+ */
 function makeMachine()
 {
     let bus = new BusVAX({busWidth: VAX.PAWIDTH, id: "bus"}, null, null);
     bus.addMemory(0, MEMSIZE, MemoryVAX.TYPE.RAM);
     let cpu = new ConsoleCpu(bus);
     let consoleDev = new ConsoleVAX(cpu.exc);
+    let clk = new ClkVAX(cpu.exc);
     bus.addSsc(new SSCVAX(cpu.exc, consoleDev), null);
-    cpu.exc.setIPRDevice(consoleDev);
-    return {bus, cpu, consoleDev};
+    cpu.exc.setIPRDevice(makeIprDevice(clk, consoleDev));
+    cpu.exc.addInterruptSource(IPL_CLK_ABS, INT_V_CLK, SCB.INTTIM);
+    return {bus, cpu, consoleDev, clk};
 }
 
 /* ------------------------------------------------------------------------------------------- *

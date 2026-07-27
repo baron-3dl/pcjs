@@ -75,9 +75,23 @@
  * maybeComplete() below, each with the vax_stddev.c line it reproduces.
  *
  * ============================================================================
- * MT.TODR -- see the doc comment on TODR_SENTINEL below (unchanged from this item's earlier,
- * pre-console commit; kept in this same file because setIPRDevice() only ever installs ONE device
- * for every off-chip IPR, TODR included).
+ * MT.TODR -- OWNED BY clk.js, NOT THIS FILE (reconciled post-merge with pcjsvax-954)
+ * ============================================================================
+ * An earlier revision of this file answered MT.TODR itself, with a fixed, non-wall-clock
+ * CC-preserving sentinel -- romdiff's boundary-advance hit `MFPR #1B,...` (MT.TODR = 27) BEFORE
+ * ever reaching the console registers, and at the time nothing else in this tree modeled TODR at
+ * all.  pcjsvax-954 has since landed a REAL TODR (modules/v2/clk.js's ClkVAX): a full port of
+ * todr_rd/todr_wr including the ROM-detection special case, the TOY_MAX_SECS overflow branch, and
+ * a DST-correct power-on resync, graded LIVE and bit-exact against SIMH (tests/timerdiff.js pokes
+ * the raw register directly via `deposit CLK TODR n`, sidestepping the cross-process wall-clock
+ * problem the sentinel's own rationale was built around).  That rationale is superseded, not
+ * merely outdated: a live, verified answer beats a CC-shape-only approximation.  The sentinel is
+ * deleted; MT.TODR now belongs to ClkVAX exclusively.  Because exc.js's setIPRDevice() accepts only
+ * ONE device, ClkVAX and ConsoleVAX are combined behind a single dispatching object -- see
+ * iprdevice.js's makeIprDevice(), which is what every machine builder in this tree now installs via
+ * setIPRDevice() instead of a bare `new ConsoleVAX(exc)`.  This file therefore never sees MT.TODR,
+ * MT.ICCS, MT.NICR or MT.ICR at all -- makeIprDevice() routes them to clk before this class's
+ * read()/write() are ever called.
  * ============================================================================
  */
 
@@ -104,43 +118,6 @@ const SERIAL_OUT_WAIT = 100;
 /* ssc_rd()/ssc_wr()'s register-index constants for the SSC mirror, vax_sysdev.c:1264-1458 (see
    ssc.js's own doc comment for how these are reached). */
 const SSC_RG_RXCS = 0x20, SSC_RG_RXDB = 0x21, SSC_RG_TXCS = 0x22, SSC_RG_TXDB = 0x23;
-
-/*
- * MT.TODR's CC-preserving sentinel -- romdiff's boundary-advance hit `MFPR #1B,...` (MT.TODR = 27)
- * BEFORE ever reaching the console registers; exc.js's setIPRDevice() is the ONLY installer for
- * every off-chip IPR, not just this item's four, so getting the ROM past that instruction requires
- * SOMETHING here to answer TODR too.
- *
- * vax_stddev.c's todr_rd() has a ROM-diagnostics special case: `if ((fault_PC & 0xFFFE0000) ==
- * 0x20040000) return todr_reg;` -- while executing from the ROM (which is ALWAYS true for this
- * item), it returns the raw counter with NO live wall-clock re-sampling.  But `todr_reg` itself was
- * already seeded, once, at `reset`/`boot cpu` time by `todr_resync()`'s "not attached" branch --
- * `(seconds since local midnight)*100 + 0x10000000 + centiseconds` -- REAL WALL-CLOCK TIME captured
- * the instant SIMH's own process reset.  Because `captureSimhTrace()` runs SIMH as a SEPARATE
- * process invocation from this machine's own JS run, there is no wall-clock instant the two could
- * ever agree on -- a GENUINELY non-reproducible value, the same class HANDOFF.md's §7 already
- * documents for EHKAA's timer-dependent counts.
- *
- * What DOES matter, and is what this models: the CC bits an MFPR of TODR sets (an ordinary MOVL-
- * shaped result -- N from the sign bit, Z from being zero, V cleared, C preserved).  SIMH's
- * wall-clock formula is `secondsSinceMidnight*100 + 0x10000000 + centiseconds`; secondsSinceMidnight
- * maxes out at 86400, so the whole expression is bounded by roughly 0x10000000 + 8,640,000 + 99,
- * comfortably under 0x20000000 -- bit 31 is NEVER set and the value is NEVER zero, for any wall-clock
- * time whatsoever.  `read(MT.TODR)` below reproduces exactly that shape (a fixed, non-wall-clock
- * sentinel deliberately picked with N=0, Z=0, matching what SIMH's formula produces on EVERY
- * possible real invocation) so the CC bits this record sets AGREE with the oracle's on every run,
- * even though the raw 32-bit VALUE itself does not and is not required to: the ROM stores it into
- * NVR-range memory (a MemoryVAX.TYPE.CONTROLLER destination), which simhtrace.js's captureResult()
- * ALREADY marks resultUnreliable and excludes from the per-instruction VALUE comparison for exactly
- * this reason: a device register's stored value is graded by its OWN dedicated oracle, never by
- * this generic reconstruction.  TODR has no such dedicated oracle in this item (it is not one of
- * the four registers this item owns) and is not graded value-for-value anywhere.
- *
- * A REAL time-of-day clock is explicitly NOT modeled here and belongs to whichever future item owns
- * the SSC/CLK timer hardware; this file's TODR handling exists ONLY to keep the ROM's boot-entry
- * trace from diverging on an IPR this item does not own.
- */
-const TODR_SENTINEL = 0x10000000;
 
 export default class ConsoleVAX {
     /**
@@ -337,10 +314,11 @@ export default class ConsoleVAX {
      * vax_sysdev.c's ReadIPR() (:845-913): MT_RXCS/MT_RXDB/MT_TXCS call the SAME functions
      * sscRead() below calls; MT_TXDB reads as a PLAIN 0 (`case MT_TXDB: val = 0;` -- no `txdb_rd()`
      * exists, output is write-only, matching real hardware).  Every other off-chip register number
-     * this device does not decode -- including every one already handled elsewhere in this machine
-     * (SID is exc.js's own, not this device's) -- falls through to 0, exactly what exc.js's
-     * readIPR() did BEFORE any iprDevice was installed, so installing this device changes nothing
-     * for a register neither it nor exc.js decodes.
+     * this device does not decode -- including MT.TODR/MT.ICCS (clk.js's ConsoleVAX, reached via
+     * iprdevice.js's makeIprDevice() before this function is ever called for them -- see the file
+     * header) and SID (exc.js's own) -- falls through to 0, exactly what exc.js's readIPR() did
+     * BEFORE any iprDevice was installed, so installing this device changes nothing for a register
+     * neither it nor exc.js decodes.
      *
      * @this {ConsoleVAX}
      * @param {number} prn
@@ -353,7 +331,6 @@ export default class ConsoleVAX {
         case MT.RXDB: return this.rxdbRd();
         case MT.TXCS: return this.txcsRd();
         case MT.TXDB: return 0;                 // vax_sysdev.c ReadIPR() case MT_TXDB: val = 0
-        case MT.TODR: return TODR_SENTINEL | 0;
         }
         return 0;
     }
