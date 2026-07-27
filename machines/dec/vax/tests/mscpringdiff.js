@@ -17,8 +17,12 @@
  *
  * THE VEHICLE COMMAND IS SET CONTROLLER CHARACTERISTICS (OP_SCC, 4), because it is the only MSCP
  * command that needs neither an attached unit nor a transfer.  It exercises the ring machinery and
- * nothing else, which is the point: the twelve unit-bearing commands are pcjsvax-f52's work and
- * `assertExclusions()` below FAILS the run if any graded case sends one.
+ * nothing else, which is the point: the twelve unit-bearing commands are NOT this item's, and
+ * `assertExclusions()` below FAILS the run if any graded case sends one.  (Seven of the twelve are
+ * now ANSWERED by rq.js -- pcjsvax-f52 landed them, with no unit attached they mostly report
+ * ST_OFL, and tests/mscpunitdiff.js is what grades them.  The fence stays exactly as it was:
+ * pcjsvax-0b4's argument is about the RING MACHINERY, and letting a unit command into this case
+ * list would make one item's coverage certify another's.)
  *
  * THREE INDEPENDENT UNPATCHED VIEWS, WHICH MUST AGREE.  No eighth SIMH patch:
  *   1. the RESPONSE PACKETS IN HOST PHYSICAL MEMORY, dumped WHOLE PAGES at a time with `examine`;
@@ -62,9 +66,11 @@
  *
  * WHAT IS DELIBERATELY NOT GRADED, BY NAME (standing rule 6)
  * -----------------------------------------------------------
- *   - The twelve UNIT-BEARING MSCP commands and all disk I/O.  pcjsvax-f52.  rq.js throws
- *     RQUnimplemented by name; `assertExclusions()` FAILS the run if a case sends one, and PHASE S
- *     FAILS the run if the C's dispatch grows a case rq.js does not classify.
+ *   - The twelve UNIT-BEARING MSCP commands and all disk I/O.  Seven are answered by rq.js and
+ *     graded by tests/mscpunitdiff.js (pcjsvax-f52); the five transfer opcodes still throw
+ *     RQUnimplemented by name (pcjsvax-346).  Either way NO case here sends one:
+ *     `assertExclusions()` FAILS the run if a case does, and PHASE S FAILS the run if the C's
+ *     dispatch grows a case rq.js does not classify or moves one to a different handler.
  *   - CONTROLLER INTERRUPT DELIVERY.  pcjsvax-aef.  rq_ring_int() raises an interrupt on
  *     SA_S1H_VEC ALONE -- it does NOT test SA_S1H_IE, unlike rq_init_int() -- so every graded case
  *     here supplies VEC == 0 and `assertExclusions()` FAILS the run if one does not.  What IS
@@ -114,7 +120,7 @@ import {
     hex, findSimhBin, runSimh, mulberry32, sampleHeap, peakHeap,
     Asm, machine, RQ_OBS, rqFieldOf, PKT_WORDS, pktWord,
     showCtrl, physPageFor, seedFor, walkScript, emitAction,
-    simhResetLines, jsResetForCase
+    simhResetLines, jsResetForCase, geometry, qbusPagesFor
 } from "./mscpharness.js";
 import { checkScope } from "./mscpscope.js";
 
@@ -151,59 +157,6 @@ const PKT_PROBES = (function() {
     for (let p of [0, 1, 2, 3, 31]) for (let w = 0; w < PKT_WORDS; w++) out.push(p * PKT_WORDS + w);
     return out;
 })();
-
-/* ------------------------------------------------------------------------------------------- *
- * Ring geometry, derived from the host's own S1 word                                            *
- * ------------------------------------------------------------------------------------------- */
-
-/**
- * geometry(spec)
- *
- * Where everything lives in QBUS space, computed FROM THE SPEC -- never by asking rq.js, which
- * would grade a defect against itself.  *** THE RESPONSE RING COMES FIRST ***: rq_step4() does
- * `rq.ba = comm; cq.ba = comm + rq.lnt`, so the response ring is at the base and the command ring
- * sits above it.  Measured on the live oracle with a one-descriptor pair at comm = 0x2000:
- * `Command ring, base = 2004` and `Response ring, base = 2000`.
- *
- * Packet buffers start on the first 64-byte boundary above both rings.  A descriptor names the
- * address of the packet's BODY, four bytes above the buffer's start, because the two-word UQSSP
- * header lives at `descriptor address + UQ_HDR_OFF`.
- */
-function geometry(spec)
-{
-    let rqLnt = 4 << spec.rqCode, cqLnt = 4 << spec.cqCode;
-    let rqBa = spec.comm >>> 0, cqBa = (spec.comm + rqLnt) >>> 0;
-    let nCmd = spec.nCmdBuf, nRsp = spec.nRspBuf;
-    let pgUp = (a) => (a + PAGE - 1) & ~(PAGE - 1);
-    /* THE THREE AREAS ARE ON SEPARATE QBUS PAGES, deliberately.  A page is the unit the CQBIC
-       scatter-gather map validates, so "unmap the page the command packets live on" is only a
-       statement about command packets if nothing else lives there -- and the PE_PRE / PE_PWE cases
-       are exactly that statement.  A 64-byte packing would put the rings, the command buffers and
-       the response buffers in one page and make both fatals indistinguishable from PE_QRE. */
-    let cmdBase = pgUp(spec.comm + rqLnt + cqLnt);
-    let rspBase = cmdBase + pgUp(nCmd * 64);
-    return {
-        rqLnt, cqLnt, rqBa, cqBa, cmdBase, rspBase,
-        rqSlots: rqLnt >> 2, cqSlots: cqLnt >> 2,
-        cmdBuf: (i) => (cmdBase + i * 64) >>> 0,
-        cmdEnv: (i) => (cmdBase + i * 64 + 4) >>> 0,
-        rspBuf: (j) => (rspBase + j * 64) >>> 0,
-        rspEnv: (j) => (rspBase + j * 64 + 4) >>> 0,
-        /* The interrupt flag words sit BELOW comm: SA_COMM_CI (-4) for the command ring, SA_COMM_RI
-           (-2) for the response ring, and SA_COMM_QQ (-8) is the lowest word rq_step4() zeroes when
-           the host asked for a purge interrupt.  So the region starts eight bytes below `comm`. */
-        lo: (spec.comm - 8) >>> 0,
-        hi: (rspBase + pgUp(nRsp * 64) - 1) >>> 0
-    };
-}
-
-/** Every Qbus page a case can reference, derived from the geometry rather than listed. */
-function qbusPagesFor(g)
-{
-    let pages = [];
-    for (let a = g.lo & ~(PAGE - 1); a <= g.hi; a += PAGE) pages.push((a / PAGE) | 0);
-    return pages;
-}
 
 /* ------------------------------------------------------------------------------------------- *
  * The command packet a host plants in memory                                                    *
@@ -1268,7 +1221,9 @@ function assertExclusions(cases, sim, failures)
             if (nm && RQVAX.MSCP_UNIT_OPS.indexOf(nm) >= 0) {
                 failures.push(`exclusion: case ${c.idx} "${c.name}" plants a command packet with opcode ` +
                     `OP_${nm} (${opc}), which rq_mscp() dispatches to a UNIT-bearing handler.  Those ` +
-                    `twelve commands are pcjsvax-f52's work and rq.js throws by name.`);
+                    `twelve commands are graded by tests/mscpunitdiff.js (pcjsvax-f52) and ` +
+                    `tests/mscprwdiff.js (pcjsvax-346), not here -- this item's argument is about ` +
+                    `the ring machinery and must not borrow another's coverage.`);
             }
         }
     }
