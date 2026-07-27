@@ -131,7 +131,7 @@ import MemoryVAX from "../modules/v2/memory.js";
 import { VAX } from "../modules/v2/defines.js";
 import CPUStateVAX from "../modules/v2/cpustate.js";
 import { OPCODES } from "../modules/v2/drom.js";
-import { SCB, MT, PSL_V_IPL, IPL_HMIN } from "../modules/v2/exc.js";
+import VAXExc, { SCB, MT, MT_MAX, PSL_V_IPL, IPL_HMIN, SSCBTO_BTO, SSCBTO_RWT } from "../modules/v2/exc.js";
 import ClkVAX, { IPL_CLK_ABS, INT_V_CLK, INSTRS_PER_TICK, ROM_MASK, ROM_TAG, TOY_MAX_SECS, dayOfYear } from "../modules/v2/clk.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -312,6 +312,10 @@ function runFixedCase(bin, scratch, name, code, opts = {})
     for (let s = 0; s < steps; s++) L.push("step 1");
     L.push(`examine -h ${["R0","R1","PC","PSL"].join(",")}`);
     L.push(`examine -h CLK INT`);
+    /* SSC bus-timeout: pcjsvax-b4b.  A fresh SIMH PROCESS per case (runSimh spawns one every call,
+       unlike mchkdiff.js's multi-case-per-process script) starts sysd_powerup()'s ssc_bto=0, so no
+       `deposit sysd bto 0` is needed here the way mchkdiff.js needs one. */
+    L.push(`examine -h sysd bto`);
     L.push("exit");
     let out = runSimh(bin, L.join("\n") + "\n", path.join(scratch, `timerdiff-${name}.ini`));
     let simh = parseSimhExamine(out);
@@ -344,7 +348,8 @@ function runFixedCase(bin, scratch, name, code, opts = {})
     }
     let js = {
         R0: cpu.regs[0] | 0, R1: cpu.regs[1] | 0, PC: cpu.regs[15] >>> 0, PSL: cpu.psl >>> 0,
-        clkInt: (cpu.exc.intReq[IPL_CLK_ABS - IPL_HMIN] >>> INT_V_CLK) & 1
+        clkInt: (cpu.exc.intReq[IPL_CLK_ABS - IPL_HMIN] >>> INT_V_CLK) & 1,
+        bto: cpu.exc.sscBto >>> 0
     };
     return {js, simh};
 }
@@ -362,9 +367,14 @@ function parseSimhExamine(out)
        own trailing decode text, so anchor strictly to the start of the value field. */
     let intM = /^INT:\s*([0-9A-Fa-f]+)/m.exec(out);
     if (!intM) throw new Error(`timerdiff: SIMH did not report CLK INT; output:\n${out}`);
+    /* `examine -h sysd bto` prints "BTO:\tvalue" the same generic way -- see mchkdiff.js's
+       parseSimhBto() for the identical precedent. */
+    let btoM = /^BTO:\s*([0-9A-Fa-f]+)/m.exec(out);
+    if (!btoM) throw new Error(`timerdiff: SIMH did not report sysd BTO; output:\n${out}`);
     return {
         R0: get("R0"), R1: get("R1"), PC: get("PC"), PSL: get("PSL"),
-        clkInt: parseInt(intM[1], 16) & 1
+        clkInt: parseInt(intM[1], 16) & 1,
+        bto: parseInt(btoM[1], 16) >>> 0
     };
 }
 
@@ -397,68 +407,72 @@ function caseAckClearsPending(bin, scratch, failures)
     covered.ackClearsPending = true;
 }
 
-/** NICR(25)/ICR(26) are architected IPR NUMBERS this SIMH model does not wire to anything at all
-    (vax_sysdev.c's ReadIPR/WriteIPR has no case for either) -- MTPR then MFPR must round-trip as
-    the inert default (write dropped, read 0), NOT as a reload register a naive port might invent. */
+/**
+ * deriveUnownedIprs()
+ *
+ * Standing rule 5: derive the "no device owns this" IPR set programmatically, from the SHIPPED
+ * dispatch's own observed behavior, rather than transcribe one.  Runs a real MFPR for every
+ * architecturally-valid register number (0..MT_MAX) on a fresh JS machine and records which ones
+ * leave sscBto set afterward.  On-chip write-only registers (SIRR/TBIA/TBIS/TBCHK) fault before
+ * ever reaching readIPR() -- every SCB vector here points at a NOP page, so that fault dispatches
+ * harmlessly instead of a HALT, and sscBto simply stays 0 for them, excluding them from the result
+ * without any hand-picked exclusion list.  IPR_DEVICE members and SID/CONPC/CONPSL are excluded
+ * the identical way: the dispatch itself never reaches the BTO-setting default for them.
+ *
+ * @returns {Array<number>}
+ */
+function deriveUnownedIprs()
+{
+    let unowned = [];
+    for (let n = 0; n <= MT_MAX; n++) {
+        let {bus, cpu} = makeMachine();
+        cpu.exc.scbb = R_SCBB;
+        cpu.regs[14] = R_KSP;
+        cpu.exc.stk[0] = R_KSP;
+        for (let k = 0; k < 16; k++) bus.setByte(R_HANDLER + k, NOP_BYTE);
+        for (let v = 0; v < 0x200; v += 4) bus.setLong(R_SCBB + v, R_HANDLER);
+        let code = mfpr(n, 0);
+        for (let i = 0; i < code.length; i++) bus.setByte(R_CODE + i, code[i]);
+        cpu.psl = 0;
+        cpu.setPC(R_CODE);
+        try { cpu.stepCPU(1); } catch (e) { continue; }
+        if ((cpu.exc.sscBto >>> 0) === 0x80000000) unowned.push(n);
+    }
+    return unowned;
+}
+
+/**
+ * caseNicrIcrInert(bin, scratch, failures)
+ *
+ * NICR(25)/ICR(26) are architected IPR NUMBERS this SIMH model does not wire to anything at all
+ * (vax_sysdev.c's ReadIPR/WriteIPR has no case for either) -- MTPR then MFPR must round-trip as
+ * the inert default (write dropped, read 0), NOT as a reload register a naive port might invent.
+ *
+ * MEASURED DIVERGENCE, RESOLVED (pcjsvax-b4b): vax_sysdev.c's ReadIPR/WriteIPR `default:` case --
+ * the one NICR/ICR (and every other unowned off-chip number, see deriveUnownedIprs() above) falls
+ * into -- ALSO sets SSCBTO_BTO (`examine sysd bto` measured 0x00000000 -> 0x80000000 across a real
+ * MFPR NICR).  This used to be a PINNED divergence (simh=BTO set, js=BTO clear), asserted rather
+ * than merely printed so a later exc.js change would force a red re-decision instead of silently
+ * relabelling a new value "(match)".  exc.js's readIPR()/writeIPR() now set sscBto |= SSCBTO_BTO
+ * (BTO only, never SSCBTO_RWT -- that stays busTimeout()'s exclusively, pcjsvax-446) on this same
+ * default arm, so the pin is flipped here to an ordinary EQUALITY assertion, graded against the
+ * full derived set -- not just NICR/ICR -- live against the oracle.
+ */
 function caseNicrIcrInert(bin, scratch, failures)
 {
-    for (let prn of [MT.NICR, MT.ICR]) {
+    let derived = deriveUnownedIprs();
+    if (!derived.includes(MT.NICR) || !derived.includes(MT.ICR)) {
+        failures.push(`nicrIcrInert: derived unowned-IPR set is missing NICR/ICR -- got [${derived.join(",")}]; ` +
+            `exc.js's readIPR()/writeIPR() no longer sets BTO for them, which is this item's own regression to catch`);
+    }
+    for (let prn of derived) {
         let tag = `passthrough_prn${prn}`;
         let code = asm(mtpr(0x12345678, prn), mfpr(prn, 0));
         let {js, simh} = runFixedCase(bin, scratch, tag, code, {steps: 2});
         checkExact(failures, tag, js.R0, simh.R0, "R0 (must read back 0, not the written value)");
-        /*
-         * PINNED, MEASURED DIVERGENCE (pcjsvax-b4b): vax_sysdev.c's ReadIPR/WriteIPR `default:`
-         * case -- the one NICR/ICR fall into -- ALSO sets SSCBTO_BTO (`examine sysd bto` measured
-         * 0x00000000 -> 0x80000000 across a real MFPR NICR).  exc.js's OWN default (readIPR()/
-         * writeIPR() with no device installed) does not set this bit -- a pre-existing gap in
-         * exc.js itself, which this item's constraint (do not touch exc.js) leaves this file
-         * unable to close; pcjsvax-b4b owns the fix (exc.js's default case must set
-         * sscBto |= SSCBTO_BTO -- BTO only, NOT BTO|RWT, distinct from busTimeout() -- per
-         * vax_sysdev.c:913/982).
-         *
-         * ASSERTED, not merely printed: a plain report has no owner, no expiry, and is not a
-         * tripwire -- a later exc.js change would silently relabel a NEW value "(match)" with
-         * nothing failing.  Pinning the CURRENTLY-MEASURED divergence (simh=BTO set, js=BTO clear)
-         * means the day exc.js changes -- pcjsvax-b4b landing, or anything else touching the
-         * default case -- this assertion goes RED and forces a re-decision, rather than silently
-         * drifting to a new, unnoticed "measured" value.
-         */
-        let btoOut = runSimh(bin, [
-            "set cpu 16m", "set cpu simhalt", "reset all", "deposit MAPEN 0",
-            `deposit -b ${hex(R_CODE)} ${MFPR_OPC.toString(16)}`,
-            `deposit -b ${hex(R_CODE + 1)} ${(prn & 0x3F).toString(16)}`,
-            `deposit -b ${hex(R_CODE + 2)} 50`,
-            "deposit PSL 0", `deposit PC ${hex(R_CODE)}`, "step 1",
-            "examine -h sysd bto", "exit"
-        ].join("\n") + "\n", path.join(scratch, `timerdiff-${tag}-bto.ini`));
-        let simhBtoAfter = parseSimhBto(btoOut);
-        let jsBtoAfter = (() => {
-            let {cpu} = makeMachine();
-            cpu.exc.scbb = R_SCBB;
-            let addr = R_CODE;
-            let mfprCode = mfpr(prn, 0);
-            for (let i = 0; i < mfprCode.length; i++) cpu.bus.setByte(addr + i, mfprCode[i]);
-            cpu.setPC(addr);
-            cpu.stepCPU(1);
-            return cpu.exc.sscBto >>> 0;
-        })();
-        if (simhBtoAfter !== 0x80000000) {
-            failures.push(`${tag}: pcjsvax-b4b pin broken -- SIMH sysd BTO after MFPR ${prn}=${hex(simhBtoAfter)}, expected 0x80000000 (the measured baseline this pin tracks)`);
-        }
-        if (jsBtoAfter !== 0x00000000) {
-            failures.push(`${tag}: pcjsvax-b4b pin broken -- JS sscBto after MFPR ${prn}=${hex(jsBtoAfter)}, expected 0x00000000. ` +
-                `If exc.js's default IPR case now sets sscBto (pcjsvax-b4b landed), update this pin to assert equality instead.`);
-        }
+        checkExact(failures, tag, js.bto, simh.bto, "SSC BTO (pcjsvax-b4b: unowned IPR must set BTO on both engines)");
     }
     covered.nicrIcrInert = true;
-}
-
-function parseSimhBto(out)
-{
-    let m = /^BTO:\s*([0-9A-Fa-f]+)/m.exec(out);
-    if (!m) throw new Error(`timerdiff: SIMH did not report sysd BTO; output:\n${out}`);
-    return parseInt(m[1], 16) >>> 0;
 }
 
 /** TODR=0 is "clock not running" -- todr_rd() returns 0 unconditionally, in EITHER context, with
@@ -1141,6 +1155,44 @@ const MUTATIONS = {
             return Math.round(elapsedMs / 10) | 0;
         };
         return () => { ClkVAX.prototype.todrRd = orig; };
+    },
+    /* pcjsvax-b4b: the pre-fix bug itself -- the off-chip default reads 0 / drops the write but
+       never sets the bus-timeout bit at all.  Composes over the shipped readIPR/writeIPR (calls
+       through to `orig`, then strips the bit back off) rather than substituting a hand-written
+       replacement -- standing rule 11: this PERTURBS the shipped path, it does not replace it. */
+    "bto_not_set_on_unowned_ipr"() {
+        let origRead = VAXExc.prototype.readIPR;
+        let origWrite = VAXExc.prototype.writeIPR;
+        VAXExc.prototype.readIPR = function(prn) {
+            let before = this.sscBto;
+            let val = origRead.call(this, prn);
+            this.sscBto = before;                   // undo whatever BTO the real path just set
+            return val;
+        };
+        VAXExc.prototype.writeIPR = function(prn, val) {
+            let before = this.sscBto;
+            origWrite.call(this, prn, val);
+            this.sscBto = before;
+        };
+        return () => { VAXExc.prototype.readIPR = origRead; VAXExc.prototype.writeIPR = origWrite; };
+    },
+    /* pcjsvax-b4b: the OTHER wrong shape -- collapsing the IPR-default path into busTimeout()'s
+       BTO|RWT instead of keeping it BTO-only (vax_sysdev.c:913/982 never touches RWT; only the
+       register-space/Qbus bus-fault path does, pcjsvax-446).  Composes over the shipped path the
+       same way: let it run, then OR the extra bit in afterward. */
+    "bto_set_with_rwt_also_set"() {
+        let origRead = VAXExc.prototype.readIPR;
+        let origWrite = VAXExc.prototype.writeIPR;
+        VAXExc.prototype.readIPR = function(prn) {
+            let val = origRead.call(this, prn);
+            if ((this.sscBto & SSCBTO_BTO) !== 0) this.sscBto = (this.sscBto | SSCBTO_RWT) | 0;
+            return val;
+        };
+        VAXExc.prototype.writeIPR = function(prn, val) {
+            origWrite.call(this, prn, val);
+            if ((this.sscBto & SSCBTO_BTO) !== 0) this.sscBto = (this.sscBto | SSCBTO_RWT) | 0;
+        };
+        return () => { VAXExc.prototype.readIPR = origRead; VAXExc.prototype.writeIPR = origWrite; };
     }
 };
 
@@ -1301,6 +1353,30 @@ function selfcheck(bin, scratch)
         if (origTz === undefined) delete process.env.TZ; else process.env.TZ = origTz;
         for (let f of dayOfYearFailures) console.log(`  ${f}`);
         results.push({name: "dayOfYear_table (M12/M13 guard)", caught: dayOfYearFailures.length === 0});
+    }
+    {
+        /* pcjsvax-b4b, done condition 5: "BTO not set on an unowned IPR" -- the pre-fix bug,
+           reinstated by MUTATIONS.bto_not_set_on_unowned_ipr(), must leave sscBto at 0 after an
+           MFPR of a register no device owns (MT.NICR), which is exactly the divergence
+           caseNicrIcrInert()'s checkExact(js.bto, simh.bto) would now flag against the oracle. */
+        let restore = MUTATIONS.bto_not_set_on_unowned_ipr();
+        let {cpu} = makeMachine();
+        cpu.exc.readIPR(MT.NICR);
+        let bto = cpu.exc.sscBto >>> 0;
+        restore();
+        results.push({name: "bto_not_set_on_unowned_ipr", caught: bto === 0});
+    }
+    {
+        /* pcjsvax-b4b, done condition 5: "BTO set but RWT also set" -- the wrong-shape fix that
+           collapses the IPR-default path into busTimeout()'s BTO|RWT, reinstated by
+           MUTATIONS.bto_set_with_rwt_also_set(), must leave sscBto with RWT riding along, which is
+           NOT what a real MFPR NICR produces on either engine (BTO only, vax_sysdev.c:913/982). */
+        let restore = MUTATIONS.bto_set_with_rwt_also_set();
+        let {cpu} = makeMachine();
+        cpu.exc.readIPR(MT.NICR);
+        let bto = cpu.exc.sscBto >>> 0;
+        restore();
+        results.push({name: "bto_set_with_rwt_also_set", caught: bto === ((SSCBTO_BTO | SSCBTO_RWT) >>> 0)});
     }
     let allCaught = results.every((r) => r.caught);
     return {results, allCaught};
