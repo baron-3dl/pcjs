@@ -115,6 +115,15 @@ import VAXExc, {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
 
+/* Plumbing -- same shape as cpudiff.js's / romdiff.js's, deliberately, so a reader of any of
+ * them trusts it once: $PCJS_VAX_REPO first, "../pcjs-vax" (a sibling of the pcjs checkout)
+ * only as the fallback, since that guess is wrong when this repo is checked out as a worktree. */
+function vaxRepo()
+{
+    if (process.env['PCJS_VAX_REPO']) return process.env['PCJS_VAX_REPO'];
+    return path.resolve(__dirname, "../../../../../pcjs-vax");
+}
+
 /* ------------------------------------------------------------------------------------------- *
  * Small utilities (PRNG matches the other VAX differentials, so a failing seed reproduces)       *
  * ------------------------------------------------------------------------------------------- */
@@ -1744,9 +1753,7 @@ function main()
     let simh = findSimh(getArg("--simh", null));
     let scratch = fs.mkdtempSync(path.join(os.tmpdir(), "excdiff-"));
     let seed = +getArg("--seed", String((Math.random() * 0xFFFFFFFF) | 0));
-    /* $PCJS_VAX_REPO first: "../pcjs-vax" is wrong when this repo is checked out as a worktree. */
-    let vaxRepo = process.env['PCJS_VAX_REPO'] || path.resolve(REPO_ROOT, "../pcjs-vax");
-    let ehkaaExe = getArg("--ehkaa", path.join(vaxRepo, "open-simh/VAX/tests/ehkaa.exe"));
+    let ehkaaExe = getArg("--ehkaa", path.join(vaxRepo(), "open-simh/VAX/tests/ehkaa.exe"));
     console.log(`excdiff.js: simh=${simh} scratch=${scratch} seed=${seed}`);
 
     if (process.argv.indexOf("--selfcheck") >= 0) {

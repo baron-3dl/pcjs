@@ -109,6 +109,15 @@ import { VAX } from "../modules/v2/defines.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
 
+/* Plumbing -- same shape as cpudiff.js's / romdiff.js's, deliberately, so a reader of any of
+ * them trusts it once: $PCJS_VAX_REPO first, "../pcjs-vax" (a sibling of the pcjs checkout)
+ * only as the fallback, since that guess is wrong when this repo is checked out as a worktree. */
+function vaxRepo()
+{
+    if (process.env['PCJS_VAX_REPO']) return process.env['PCJS_VAX_REPO'];
+    return path.resolve(__dirname, "../../../../../pcjs-vax");
+}
+
 const MEMSIZE = 0x01000000;             // 16MB, SIMH's microvax3900 default
 
 /* ------------------------------------------------------------------------------------------- *
@@ -1699,7 +1708,7 @@ async function main()
         eh = await runEhkaa(simhBin, {
             scratch,
             trace: getArg("--trace", null),
-            ehkaaExe: getArg("--ehkaa", path.resolve(REPO_ROOT, "../pcjs-vax/open-simh/VAX/tests/ehkaa.exe"))
+            ehkaaExe: getArg("--ehkaa", path.join(vaxRepo(), "open-simh/VAX/tests/ehkaa.exe"))
         }, "");
         console.log("  elapsed: %ss", ((Date.now() - t0) / 1000).toFixed(1));
         errors.push(...eh.failures);

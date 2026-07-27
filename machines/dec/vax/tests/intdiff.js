@@ -78,6 +78,15 @@ import { DROM, DROM_STRIDE, DR, IG, SPEC, OPCODES } from "../modules/v2/drom.js"
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
 
+/* Plumbing -- same shape as cpudiff.js's / romdiff.js's, deliberately, so a reader of any of
+ * them trusts it once: $PCJS_VAX_REPO first, "../pcjs-vax" (a sibling of the pcjs checkout)
+ * only as the fallback, since that guess is wrong when this repo is checked out as a worktree. */
+function vaxRepo()
+{
+    if (process.env['PCJS_VAX_REPO']) return process.env['PCJS_VAX_REPO'];
+    return path.resolve(__dirname, "../../../../../pcjs-vax");
+}
+
 /* ------------------------------------------------------------------------------------------- *
  * PRNG (mulberry32, matching decodediff.js/mmudiff.js so a failing seed is reproducible)          *
  * ------------------------------------------------------------------------------------------- */
@@ -1114,7 +1123,7 @@ function main()
     if (r.failures.length > 25) problems.push(`RANDOMIZED: ...and ${r.failures.length - 25} more failures`);
 
     console.log(`\n=== EHKAA phase ===`);
-    let e = phaseEHKAA({simh, scratch, ehkaaExe: getArg("--ehkaa", path.resolve(REPO_ROOT, "../pcjs-vax/open-simh/VAX/tests/ehkaa.exe"))});
+    let e = phaseEHKAA({simh, scratch, ehkaaExe: getArg("--ehkaa", path.join(vaxRepo(), "open-simh/VAX/tests/ehkaa.exe"))});
     if (e.skipped) {
         console.log(`  SKIPPED: ${e.reason}`);
         problems.push(`EHKAA: skipped (${e.reason}) -- not a substitute for the randomized phase, but its absence means real-workload coverage was NOT exercised this run`);

@@ -84,6 +84,15 @@ import { OP_MEM } from "../modules/v2/decode.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
 
+/* Plumbing -- same shape as cpudiff.js's / romdiff.js's, deliberately, so a reader of any of
+ * them trusts it once: $PCJS_VAX_REPO first, "../pcjs-vax" (a sibling of the pcjs checkout)
+ * only as the fallback, since that guess is wrong when this repo is checked out as a worktree. */
+function vaxRepo()
+{
+    if (process.env['PCJS_VAX_REPO']) return process.env['PCJS_VAX_REPO'];
+    return path.resolve(__dirname, "../../../../../pcjs-vax");
+}
+
 const MEMSIZE   = 0x01000000;       // 16MB, SIMH's microvax3900 default (vaxmod_defs.h INITMEMSIZE)
 
 /*
@@ -1763,7 +1772,7 @@ async function main()
         seed: +getArg("--seed", 0xC0FFEE),
         trace: getArg("--trace", null),
         scratch: getArg("--scratch", fs.mkdtempSync(path.join(os.tmpdir(), "vaxdecode-"))),
-        ehkaaExe: getArg("--ehkaa", path.resolve(REPO_ROOT, "../pcjs-vax/open-simh/VAX/tests/ehkaa.exe"))
+        ehkaaExe: getArg("--ehkaa", path.join(vaxRepo(), "open-simh/VAX/tests/ehkaa.exe"))
     };
     let simh = findSimh(getArg("--simh", null));
     let fSkipEHKAA = argv.indexOf("--skip-ehkaa") >= 0;
