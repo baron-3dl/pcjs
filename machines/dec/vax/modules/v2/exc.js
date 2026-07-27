@@ -544,6 +544,25 @@ class VAXExc {
     busTimeout(fWrite)
     {
         this.sscBto = (this.sscBto | SSCBTO_BTO | SSCBTO_RWT) | 0;
+        return this.machineCheckCode(fWrite);
+    }
+
+    /**
+     * machineCheckCode(fWrite)
+     *
+     * `MACH_CHECK (MCHK_READ)` vs `MACH_CHECK (MCHK_WRITE)` -- the direction-to-p1 mapping, and
+     * NOTHING else.  Split out of busTimeout() by pcjsvax-622 because vax_sysdev.c has a second
+     * class of machine check that shares this mapping and must NOT set the bus-timeout bits: a
+     * register handler that raises MACH_CHECK() itself (cmctl_rd()/cmctl_wr()'s register 18 --
+     * see cmctl.js and regblock.js's REG_MCHK).  Keeping ONE copy of the mapping is the point:
+     * two call sites with two copies is how the wrong code reaches the SCB frame on one path only.
+     *
+     * @this {VAXExc}
+     * @param {boolean} fWrite
+     * @returns {number} MCHK_READ or MCHK_WRITE -- the SCB_MCHK fault's p1
+     */
+    machineCheckCode(fWrite)
+    {
         return fWrite ? MCHK_WRITE : MCHK_READ;
     }
 

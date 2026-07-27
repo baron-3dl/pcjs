@@ -404,14 +404,19 @@ function runJS(romBytes, opts, magicByte)
     cpu.boot(magicByte);
 
     let faults = new Map(), faultEvents = 0;
+    /* `...rest` is load-bearing, not tidiness: onBusFault() takes a THIRD argument (pcjsvax-622's
+       `fNoBto`, the handler-raised machine check that must not set the SSC bus-timeout bits -- see
+       cpustate.js).  A wrapper that forwarded only the two it names would silently change the
+       machine being measured, and would change it ONLY while instrumented, which is the worst
+       possible place for a difference to live. */
     let realOnBusFault = cpu.onBusFault.bind(cpu);
-    cpu.onBusFault = function(addr, access) {
+    cpu.onBusFault = function(addr, access, ...rest) {
         let key = `${hex(addr >>> 0)}:${(access & VAX.ACCESS.WRITE) ? "W" : "R"}`;
         let e = faults.get(key);
         if (!e) faults.set(key, e = {addr: addr >>> 0, access, count: 0, firstStep: steps + 1});
         e.count++;
         faultEvents++;
-        return realOnBusFault(addr, access);
+        return realOnBusFault(addr, access, ...rest);
     };
 
     let steps = 0, stop = null, budget = Walk.budget(opts);

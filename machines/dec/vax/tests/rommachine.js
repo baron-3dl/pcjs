@@ -33,6 +33,7 @@ import SSCVAX from "../modules/v2/ssc.js";
 import NVRVAX from "../modules/v2/nvr.js";
 import CQBICVAX from "../modules/v2/cqbic.js";
 import KA655VAX from "../modules/v2/ka655.js";
+import CMCTLVAX, { CMCTL_BASE, CMCTL_LENGTH } from "../modules/v2/cmctl.js";
 import CDGVAX from "../modules/v2/cdg.js";
 import ConsoleVAX from "../modules/v2/console.js";
 import ClkVAX, { IPL_CLK_ABS, INT_V_CLK } from "../modules/v2/clk.js";
@@ -59,7 +60,7 @@ const MEMSIZE = 0x01000000;
  *
  * @param {Uint8Array} romBytes
  * @param {boolean} [fOmitCdg]
- * @returns {Object} {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, ka655, cdg, devices}
+ * @returns {Object} {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, cmctl, ka655, cdg, devices}
  */
 function makeRomMachine(romBytes, fOmitCdg = false)
 {
@@ -93,8 +94,16 @@ function makeRomMachine(romBytes, fOmitCdg = false)
        traffic. */
     let ka655 = new KA655VAX();
     let cqbic = new CQBICVAX(cpu.exc);
+    /* CMCTLVAX (pcjsvax-622) is the memory controller's register file.  It takes MEMSIZE because
+       SIMH's cmctl_rd()/cmctl_wr() read `MEMSIZE` in two places -- register 18's KA655X test and
+       the signature request's ADDR_IS_MEM() -- and MEMSIZE is `cpu_unit.capac`, i.e. exactly the
+       size passed to addMemory() above.  Its base and length are IMPORTED, not restated: the
+       length is a computation over the bank geometry (see cmctl.js's header), and a second
+       hand-written copy of it here is precisely the drift standing rule 7 was earned by. */
+    let cmctl = new CMCTLVAX(MEMSIZE);
     bus.addRegBlock([
         {base: VAX.PHYSMEM.REG_BASE >>> 0, length: 0x14, dev: cqbic},
+        {base: CMCTL_BASE, length: CMCTL_LENGTH, dev: cmctl},
         {base: (VAX.PHYSMEM.REG_BASE + 0x4000) >>> 0, length: 8, dev: ka655}
     ]);
     let cdg = null;
@@ -107,9 +116,9 @@ function makeRomMachine(romBytes, fOmitCdg = false)
     /* Derived from the constructions above, in this same function, so it can neither list a device
        the machine does not have nor omit one it does (see the file header).  `cdg` is present only
        when it was actually decoded, which is what makes `fOmitCdg` visible to a census. */
-    let devices = [consoleDev, clk, ssc, nvr, cqbic, ka655, cdg].filter((d) => d !== null)
+    let devices = [consoleDev, clk, ssc, nvr, cqbic, cmctl, ka655, cdg].filter((d) => d !== null)
         .map((d) => ({name: d.constructor.name, dev: d}));
-    return {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, ka655, cdg, devices};
+    return {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, cmctl, ka655, cdg, devices};
 }
 
 export { makeRomMachine, MEMSIZE };

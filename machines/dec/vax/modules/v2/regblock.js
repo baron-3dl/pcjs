@@ -24,7 +24,38 @@
  * writeLong/writeWord/writeByte(addr) exactly like SSCVAX/NVRVAX/CQBICVAX.  Checked in the order
  * given (the ranges are disjoint on real hardware, so order does not matter for correctness, only
  * for which one this file's own selfcheck exercises first).
+ *
+ * ============================================================================
+ * THREE OUTCOMES, NOT TWO -- WHY `REG_MCHK` EXISTS (pcjsvax-622)
+ * ============================================================================
+ * A sub-device's read used to answer one of two ways: a number ("I decode this"), or `null` ("I do
+ * not"), the latter routed to MemoryVAX.readNone() -> BusVAX.fault() -> CPUStateVAX.onBusFault(),
+ * which reproduces vax_sysdev.c's ReadReg()/WriteReg() fall-through -- `ssc_bto |= SSCBTO_BTO |
+ * SSCBTO_RWT` and THEN a machine check (:1031, :1070).
+ *
+ * vax_sysdev.c has a THIRD outcome that neither of those expresses: a handler that is reached, and
+ * that raises `MACH_CHECK()` ITSELF, without the bus-timeout bits.  cmctl_rd()/cmctl_wr()'s
+ * register 18 is one (cmctl.js); cqbic.js's header names two more it had to disclose as gaps for
+ * want of this seam (cqmap_rd()'s read branch, and cqm_rd()/cqm_wr() -- wiring those is
+ * pcjsvax-5c1's work, not this file's).  The difference is DIRECTLY OBSERVABLE to the ROM, which
+ * can read the SSC bus-timeout register: measured on the live oracle, a read of REG+0x148
+ * (register 18) machine-checks with BTO = 00000000, while a read of REG+0x14C -- one longword past
+ * the end of CMCTL, genuinely undecoded -- machine-checks with BTO = C0000000.
+ *
+ * So a device may return `REG_MCHK` from any read or write, and this dispatcher raises the fault
+ * through BusVAX.fault()'s `fNoBto` argument instead of falling through to readNone/writeNone.
+ * `REG_MCHK` is a Symbol rather than a sentinel number so that it can never collide with a
+ * register value, and rather than `null` so that "I do not decode this" keeps meaning exactly what
+ * it meant before.
  */
+
+import { VAX } from "./defines.js";
+
+/**
+ * The "reached the handler, and the handler raised MACH_CHECK() itself" answer -- see the file
+ * header.  Exported so a sub-device (cmctl.js today) can return it from any read or write.
+ */
+export const REG_MCHK = Symbol("REG_MCHK");
 
 /**
  * makeRegController(devices)
@@ -40,6 +71,19 @@ export function makeRegController(devices)
         return null;
     }
 
+    /**
+     * mchk(blk, addr, access, dflt)
+     *
+     * The REG_MCHK path: BusVAX.fault() with `fNoBto` set, so CPUStateVAX.onBusFault() raises
+     * SCB_MCHK WITHOUT the SSC bus-timeout bits.  `dflt` mirrors what the corresponding
+     * MemoryVAX.readNone()/readWordNone()/readLongNone() returns; with a CPU attached the fault
+     * throws and the value is never seen, and without one it keeps the undriven-CDAL convention.
+     */
+    function mchk(blk, addr, access, dflt) {
+        blk.bus.fault(addr, access, true);
+        return dflt;
+    }
+
     return {
         getControllerBuffer(addr) { return [null, 0]; },
         getControllerAccess() {
@@ -49,6 +93,7 @@ export function makeRegController(devices)
                     let dev = find(addr);
                     if (dev) {
                         let v = dev.readByte(addr);
+                        if (v === REG_MCHK) return mchk(this, addr, VAX.ACCESS.READ_BYTE, 0xFF);
                         if (v !== null) return v;
                     }
                     return this.readNone(off, addr);
@@ -56,7 +101,11 @@ export function makeRegController(devices)
                 function writeByte(off, b, addr) {
                     addr = addr >>> 0;
                     let dev = find(addr);
-                    if (dev && dev.writeByte(addr, b)) return;
+                    if (dev) {
+                        let r = dev.writeByte(addr, b);
+                        if (r === REG_MCHK) { mchk(this, addr, VAX.ACCESS.WRITE_BYTE, 0); return; }
+                        if (r) return;
+                    }
                     this.writeNone(off, b, addr);
                 },
                 function readWord(off, addr) {
@@ -64,6 +113,7 @@ export function makeRegController(devices)
                     let dev = find(addr);
                     if (dev) {
                         let v = dev.readWord(addr);
+                        if (v === REG_MCHK) return mchk(this, addr, VAX.ACCESS.READ_WORD, 0xFFFF);
                         if (v !== null) return v;
                     }
                     return this.readWordNone(off, addr);
@@ -71,7 +121,11 @@ export function makeRegController(devices)
                 function writeWord(off, w, addr) {
                     addr = addr >>> 0;
                     let dev = find(addr);
-                    if (dev && dev.writeWord(addr, w)) return;
+                    if (dev) {
+                        let r = dev.writeWord(addr, w);
+                        if (r === REG_MCHK) { mchk(this, addr, VAX.ACCESS.WRITE_WORD, 0); return; }
+                        if (r) return;
+                    }
                     this.writeNone(off, w, addr);
                 },
                 function readLong(off, addr) {
@@ -79,6 +133,7 @@ export function makeRegController(devices)
                     let dev = find(addr);
                     if (dev) {
                         let v = dev.readLong(addr);
+                        if (v === REG_MCHK) return mchk(this, addr, VAX.ACCESS.READ_LONG, -1);
                         if (v !== null) return v;
                     }
                     return this.readLongNone(off, addr);
@@ -86,7 +141,11 @@ export function makeRegController(devices)
                 function writeLong(off, l, addr) {
                     addr = addr >>> 0;
                     let dev = find(addr);
-                    if (dev && dev.writeLong(addr, l)) return;
+                    if (dev) {
+                        let r = dev.writeLong(addr, l);
+                        if (r === REG_MCHK) { mchk(this, addr, VAX.ACCESS.WRITE_LONG, 0); return; }
+                        if (r) return;
+                    }
                     this.writeNone(off, l, addr);
                 }
             ];
