@@ -14,7 +14,7 @@
  * PROGRAM RUNS -- which is a different claim, and one no number of green opcodes implies, because
  * the things it grades (fault_PC, the FPD resume, deferred trap delivery, the abort/unwind
  * boundary, the SCB emulate trap, cycle accounting) are BY CONSTRUCTION invisible to a
- * single-instruction comparison.  Three phases:
+ * single-instruction comparison.  Four phases:
  *
  *   EHKAA        The real workload.  The DEC EHKAA hardware-core diagnostic is loaded at physical
  *                0 and run from 0x200 -- `load ehkaa.exe` + `go 200`, byte for byte what SIMH
@@ -34,9 +34,20 @@
  *                number of cycles for a string instruction stops at a different instruction and
  *                the register files disagree.
  *
+ *   INIE-RESET   pcjsvax-1be.  EHKAA and RANDOMIZED both reset the WHOLE machine between every
+ *                case (`cpu.reset()` / `reset all`), so neither can see a defect that exists only
+ *                ACROSS two stepCPU() calls with nothing reset in between -- the boundary real
+ *                SIMH draws at vax_cpu.c:514 (`in_ie = 0`, unconditional, every `sim_instr()` call,
+ *                i.e. every SCP `step`).  This phase deposits ONE state, calls `stepCPU(1)` TWICE
+ *                with no reset between (matching two `step 1` commands with no `reset all` between
+ *                them), and grades PC/PSL/R14/SISR after EACH call.  See phaseInIEReset()'s own
+ *                header for the deterministic sequence.
+ *
  *   SELFCHECK    `--selfcheck` injects deliberate defects into the SHIPPED code path (cpustate.js's
  *                dispatch/loop, and the trap-request and FPD-resume lines this item added to
  *                cpu.js/control.js/strq.js) and fails if the differential does not catch each one.
+ *                It also re-runs INIE-RESET once with pcjsvax-1be's own fix defeated (see
+ *                applyInIEMutation()) and fails unless that defeats the comparison too.
  *
  * WHY BOTH A REAL WORKLOAD AND A RANDOMIZED PHASE
  * -----------------------------------------------
@@ -1117,7 +1128,214 @@ function phaseRandomized(simh, opts, mutation)
 }
 
 /* ------------------------------------------------------------------------------------------- *
- * PHASE 3 -- --selfcheck                                                                         *
+ * PHASE 3 -- inIE reset at the stepCPU() call boundary (pcjsvax-1be)                             *
+ *                                                                                                 *
+ * DETERMINISTIC, not randomized -- this grades one specific boundary vax_cpu.c:514 draws, not a   *
+ * distribution, and a defect here does not get more or less visible with more cases.  The         *
+ * sequence:                                                                                       *
+ *                                                                                                 *
+ *   1. PSL=0 (kernel, IPL 0), R14=INIE_R14 (outside the 16MB this test maps -- always unbacked),   *
+ *      SISR<INIE_SISR_LVL> set (a software interrupt immediately eligible, since the running IPL   *
+ *      is 0), IS=INIE_IS (a VALID, well-backed interrupt-stack pointer), PC=INIE_PC, and an        *
+ *      ordinary `MOVL #imm, @#INIE_R14` sitting at INIE_PC -- the SAME unbacked address, so the    *
+ *      second step's fault is the plainest possible unbacked write, not a second special case.     *
+ *                                                                                                 *
+ *   2. FIRST stepCPU(1)/`step 1`: setIRQL() sees the pending softint and intexc() dispatches it;   *
+ *      its own frame push (to R14, unbacked) faults WHILE intexc() has already set inIE=1 and      *
+ *      before it reaches its own clear -- so takeFault() sees inIE already set and BOTH machines   *
+ *      take STOP_INIE here, identically, whether or not pcjsvax-1be's fix exists.  This step        *
+ *      establishes the poisoned precondition; it is not itself the thing being graded, which is    *
+ *      why its own outcome is asserted (a setup self-check) rather than silently trusted.           *
+ *                                                                                                 *
+ *   3. SECOND stepCPU(1)/`step 1`, NO reset in between: PC is still INIE_PC (the failed intexc()    *
+ *      never reached setPC()), so this executes the `MOVL` sitting there.  Its write faults again   *
+ *      (same unbacked address) -- an entirely ordinary machine check, dispatched onto IS, which     *
+ *      IS backed, so the dispatch itself succeeds on a machine that resets inIE at this call's      *
+ *      entry.  Real SIMH does (vax_cpu.c:514); a stepCPU() that does not finds inIE still 1 from     *
+ *      step 2 and throws STOP_INIE immediately, before intexc() is even attempted -- a step that     *
+ *      should succeed instead stops the machine.  This is the actual grade.                         *
+ *                                                                                                 *
+ * Every step's PC/PSL/R14/SISR is compared, not merely the last one, so a divergence is             *
+ * attributed to the step that produced it.                                                          *
+ * ------------------------------------------------------------------------------------------- */
+
+const INIE_R14 = 0x1FFFFFF0 | 0;         // outside the 16MB RAM both machines map -- always unbacked
+const INIE_IS = 0x00002000;              // a valid interrupt-stack pointer, well inside RAM
+const INIE_SISR_LVL = 4;                 // any softint level 1..15, below the IPL=0 both machines run at
+const INIE_PC = 0x1000;
+const INIE_FIELDS = ["PC", "PSL", "R14", "SISR"];
+
+/** The one instruction both steps fault on: an ordinary write to the same unbacked address. */
+function inIEResetCode() { return asm(op("MOVL"), imm(0x12345678), abs(INIE_R14)); }
+
+/** The instruction bytes, packed into longwords at their (possibly unaligned) addresses. */
+function inIEResetMem()
+{
+    let code = inIEResetCode();
+    let mem = new Map();
+    for (let i = 0; i < code.length; i++) {
+        let a = (INIE_PC + i) >>> 0, la = a & ~3, sh = (a & 3) * 8;
+        let cur = mem.get(la) || 0;
+        mem.set(la, ((cur & ~(0xFF << sh)) | ((code[i] & 0xFF) << sh)) | 0);
+    }
+    return mem;
+}
+
+/**
+ * runSimhInIEReset(simh, opts)
+ *
+ * ONE `reset all`, then TWO `step 1` commands with nothing reset between them -- the oracle side
+ * of the sequence above.
+ *
+ * @param {string} simh
+ * @param {Object} opts
+ * @returns {Object} {1: {PC,PSL,R14,SISR}, 2: {...}}
+ */
+function runSimhInIEReset(simh, opts)
+{
+    let L = ["set cpu 16m", "set cpu simhalt", "reset all",
+             `deposit SISR ${hex(1 << INIE_SISR_LVL)}`, "deposit PSL 0",
+             `deposit R14 ${hex(INIE_R14)}`, `deposit IS ${hex(INIE_IS)}`, `deposit PC ${hex(INIE_PC)}`];
+    for (let [a, v] of inIEResetMem()) L.push(`deposit ${hex(a)} ${hex(v)}`);
+    let MARK = "INIE_STEP";
+    for (let step of [1, 2]) {
+        L.push(`echo ${MARK}${step}`, "step 1", `examine -h ${INIE_FIELDS.join(",")}`);
+    }
+    L.push("quit");
+    let out = runSimh(simh, L.join("\n") + "\n", path.join(opts.scratch, "cpudiff-inie.ini"));
+    let steps = {1: {}, 2: {}};
+    let cur = 0, field = 0;
+    for (let line of out.split("\n")) {
+        let mm = line.match(new RegExp(MARK + "(\\d)"));
+        if (mm) { cur = +mm[1]; field = 0; continue; }
+        if (!cur || field >= INIE_FIELDS.length) continue;
+        let vm = line.match(VALUE_RE);
+        if (vm) { steps[cur][INIE_FIELDS[field]] = parseInt(vm[2], 16) >>> 0; field++; }
+    }
+    for (let step of [1, 2]) {
+        if (Object.keys(steps[step]).length !== INIE_FIELDS.length) {
+            throw new Error(`cpudiff: INIE-RESET step ${step} produced ` +
+                             `${Object.keys(steps[step]).length}/${INIE_FIELDS.length} SIMH values -- ` +
+                             `parse failed, see raw output:\n${out}`);
+        }
+    }
+    return steps;
+}
+
+/**
+ * runJsInIEReset(mutation)
+ *
+ * The same deposit, then TWO `stepCPU(1)` calls with no `cpu.reset()` between them.
+ *
+ * @param {?function(Object):function()} mutation applied to the fresh cpu before stepping, undone after
+ * @returns {Object} {1: {PC,PSL,R14,SISR,stop}, 2: {...}}
+ */
+function runJsInIEReset(mutation)
+{
+    let {cpu} = makeMachine();
+    let undo = mutation ? mutation(cpu) : null;
+    try {
+        cpu.psl = 0;
+        cpu.regs[14] = INIE_R14;
+        cpu.exc.stk[4] = INIE_IS;
+        cpu.exc.sisr = 1 << INIE_SISR_LVL;
+        cpu.setPC(INIE_PC);
+        let code = inIEResetCode();
+        for (let i = 0; i < code.length; i++) cpu.mmu.writeB((INIE_PC + i) >>> 0, code[i]);
+
+        let capture = (stop) => ({
+            PC: cpu.regs[15] >>> 0, PSL: cpu.psl >>> 0, R14: cpu.regs[14] >>> 0,
+            SISR: cpu.exc.sisr >>> 0, stop
+        });
+        let steps = {};
+        for (let step of [1, 2]) {
+            try { cpu.stepCPU(1); steps[step] = capture(null); }
+            catch (e) { if (!(e instanceof VAXStop)) throw e; steps[step] = capture(e); }
+        }
+        return steps;
+    } finally {
+        if (undo) undo();
+    }
+}
+
+/**
+ * phaseInIEReset(simh, opts, mutation)
+ *
+ * @param {string} simh
+ * @param {Object} opts
+ * @param {?function(Object):function()} mutation
+ * @returns {Array.<string>} failures
+ */
+function phaseInIEReset(simh, opts, mutation)
+{
+    let simhSteps = runSimhInIEReset(simh, opts);
+    let jsSteps = runJsInIEReset(mutation);
+    let failures = [];
+
+    /* The setup itself must land on the intended boundary -- step 1 is IDENTICAL with or without
+       the fix (see the header), so if it is not STOP_INIE the SETUP is broken, not the fix. */
+    if (!(jsSteps[1].stop instanceof VAXStop) || jsSteps[1].stop.reason !== VAXStop.REASON.INIE) {
+        failures.push(`INIE-RESET: step 1 did not land on the intended STOP_INIE boundary ` +
+                      `(JS stop=${jsSteps[1].stop ? jsSteps[1].stop.reason : "(none, ran to completion)"}) ` +
+                      `-- the test's own setup is broken, not necessarily the fix`);
+        return failures;
+    }
+
+    for (let step of [1, 2]) {
+        for (let f of INIE_FIELDS) {
+            if ((jsSteps[step][f] >>> 0) !== (simhSteps[step][f] >>> 0)) {
+                failures.push(`INIE-RESET: step ${step} ${f}: JS=${hex(jsSteps[step][f])} ` +
+                              `SIMH=${hex(simhSteps[step][f])}` +
+                              (jsSteps[step].stop ? ` (JS stop=${jsSteps[step].stop.reason})` : ""));
+            }
+        }
+    }
+    return failures;
+}
+
+/**
+ * applyInIEMutation(cpu)
+ *
+ * Defeats EXACTLY stepCPU()'s own `this.exc.inIE = 0` entry reset -- the one line pcjsvax-1be
+ * added -- by swallowing the FIRST write made to `exc.inIE` inside EACH stepCPU() call (that
+ * write is textually the fix's own reset, since it is the function's first statement) and passing
+ * every OTHER write straight through unmodified: intexc()'s own success-path clear, exc.reset()'s
+ * clear, and takeFault()'s assignments all still run for real.  This perturbs the real VAXExc
+ * instance and the real CPUStateVAX.prototype.stepCPU through a property/method wrap; it never
+ * substitutes a rewritten copy of stepCPU, intexc() or takeFault() (standing rule #11) -- every
+ * line of the shipped dispatch still runs, this only un-does the one assignment under test.
+ *
+ * @param {Object} cpu
+ * @returns {function()} undo
+ */
+function applyInIEMutation(cpu)
+{
+    let backing = cpu.exc.inIE | 0;
+    let swallowNext = false;
+    let origDesc = Object.getOwnPropertyDescriptor(cpu.exc, "inIE");
+    Object.defineProperty(cpu.exc, "inIE", {
+        configurable: true,
+        get() { return backing; },
+        set(v) { if (swallowNext) { swallowNext = false; return; } backing = v; }
+    });
+    let origStepCPU = CPUStateVAX.prototype.stepCPU;
+    CPUStateVAX.prototype.stepCPU = function(n) {
+        swallowNext = true;                  // arm: the NEXT write is stepCPU()'s own entry reset
+        try {
+            return origStepCPU.call(this, n);
+        } finally {
+            swallowNext = false;             // disarm even if stepCPU threw before reaching it
+        }
+    };
+    return () => {
+        CPUStateVAX.prototype.stepCPU = origStepCPU;
+        if (origDesc) Object.defineProperty(cpu.exc, "inIE", origDesc); else delete cpu.exc.inIE;
+        cpu.exc.inIE = backing;
+    };
+}
+
+/* ------------------------------------------------------------------------------------------- *
+ * PHASE 4 -- --selfcheck                                                                         *
  *                                                                                                *
  * Every mutation below is applied to the SHIPPED objects -- CPUStateVAX.prototype, the DISPATCH   *
  * table cpustate.js exports, and the trap/resume behavior this item added -- not to a copy.  Five *
@@ -1382,6 +1600,12 @@ function main()
         problems.push(`COVERAGE: only ${r.nonTrivial}/${r.compared} cases changed any state, floor is 60%`);
     }
 
+    /* ---- PHASE 3: inIE reset across the stepCPU() call boundary (pcjsvax-1be) ---- */
+    let inie = phaseInIEReset(simh, opts, null);
+    console.log("\nINIE-RESET (two stepCPU() calls, no reset between)");
+    console.log(`  result                : ${inie.length ? "DIVERGE" : "MATCH"}`);
+    for (let f of inie) problems.push(f);
+
     report(problems);
 }
 
@@ -1417,6 +1641,24 @@ function selfcheck(simh, opts)
         console.log(`  ${caught ? "CAUGHT " : "SURVIVED"} ${name.padEnd(28)} ${how}`);
         if (!caught) survived.push(name);
     }
+
+    /*
+     * INIE-RESET is graded separately rather than folded into MUTATIONS above: every mutation in
+     * that table is checked by runJsCase(), which calls cpu.reset() before EVERY case -- and
+     * cpu.reset() -> exc.reset() also clears inIE (its own doc comment says so), which would mask
+     * this defect completely regardless of whether the fix exists.  This phase's own two-calls-
+     * no-reset-between structure is the only thing that can see it, so it gets its own check here.
+     */
+    let baseline = phaseInIEReset(simh, opts, null);
+    console.log(`  ${baseline.length ? "SURVIVED" : "CAUGHT "} ${"inie-reset-baseline".padEnd(28)} ` +
+                (baseline.length ? baseline[0] : "(unmutated sequence matches SIMH, as it must)"));
+    if (baseline.length) survived.push("inie-reset-baseline");
+
+    let mutated = phaseInIEReset(simh, opts, applyInIEMutation);
+    console.log(`  ${mutated.length ? "CAUGHT " : "SURVIVED"} ${"stepcpu-no-inie-reset".padEnd(28)} ` +
+                (mutated.length ? mutated[0] : ""));
+    if (!mutated.length) survived.push("stepcpu-no-inie-reset");
+
     report(survived.map((n) => `SELFCHECK: mutation "${n}" was NOT caught -- that is a coverage hole, not a pass`));
 }
 
