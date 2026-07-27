@@ -92,6 +92,7 @@ import SSCVAX from "../modules/v2/ssc.js";
 import NVRVAX from "../modules/v2/nvr.js";
 import CQBICVAX from "../modules/v2/cqbic.js";
 import KA655VAX from "../modules/v2/ka655.js";
+import CDGVAX from "../modules/v2/cdg.js";
 import ConsoleVAX from "../modules/v2/console.js";
 import ClkVAX, { IPL_CLK_ABS, INT_V_CLK } from "../modules/v2/clk.js";
 import { makeIprDevice } from "../modules/v2/iprdevice.js";
@@ -170,7 +171,9 @@ function runSimh(bin, script, iniPath, timeoutMs = 5 * 60 * 1000)
  * RAM at 0 (the KA655's own system memory, which the ROM's power-up self-tests size and probe --
  * without it the very first instructions would fault on RAM before ever reaching the ROM's own
  * device probing) plus the ROM itself, decoded via BusVAX.addRom(), plus the SSC base register,
- * decoded via BusVAX.addSsc() -- pcjsvax-320, the item this file's own boundary report pointed at.
+ * decoded via BusVAX.addSsc() -- pcjsvax-320, the item this file's own boundary report pointed at --
+ * plus the REG_BASE sub-devices (BusVAX.addRegBlock(), pcjsvax-bfb) and the cache diagnostic space
+ * (BusVAX.addCdg(), pcjsvax-0b7 -- the item the #393 boundary pointed at).
  *
  * @param {Uint8Array} romBytes
  * @returns {Object} {bus, cpu}
@@ -199,10 +202,17 @@ function makeMachine(romBytes)
        per-instruction tick hook, the same reason `clk` is kept as a local for `cpu.clk`. */
     let ssc = new SSCVAX(cpu.exc, consoleDev);
     bus.addSsc(ssc, new NVRVAX());
+    /* KA655VAX is kept as a local because CDGVAX needs the SAME instance: vax_sysdev.c's cdg_rd()
+       writes the KA655 CACR as a side effect of every cache-diagnostic read (pcjsvax-0b7 -- see
+       cdg.js's and ka655.js's headers, and tests/cdgdiff.js, which grades that side effect against
+       the live oracle).  Two instances would leave the ROM reading a CACR that never saw the CDG
+       traffic. */
+    let ka655 = new KA655VAX();
     bus.addRegBlock([
         {base: VAX.PHYSMEM.REG_BASE >>> 0, length: 0x14, dev: new CQBICVAX(cpu.exc)},
-        {base: (VAX.PHYSMEM.REG_BASE + 0x4000) >>> 0, length: 8, dev: new KA655VAX()}
+        {base: (VAX.PHYSMEM.REG_BASE + 0x4000) >>> 0, length: 8, dev: ka655}
     ]);
+    bus.addCdg(new CDGVAX(ka655));
     cpu.setBus(bus);
     cpu.exc.setIPRDevice(makeIprDevice(clk, consoleDev));
     cpu.exc.addInterruptSource(IPL_CLK_ABS, INT_V_CLK, SCB.INTTIM);
@@ -1552,8 +1562,9 @@ function main()
                 boundary.instrNum = boundaryInstrNum;
                 console.log(`\n  UNDECODED-HARDWARE BOUNDARY: instruction #${boundaryInstrNum} ` +
                     `(${boundary.fWrite ? "write" : "read"}) touched ${nameAddress(boundary.addr)}, which SIMH ` +
-                    `services (ssc_rd/ssc_wr -- backed end-to-end, same category as CDG) but this bus does ` +
-                    `not decode yet.  See the next device item, which will move this boundary forward.`);
+                    `services (its own regtable[] handler answers there -- the address was CONFIRMED ` +
+                    `backed on the live oracle by probeSimhBackedAt() above, not assumed) but this bus ` +
+                    `does not decode yet.  See the next device item, which will move this boundary forward.`);
             }
         } catch (e) {
             /* pcjsvax-23c FIX: this is the whole reason this block is now wrapped -- a failure HERE

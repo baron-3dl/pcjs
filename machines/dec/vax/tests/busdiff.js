@@ -79,6 +79,8 @@ import { fileURLToPath } from "url";
 import BusVAX from "../modules/v2/bus.js";
 import MemoryVAX from "../modules/v2/memory.js";
 import { VAX } from "../modules/v2/defines.js";
+import CDGVAX from "../modules/v2/cdg.js";
+import KA655VAX from "../modules/v2/ka655.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
@@ -744,29 +746,54 @@ function runDiff(simhBin, nOps, seed, mutation, fQuiet)
 /**
  * reportScopeGaps(simhBin)
  *
- * DISCLOSURE, not a comparison.  This item reserves the KA655 I/O / register / NVR / Qbus ranges
- * but deliberately does NOT decode them (that is the device items' work), so SIMH and this bus
- * DIVERGE there by design: SIMH's console happily reads the NVR and the cache diagnostic space, we
- * report non-existent memory.  Those addresses are therefore excluded from the randomized address
- * pool.  This function probes them on both sides and prints the divergence explicitly, so the gap
- * is on the record rather than hidden behind a green result.
+ * DISCLOSURE FOR THE UNDECODED ROWS, AND A GRADED COMPARISON FOR THE DECODED ONES.  This item
+ * reserves the KA655 I/O / register / Qbus ranges but deliberately does NOT decode them (that is
+ * the device items' work), so SIMH and this bus DIVERGE there by design: SIMH's console happily
+ * reads them, we report non-existent memory.  Those addresses are excluded from the randomized
+ * address pool, and this function probes them on both sides and prints the divergence explicitly,
+ * so the gap is on the record rather than hidden behind a green result.
  *
- * ROM is the one row that no longer diverges: pcjsvax-223 decodes it (BusVAX.addRom()), so the
- * probe bus here loads a zero-filled ROM image before probing -- matching SIMH's own un-loaded
- * state exactly (rom_reset() calloc's the ROM array to zero; this script never issues `load -r`,
- * so both sides are reading a fresh, unloaded ROM).  The other rows are untouched.
+ * Rows whose range a later item DECODED are not simply deleted from this table when they stop
+ * diverging -- their EXPECTATION changes and becomes an ASSERTION, so the row keeps earning its
+ * place.  Deleting it instead would quietly retire the only place this file ever looks at that
+ * address.  Each row therefore carries what it must do, and a row that does anything else FAILS.
+ *
+ * WHICH ROWS CAN DIVERGE AT ALL IS DECIDED BY cpu_ex(), NOT BY THIS FILE'S SCOPE.  The SIMH side
+ * of this probe is a console `e -b`, which reaches vax_cpu.c's cpu_ex() (:3399) -- and that
+ * function services ONLY `ADDR_IS_MEM || ADDR_IS_CDG || ADDR_IS_ROM || ADDR_IS_NVR`, returning
+ * SCPE_NXM for everything else.  So IOPAGE, REG and CQM read NXM on the SIMH side too, no matter
+ * what SIMH's INSTRUCTION path would do with them (it decodes all three -- see mchkdiff.js, which
+ * probes them by execution for exactly this reason).  Their agreement here is a property of the
+ * console path, not evidence that this bus decodes them.  The three expectations:
+ *
+ *   ROM  "match"   -- decoded by pcjsvax-223 (BusVAX.addRom()), and cpu_ex services it.  The probe
+ *                     bus loads a zero-filled ROM image first, matching SIMH's own un-loaded state
+ *                     exactly (rom_reset() calloc's the ROM array to zero; this script never issues
+ *                     `load -r`, so both sides read a fresh, unloaded ROM).
+ *   CDG  "match"   -- decoded by pcjsvax-0b7 (BusVAX.addCdg(), cdg.js), and cpu_ex services it.
+ *                     This row WAS the documented divergence "CDG @0x10000000: SIMH=0x00 JS=NXM";
+ *                     it is now an asserted match.  The register-level grading of that range --
+ *                     aliasing, the CACR diagnostic-parity side effect, the write merge, end-to-end
+ *                     backing -- is tests/cdgdiff.js's; this row only holds the one address this
+ *                     file has always probed.
+ *   NVR  "diverge" -- cpu_ex SERVICES it but this bus does not decode it, so it is the one genuine
+ *                     scope divergence left in this table.
+ *   IOPAGE / REG / CQM  "match" -- both sides NXM, because cpu_ex does not service them either.
  *
  * @param {string} simhBin
+ * @returns {Array.<string>} problems -- empty unless a row did something other than what it says.
+ *   BOTH directions fail: a "match" row that diverges, and a "diverge" row that starts matching
+ *   (which means the item that decoded it left a stale expectation here).
  */
 function reportScopeGaps(simhBin)
 {
     let aProbes = [
-        ["IOPAGE", VAX.PHYSMEM.IOPAGE_BASE],
-        ["ROM",    VAX.PHYSMEM.ROM_BASE],
-        ["REG",    VAX.PHYSMEM.REG_BASE],
-        ["NVR",    VAX.PHYSMEM.NVR_BASE],
-        ["CDG",    VAX.PHYSMEM.CDG_BASE],
-        ["CQM",    VAX.PHYSMEM.CQM_BASE]
+        ["IOPAGE", VAX.PHYSMEM.IOPAGE_BASE, "match"],       // cpu_ex does not service it either
+        ["ROM",    VAX.PHYSMEM.ROM_BASE,    "match"],       // decoded, pcjsvax-223
+        ["REG",    VAX.PHYSMEM.REG_BASE,    "match"],       // cpu_ex does not service it either
+        ["NVR",    VAX.PHYSMEM.NVR_BASE,    "diverge"],     // cpu_ex services it; this bus does not
+        ["CDG",    VAX.PHYSMEM.CDG_BASE,    "match"],       // decoded, pcjsvax-0b7
+        ["CQM",    VAX.PHYSMEM.CQM_BASE,    "match"]        // cpu_ex does not service it either
     ];
     let aLines = ["set cpu " + (MEMSIZE >> 20) + "m"];
     let aCmds = [];
@@ -779,14 +806,30 @@ function reportScopeGaps(simhBin)
 
     let bus = makeBus("");
     bus.addRom(new Uint8Array(VAX.PHYSMEM.ROM_SIZE));
-    console.log("\nOut-of-scope ranges (reserved by bus.js, NOT decoded by this item):");
+    bus.addCdg(new CDGVAX(new KA655VAX()));
+    let problems = [];
+    console.log("\nKA655 ranges probed through the SIMH console path (each row carries the " +
+                "relationship it MUST hold -- see this function's header):");
     for (let i = 0; i < aProbes.length; i++) {
-        let js = scpExamine(bus, aProbes[i][1], 1);
-        console.log("  %s @0x%s: SIMH=%s  JS=%s%s", aProbes[i][0].padEnd(6), hex(aProbes[i][1], 8),
-            aResults[i].ok? "0x" + hex(aResults[i].value, 2) : "NXM",
-            js.ok? "0x" + hex(js.value, 2) : "NXM",
-            (aResults[i].ok != js.ok)? "   <- expected divergence (undecoded)" : "");
+        let [name, addr, expect] = aProbes[i];
+        let js = scpExamine(bus, addr, 1);
+        let simhStr = aResults[i].ok? "0x" + hex(aResults[i].value, 2) : "NXM";
+        let jsStr = js.ok? "0x" + hex(js.value, 2) : "NXM";
+        let same = (aResults[i].ok == js.ok) && (!aResults[i].ok || aResults[i].value == js.value);
+        let held = (expect == "match") == same;
+        console.log("  %s @0x%s: SIMH=%s  JS=%s   <- expect %s, %s", name.padEnd(6), hex(addr, 8),
+            simhStr, jsStr, expect.padEnd(7), held? "OK" : "VIOLATED");
+        if (!held && expect == "match") {
+            problems.push(`SCOPE: ${name} @0x${hex(addr, 8)} must MATCH but diverges ` +
+                `(SIMH=${simhStr} JS=${jsStr})`);
+        }
+        if (!held && expect == "diverge") {
+            problems.push(`SCOPE: ${name} @0x${hex(addr, 8)} is recorded as a scope DIVERGENCE but ` +
+                `now agrees with SIMH (both ${simhStr}) -- the item that decoded it must change this ` +
+                `row's expectation to "match" rather than leaving a stale one here`);
+        }
     }
+    return problems;
 }
 
 /* ------------------------------------------------------------------------------------------- *
@@ -841,7 +884,7 @@ function main()
     require(stats.nVerifyChecks > 2000 * scale, "too few write read-back comparisons (" + stats.nVerifyChecks + ")");
     require(stats.byCat[CAT.ALIAS_NXM] > 2000 * scale, "too few non-existent S0 addresses (" + stats.byCat[CAT.ALIAS_NXM] + ")");
 
-    reportScopeGaps(simhBin);
+    aErrors.push(...reportScopeGaps(simhBin));
 
     if (fSelfCheck) {
         console.log("\nSelf-check: the differential must FAIL when the bus is deliberately broken.");

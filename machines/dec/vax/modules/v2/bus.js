@@ -40,6 +40,7 @@ import State from "../../../../modules/v2/state.js";
 import { DEBUGGER, VAX } from "./defines.js";
 import { makeSscController } from "./ssc.js";
 import { makeRegController } from "./regblock.js";
+import { makeCdgController } from "./cdg.js";
 
 /**
  * @class BusVAX
@@ -176,6 +177,11 @@ export default class BusVAX extends Component {
      * ssc.js's file header for the full account of what is and is not covered and why the ones that
      * still fault are not a silent gap. isReserved() only answers the coarse "does this component
      * reserve the RANGE" question RAM-aliasing checks need, not per-register decode status.
+     *
+     * CDG_BASE is not in this list either, as of pcjsvax-0b7 (see addCdg()/cdg.js).  Unlike the SSC
+     * it is decoded WITHOUT remainder: the whole 64MB span reads and writes, aliased onto a 64KB
+     * store, exactly as vax_sysdev.c's cdg_rd()/cdg_wr() do -- so there is no address in it left
+     * for isReserved() to answer "reserved but undecoded" about.
      *
      * NVR_BASE was MISSING from BusVAX.RESERVED until pcjsvax-446's veracity review caught the gap
      * (standing rule 7: scope lives in code, not comments -- this comment already claimed "SSC,
@@ -443,6 +449,37 @@ export default class BusVAX extends Component {
     addRegBlock(devices)
     {
         this.addMemory(VAX.PHYSMEM.REG_BASE >>> 0, VAX.PHYSMEM.REG_LENGTH, MemoryVAX.TYPE.CONTROLLER, makeRegController(devices));
+    }
+
+    /**
+     * addCdg(cdg)
+     *
+     * pcjsvax-0b7: decodes VAX.PHYSMEM.CDG_BASE, the cache diagnostic space, for its WHOLE 64MB
+     * span -- the range the ROM's `MOVC5` at instruction #393 writes into.  Same pattern as
+     * addSsc()/addRegBlock(), with one difference worth stating: those install a controller that
+     * still falls through to readNone/writeNone for whatever no device claims, because their spans
+     * contain genuinely undecoded sub-registers.  CDG has none.  vax_sysdev.c's regtable entry
+     * `{ CDGBASE, CDGBASE+CDGSIZE, &cdg_rd, &cdg_wr }` answers for every address in the range, so
+     * makeCdgController() has no fall-through path at all and CDG_BASE leaves BusVAX.RESERVED
+     * entirely (see that array's comment).
+     *
+     * WHAT THIS CALL COSTS -- STATED BECAUSE IT WAS MEASURED, AND BECAUSE AN EARLIER VERSION OF
+     * THIS COMMENT SAID ONLY "no per-block buffer" AND SO READ AS IF THE CALL WERE CHEAP.  It is
+     * not.  The blocks carry no per-block BUFFER -- the backing store is CDGVAX's own 64KB
+     * Int32Array, which the whole range aliases onto (see cdg.js's header) -- but addMemory() still
+     * constructs one MemoryVAX per BLOCK_SIZE chunk, and VAX.PHYSMEM.CDG_LENGTH / BusVAX.BLOCK_SIZE
+     * is 8192 blocks PER CALL: 128 times the register block's 64, and 8192 times the SSC's one.
+     * Calling this once per test case is what OOM-killed tests/cdgdiff.js at 8.6GB RSS (the kernel
+     * OOM killer took the machine down with it) before that file was changed to build ONE machine
+     * and reuse it; makeCdgController()'s hoisted access table is the other half of that fix.
+     * A caller that constructs machines in a loop must REUSE the machine, not re-run this.
+     *
+     * @this {BusVAX}
+     * @param {CDGVAX} cdg
+     */
+    addCdg(cdg)
+    {
+        this.addMemory(VAX.PHYSMEM.CDG_BASE >>> 0, VAX.PHYSMEM.CDG_LENGTH, MemoryVAX.TYPE.CONTROLLER, makeCdgController(cdg));
     }
 
     /**
@@ -925,14 +962,19 @@ BusVAX.BLOCK_SIZE = 0x2000;
  * Physical ranges this component reserves but does NOT decode.  See isReserved().
  */
 BusVAX.RESERVED = [
-    [VAX.PHYSMEM.CDG_BASE,    VAX.PHYSMEM.CDG_LENGTH],
     [VAX.PHYSMEM.IOPAGE_BASE, VAX.PHYSMEM.IOPAGE_LENGTH],
     [VAX.PHYSMEM.REG_BASE,    VAX.PHYSMEM.REG_LENGTH],
     [VAX.PHYSMEM.CQM_BASE,    VAX.PHYSMEM.CQM_LENGTH],
     [VAX.PHYSMEM.NVR_BASE,    VAX.PHYSMEM.NVR_LENGTH]    // added pcjsvax-446: was a gap (see isReserved())
     /* ROM_BASE removed by pcjsvax-223: it is decoded now (see addRom()), not merely reserved.
        SSC_BASE removed by pcjsvax-320: it is decoded now too (see addSsc()/ssc.js), not merely
-       reserved -- even though most of its sub-registers still fault; see isReserved()'s comment. */
+       reserved -- even though most of its sub-registers still fault; see isReserved()'s comment.
+       CDG_BASE removed by pcjsvax-0b7: addCdg()/cdg.js decodes the WHOLE range, end to end, and
+       unlike the SSC there is no undecoded remainder -- cdg_rd()/cdg_wr() answer for every address
+       in it.  tests/mchkdiff.js derives its RANGES from this array, so dropping an entry here also
+       drops it from that file's pool; that is correct and intended (nothing in CDG machine-checks
+       on either engine any more), and mchkdiff's RANGE_NAMES/EXPECTED_CALIBRATION were updated in
+       the same change -- see the load-time length assertion there, which is what enforces it. */
 ];
 
 BusVAX.ERROR = {
