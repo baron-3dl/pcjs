@@ -16,6 +16,11 @@ access and every delivered interrupt, and stock SIMH exposes none of it in
 machine-readable form either. Patch 0006 closes that gap; see "What 0006 adds"
 below.
 
+And once more, one milestone further up: the Qbus DMA data path (`pcjsvax-e22`) cannot be reached
+from the console at all — a DMA is not a CPU instruction, and the only in-tree callers of
+`Map_ReadB`/`Map_WriteB` are device models not yet ported. Patch 0007 adds a console entry point
+for them; see "What 0007 adds" below.
+
 ```
 machines/dec/vax/tests/simh/build.sh          # -> $TMPDIR/pcjs-vax-simh/open-simh/BIN/microvax3900
 export SIMH_DECODE_BIN=$TMPDIR/pcjs-vax-simh/open-simh/BIN/microvax3900
@@ -439,6 +444,70 @@ which deposits **its own** throwaway code at physical `0x100`-`0x10D` and runs i
 setup if not absorbed first. `unaligned_probe()` issues one throwaway `step 1` before touching
 anything else for exactly this reason; see its docstring.
 
+## What 0007 adds
+
+`pcjsvax-e22` needs an oracle for the **Qbus DMA data path** — the CQBIC scatter-gather map and the
+four routines every Qbus mass-storage device (RQ/MSCP, TQ, RL) calls to move data through it:
+
+```c
+int32 Map_ReadB  (uint32 ba, int32 bc, uint8 *buf);        /* vaxmod_defs.h:459-462 */
+int32 Map_ReadW  (uint32 ba, int32 bc, uint16 *buf);
+int32 Map_WriteB (uint32 ba, int32 bc, const uint8 *buf);
+int32 Map_WriteW (uint32 ba, int32 bc, const uint16 *buf);
+```
+
+**Nothing in a stock `microvax3900` can be made to call them from the console.** A DMA is by
+definition not a CPU instruction, so no instruction stream reaches them, and the only in-tree
+callers are device models this project has not ported yet. `EXAMINE QBA` / `DEPOSIT QBA`
+(`qba_ex`/`qba_dep`) come closest but go through `qba_map_addr_c()`, the *console* variant of the
+translation, which is word-only and **deliberately latches no error state at all** — so it cannot
+grade the residual count, the `DSER`/`MEAR`/`SEAR` side effects, or the per-page remap loop, which
+is the entire subject.
+
+0007 adds one `SHOW` on the QBA device — not on the CPU, so the whole patch is confined to
+`vax_io.c`, the file that already owns these routines:
+
+```
+SHOW QBA QDMA=op:ba:bc:sa       (every field hex, colon separated -- SHOW splits on commas)
+
+  op   0 = Map_ReadB, 1 = Map_ReadW, 2 = Map_WriteB, 3 = Map_WriteW
+       ("read"/"write" are from the DEVICE's point of view, as in the routine names:
+        a read moves memory into the device's buffer)
+  ba   Qbus bus address (the routines apply QBMAMASK themselves)
+  bc   byte count, 0 <= bc <= QDMA_MAXBC (4096)
+  sa   the device buffer's STAGING address in physical memory -- not a Qbus address,
+       not touched by the map
+
+  -> QDMA <op> <resid> <dser> <mear> <sear> <ipc> <memerr>
+  -> QDMA <op> abort <abortval>
+```
+
+`resid` is the routine's own return value: **the count NOT transferred, 0 on full success.** A
+device that treats a non-zero return as success is the defect this convention exists to prevent.
+
+The buffer travels through **memory**, not the command line, for a measured reason: a
+scatter-gather transfer has to span three or more 512-byte map pages to be worth grading at all
+(a single-page transfer is satisfied by an identity map, which is exactly the wrong implementation),
+and several KB of hex would not survive SCP's command buffer. For a read the buffer is pre-filled
+with `QDMA_FILL` (`0xE5`) and copied out for the **full** `bc`, so the untransferred tail of a
+partial transfer is directly observable rather than inferred from `resid`. The `Map_ReadW`/
+`Map_WriteW` buffer is a `uint16 *` in the C and is staged here as its underlying **bytes**, so a
+byte-order defect in a port shows up in the staged buffer instead of being hidden by a word-level
+comparison.
+
+The CQBIC error registers are read *after* the transfer and are **not** cleared by the command:
+they are sticky (that is what `CQDSER_LST` means), so clearing them would destroy the accumulation
+a test wants to grade. The caller decides what state each case starts from, with
+`DEPOSIT QBA DSER/MEAR/SEAR`.
+
+The command owns a `setjmp` of its own, like `SHOW CPU MMUOP=` and `SHOW CPU FPOP=`, because the
+`Map_*` routines can `ABORT()` and there is no `sim_instr` frame to land in when they are called
+from the console. In principle it is unreachable — `qba_map_addr()` returns `FALSE` for every
+address `ReadB`/`ReadL` could fault on — so the abort line is *reported*, not assumed away.
+
+`tests/qdmadiff.js` is the consumer. A binary built without 0007 makes it **fail with a message
+naming the patch**; it is never silently skipped.
+
 ## Upstream-drift hazards, per patch
 
 What each patch hangs off of — check these first on a rebase; if any of them moved or changed
@@ -454,16 +523,19 @@ no longer mean what the prose above says.
 | 0005 | `vax_cpu.c`, `vax_cpu1.c`, `vax_defs.h` | `cpu_deb[]` DEBTAB table (adds `EXCTRACE`); new `LOG_CPU_X` bit in `vax_defs.h` (must stay clear of the existing `LOG_CPU_FAULT_*` bits — currently `0x200`, one past `LOG_CPU_FAULT_EMUL`'s `0x100`); new `exc_trace_state()`; and five existing functions get entry/exit trace calls spliced in: `intexc()` (also hoists its SCB-read address into a local, `pcjs_scbpa`, logged and then used in place of the inline expression — the read itself is unchanged), `op_rei()`, `op_chm()`, `op_mtpr()`, `op_mfpr()`. A rebase that changes any of these five functions' control flow (early returns, additional fault paths) needs the corresponding `PCJS_TRACING` block re-sited, not just re-hunked. |
 | 0006 | `vax_cpu.c`, `vax_sysdev.c`, `vax_io.c` | `sysd_debug[]` DEBTAB table (adds `DEVTRACE`, bit `0x0040`, one past `DBG_CNF`'s `0x0020` — must stay clear of `DBG_REGR`/`DBG_REGW`/`DBG_INT`/`DBG_SCHD`/`DBG_TODR`/`DBG_CNF`); `ReadIPR`'s single common `return val` (traces `IPRR`, changes nothing about which case sets `val`) and `WriteIPR`'s entry (traces `IPRW` before the switch, so it fires even for the `RSVD_OPND_FAULT` cases); `ReadReg`/`WriteReg`'s `regtable[]` dispatch loop in `vax_sysdev.c` (each gets one `val`/trace line inserted at its existing early `return`/`p->write(...)` call — this is the highest-leverage hook in the patch, since it's the *only* place all eight register-space families converge); the `IE_INT` call site inside `sim_instr()`'s dispatch loop in `vax_cpu.c` (reuses 0005's `LOG_CPU_X`/`cpu_dev`, adds no new bit — its inline comment also carries the masked-interrupt-invisibility caveat, see above); **(pcjsvax-62a)** `ReadIO`/`ReadIOU`/`WriteIO`/`WriteIOU` in `vax_io.c` (each gets one `val`/trace line — `ReadIO`/`ReadIOU` after the value is resolved and before `return`, `WriteIO`/`WriteIOU` at entry before dispatch — reusing `DBG_DEVT`/`sysd_dev` via a second `extern DEVICE sysd_dev;` + `#define DBG_DEVT 0x0040` local to `vax_io.c`, since the original is a private `#define` in `vax_sysdev.c`, not a header symbol). A rebase that changes `ReadReg`/`WriteReg`'s single-loop-with-early-return shape, or splits `regtable[]` into per-family dispatch, needs the trace call re-sited to wherever the new common exit is; the same applies to `ReadIO`/`WriteIO`/`ReadIOU`/`WriteIOU` if a rebase changes their signatures (e.g. folds the aligned/unaligned pairs together) or if `vax_sysdev.c`'s `DBG_DEVT` value ever moves (the `vax_io.c` copy must move with it — nothing enforces the two definitions staying equal except this note). |
 
+| 0007 | `vax_io.c` | `qba_mod[]` MTAB table (appends the `QDMA` entry after 0006's untouched entries — order-insensitive, it is last); new `qba_show_qdma()`, which calls `Map_ReadB`/`Map_ReadW`/`Map_WriteB`/`Map_WriteW` and `ReadB`/`WriteB` directly and takes `save_env`/`setjmp` — a signature change to any `Map_*` routine (as in `is1000_sysdev.c`, whose versions take an extra `t_bool map` argument) breaks it loudly at compile time, which is the desired failure; `cq_dser`/`cq_mear`/`cq_sear`/`cq_ipc` module globals and `mem_err` (`vax_defs.h:891`) are read, not modified; `ADDR_IS_MEM` bounds the staging address. |
+
 Provenance: patches 0001-0005 are against Open SIMH at commit `a1f57fa3`; 0006 is generated against
 that same base with 0001-0005 already applied (its context lines reflect the post-0005 source, as
 `git apply`'s sequential model requires); 0006 was extended in place by `pcjsvax-62a` against the
 same base plus 0001-0005 (not a fresh diff against later SIMH state), for the same sequential-model
 reason. Keep them small and additive so they keep applying as
 upstream moves; net diff is two files +79 lines for 0002, three files +166/-4 for 0003, one file
-+356/-0 for 0004, three files +71/-1 for 0005, and (as extended by pcjsvax-62a) three files +67/-4
-for 0006, with every copyright
++356/-0 for 0004, three files +71/-1 for 0005, (as extended by pcjsvax-62a) three files +67/-4
+for 0006, and one file +157/-0 for 0007 (generated against the same base with 0001-0006 applied,
+for the same sequential-model reason), with every copyright
 header untouched. No patch changes instruction semantics — the simulator's own EHKAA self-test,
-which `make ... vax` runs, passes unmodified with all six applied.
+which `make ... vax` runs, passes unmodified with all seven applied.
 
 ### Two hazards fixed by `pcjsvax-fb1` — read before assuming either is still true
 

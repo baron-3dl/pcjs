@@ -1,0 +1,182 @@
+diff --git a/VAX/vax_io.c b/VAX/vax_io.c
+index 12274c4..86a8092 100644
+--- a/VAX/vax_io.c
++++ b/VAX/vax_io.c
+@@ -154,6 +154,7 @@ t_bool qba_map_addr (uint32 qa, uint32 *ma);
+ t_bool qba_map_addr_c (uint32 qa, uint32 *ma);
+ t_stat qba_show_virt (FILE *of, UNIT *uptr, int32 val, CONST void *desc);
+ t_stat qba_show_map (FILE *of, UNIT *uptr, int32 val, CONST void *desc);
++t_stat qba_show_qdma (FILE *of, UNIT *uptr, int32 val, CONST void *desc);
+ t_stat qba_help (FILE *st, DEVICE *dptr, UNIT *uptr, int32 flag, const char *cptr);
+ const char *qba_description (DEVICE *dptr);
+ 
+@@ -196,6 +197,9 @@ MTAB qba_mod[] = {
+       NULL, &qba_show_virt, NULL, "Display translation for Qbus address arg" },
+     { MTAB_XTD|MTAB_VDV|MTAB_NMO|MTAB_SHP, 0, "MAP", NULL,
+       NULL, &qba_show_map, NULL, "Display Qbus map register(s)" },
++    /* pcjs-vax Qbus DMA differential-test support; see machines/dec/vax/tests/simh/README.md */
++    { MTAB_XTD|MTAB_VDV|MTAB_NMO|MTAB_SHP|MTAB_NC, 0, "QDMA", NULL,
++      NULL, &qba_show_qdma, NULL, "perform one Map_Read/Write DMA: op:ba:bc[:byte...]" },
+     { 0 }
+     };
+ 
+@@ -998,6 +1002,159 @@ uint32 *qb_map = &M[cq_mbr >> 2];
+ return show_bus_map (of, (const char *)desc, qb_map, (CQMAPSIZE >> 2), "Qbus", CQMAP_VLD);
+ }
+ 
++/* pcjs-vax Qbus DMA differential-test support
++   -------------------------------------------
++   SHOW QBA QDMA=op:ba:bc:sa      (every field hex, colon separated -- SHOW
++   splits its argument on commas, so colons it is)
++
++   Performs exactly ONE Map_ReadB/Map_ReadW/Map_WriteB/Map_WriteW -- the REAL
++   routines above, unmodified, which are the entry points every Qbus mass-storage
++   device (RQ/MSCP, TQ, RL) uses to move data through the CQBIC scatter-gather
++   map -- and prints one machine-readable line, so that
++   machines/dec/vax/tests/qdmadiff.js can grade a JavaScript port of them.
++
++   Nothing else in this simulator can be made to call them from the console: a
++   DMA is by definition not a CPU instruction, and the only in-tree callers are
++   device models this project has not ported yet.  qba_ex()/qba_dep() (EXAMINE
++   QBA / DEPOSIT QBA) reach qba_map_addr_c(), the CONSOLE variant, which is word
++   only and deliberately latches NO error state -- so it cannot grade the
++   residual count, the DSER/MEAR/SEAR side effects, or the per-page remap loop,
++   which is what this command exists for.
++
++   Inputs:  op      0 = Map_ReadB, 1 = Map_ReadW, 2 = Map_WriteB, 3 = Map_WriteW
++                    ("read" and "write" are from the DEVICE's point of view, as
++                    in the routine names: read = memory -> device buffer)
++            ba      Qbus bus address (the routines apply QBMAMASK themselves)
++            bc      byte count, 0 <= bc <= QDMA_MAXBC
++            sa      the DEVICE BUFFER's staging address in physical memory --
++                    NOT a Qbus address and NOT touched by the map.  bc bytes are
++                    copied from sa into the buffer before a WRITE op; after a
++                    READ op, QDMA_SBC(bc) bytes -- bc rounded UP to a longword
++                    plus a QDMA_GUARD-byte tail -- are copied back out to sa.
++                    sa..sa+QDMA_SBC(bc)-1 must be memory or the command is
++                    SCPE_ARG.
++
++                    THE TAIL IS NOT PADDING.  Map_ReadB/Map_ReadW choose their
++                    loop on ((ba | bc) & 03), and the LONGWORD loop transfers
++                    ceil(bc/4)*4 bytes -- so a count that is not a multiple of 4
++                    writes PAST bc into the caller's buffer if the alignment test
++                    is wrong.  Every VAX page is a multiple of 4, so that overrun
++                    can never cross a page boundary and therefore never changes
++                    the residual or any error register: staging the tail out is
++                    the ONLY way the difference is observable at all.  Measured,
++                    not assumed -- an injected `(ba | bc) & 3` -> `ba & 3` defect
++                    survived qdmadiff.js until this tail was added.
++
++   Output:  QDMA <op> <resid> <dser> <mear> <sear> <ipc> <memerr>
++            QDMA <op> abort <abortval>
++
++   resid is the routine's own return value: the count NOT transferred, 0 on full
++   success.  The buffer travels through MEMORY rather than the command line
++   because a scatter-gather transfer has to be able to span three or more 512-
++   byte map pages to be worth grading at all, and several KB of hex would not
++   survive SCP's command buffer.  It also lets the caller compare the transfer
++   with an ordinary EXAMINE.  For a read the buffer is pre-filled with QDMA_FILL
++   and copied out for the FULL bc, so the untransferred tail of a partial
++   transfer is directly observable rather than inferred from resid.
++
++   The Map_ReadW/Map_WriteW buffer is a uint16 array in the C, and is staged here
++   as its underlying BYTES, so a byte-order defect in a port is visible in the
++   staged buffer rather than hidden by a word-level comparison.  That makes the
++   staging host-endian for the word ops; every machine this project builds on is
++   little-endian, which is also what a VAX device buffer is.
++
++   dser/mear/sear/ipc/memerr are read AFTER the transfer and are not cleared
++   here: the CQBIC error registers are sticky (that is what CQDSER_LST means),
++   so clearing them would destroy the very accumulation a test wants to grade.
++   The caller decides, with DEPOSIT QBA DSER/MEAR/SEAR, what state each case
++   starts from.
++
++   Nothing here changes any instruction semantics, and nothing here is reachable
++   unless the console command is typed. */
++
++#define QDMA_MAXBC      4096
++#define QDMA_FILL       0xE5
++#define QDMA_GUARD      8
++#define QDMA_SBC(bc)    ((((bc) + 3) & ~3) + QDMA_GUARD)
++
++t_stat qba_show_qdma (FILE *of, UNIT *uptr, int32 val, CONST void *desc)
++{
++CONST char *cptr = (CONST char *) desc;
++static union {
++    uint8 b[QDMA_MAXBC];
++    uint16 w[QDMA_MAXBC / 2];
++    } qdma_buf;
++unsigned long fld[4];
++int nfld = 0, i, abortval;
++int32 op, bc, sbc, resid;
++uint32 ba, sa;
++const char *p;
++char *ep;
++
++if (cptr == NULL)
++    return SCPE_ARG;
++for (p = cptr; (*p != 0) && (nfld < (int) (sizeof (fld) / sizeof (fld[0]))); ) {
++    fld[nfld] = strtoul (p, &ep, 16);                   /* every field is hex */
++    if (ep == p)
++        return SCPE_ARG;
++    nfld++;
++    p = ep;
++    if (*p != ':')
++        break;
++    p++;
++    }
++if (nfld < 4)
++    return SCPE_ARG;
++op = (int32) fld[0];
++ba = (uint32) fld[1];
++bc = (int32) fld[2];
++sa = (uint32) fld[3];
++if ((op < 0) || (op > 3) || (bc < 0) || (bc > (QDMA_MAXBC - QDMA_GUARD - 4)))
++    return SCPE_ARG;
++sbc = (op < 2)? QDMA_SBC (bc): bc;                      /* a read stages a guard tail out */
++if ((sbc > 0) && (!ADDR_IS_MEM (sa) || !ADDR_IS_MEM (sa + sbc - 1)))
++    return SCPE_ARG;                                    /* staging must be real memory */
++for (i = 0; i < QDMA_MAXBC; i++)
++    qdma_buf.b[i] = QDMA_FILL;
++if (op >= 2) {                                          /* a write needs data */
++    for (i = 0; i < bc; i++)
++        qdma_buf.b[i] = (uint8) ReadB (sa + i);
++    }
++
++abortval = setjmp (save_env);                           /* the Map_* routines can ABORT() */
++if (abortval != 0) {                                    /* unreachable in principle: */
++    fprintf (of, "QDMA %d abort %d\n", op, abortval);   /* qba_map_addr() returns FALSE for */
++    return SCPE_OK;                                     /* every address ReadB/WriteB could */
++    }                                                   /* fault on -- reported, not assumed */
++
++switch (op) {
++
++case 0:
++    resid = Map_ReadB (ba, bc, qdma_buf.b);
++    break;
++
++case 1:
++    resid = Map_ReadW (ba, bc, qdma_buf.w);
++    break;
++
++case 2:
++    resid = Map_WriteB (ba, bc, qdma_buf.b);
++    break;
++
++default:
++    resid = Map_WriteW (ba, bc, qdma_buf.w);
++    break;
++    }
++
++if (op < 2) {                                           /* a read staged the data out */
++    for (i = 0; i < sbc; i++)
++        WriteB (sa + i, qdma_buf.b[i]);
++    }
++fprintf (of, "QDMA %d %X %X %X %X %X %X\n", op, resid, cq_dser, cq_mear, cq_sear,
++    cq_ipc, mem_err);
++return SCPE_OK;
++}
++
+ t_stat qba_help (FILE *st, DEVICE *dptr, UNIT *uptr, int32 flag, const char *cptr)
+ {
+ fprintf (st, "Qbus Adapter (QBA)\n\n");

@@ -8,7 +8,7 @@
 # file BEFORE it, not the instruction bytes in a machine-readable form, and -- most importantly --
 # not the memory reads the addressing modes performed.  Nor can its console observe a translation
 # for anything but a READ in one access mode, nor can it perform one floating point operation on
-# operands you choose.  Four patches add what is missing:
+# operands you choose.  Seven patches add what is missing:
 #
 #   0001  (lives in the pcjs-vax work repo) adds the R0-R15 dump: the "REGS" line.
 #   0002  (here) adds the decode-replay capture: "PREG", "IBYT", "OPND", "RECQ", "MEMR", "BRDP".
@@ -34,6 +34,14 @@
 #         NOTE: INTD only observes DELIVERED interrupts -- SET_INT/CLR_INT are macros with no call
 #         site to hook, so a masked interrupt REQUEST produces no trace record at all until (if
 #         ever) it is later delivered. See tests/simh/README.md's "CAVEAT" section.
+#   0007  (here) adds SHOW QBA QDMA=, which performs one Map_ReadB/Map_ReadW/Map_WriteB/
+#         Map_WriteW -- the real vax_io.c DMA entry points every Qbus mass-storage device uses
+#         to move data through the CQBIC scatter-gather map -- and reports the residual count,
+#         the transferred bytes, and the CQBIC DSER/MEAR/SEAR/IPC/mem_err side effects.  A DMA
+#         is not a CPU instruction, and this simulator has no other console path that reaches
+#         those routines with their error latching intact (EXAMINE QBA uses qba_map_addr_c, the
+#         console variant, which is word-only and latches nothing), so without this patch
+#         tests/qdmadiff.js has no oracle at all.
 #
 # None changes any instruction semantics; the simulator's own EHKAA self-test still passes,
 # which the build runs automatically.
@@ -66,8 +74,9 @@ PATCH3="$HERE/0003-mmu-differential-support.patch"
 PATCH4="$HERE/0004-fp-differential-support.patch"
 PATCH5="$HERE/0005-exception-differential-support.patch"
 PATCH6="$HERE/0006-device-register-trace.patch"
+PATCH7="$HERE/0007-qbus-dma-differential-support.patch"
 
-for f in "$SRC" "$PATCH1" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" "$PATCH6"; do
+for f in "$SRC" "$PATCH1" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" "$PATCH6" "$PATCH7"; do
     if [[ ! -e "$f" ]]; then
         echo "FATAL: required input not found: $f" >&2
         echo "       Set \$PCJS_VAX_REPO to the pcjs-vax work repo if it is not beside this one." >&2
@@ -107,7 +116,8 @@ else
     git apply "$PATCH4"
     git apply "$PATCH5"
     git apply "$PATCH6"
-    echo "applied 0001, 0002, 0003, 0004, 0005 and 0006"
+    git apply "$PATCH7"
+    echo "applied 0001, 0002, 0003, 0004, 0005, 0006 and 0007"
 fi
 
 cd "$DEST/open-simh"
