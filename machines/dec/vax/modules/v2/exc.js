@@ -76,15 +76,20 @@
  *   - Writing MT.SID, MT.CONPC or MT.CONPSL is a reserved-operand fault.
  *   - Reading MT.SIRR, MT.TBIA, MT.TBIS or MT.TBCHK is a reserved-operand fault (write-only).
  *   - Every other off-chip register number -- including the ones the architecture leaves
- *     RESERVED, which the KA655 does NOT fault on -- reads 0 and ignores writes, which is exactly
- *     what vax_sysdev.c's `default:` case does apart from setting the SSC bus-timeout bit
- *     (ssc_bto), a bit nothing in the CPU ever reads back.  EHKAA exercises two such reserved
- *     numbers (0x0F and 0x28, docs/reference/ehkaa-profile.md §4.2) and this is why they behave.
+ *     RESERVED, which the KA655 does NOT fault on, and MT.NICR/MT.ICR, which are architecturally
+ *     NAMED but have no `case` in vax_sysdev.c's ReadIPR/WriteIPR at all (measured, pcjsvax-b4b) --
+ *     reads 0, ignores writes, AND sets the SSC bus-timeout bit (sscBto |= SSCBTO_BTO,
+ *     vax_sysdev.c:913/982), exactly what that `default:` case does.  BTO only -- never
+ *     SSCBTO_RWT, which stays busTimeout()'s exclusively (pcjsvax-446).  A bit nothing in the CPU
+ *     ever reads back, but tests/timerdiff.js does (`examine sysd bto`).  EHKAA exercises two such
+ *     reserved numbers (0x0F and 0x28, docs/reference/ehkaa-profile.md §4.2) and this is why they
+ *     behave.
  *
  * `setIPRDevice(dev)` installs the real device model when the device item lands; until then the
  * numbers in IPR_DEVICE are the ONLY IPRs whose values this module cannot reproduce, and
  * tests/excdiff.js excludes exactly that set from its randomized pool (and asserts that EHKAA
- * touches none of them).
+ * touches none of them).  MT.NICR/MT.ICR are NOT in that set (pcjsvax-b4b): SIMH does not wire
+ * them to any device either, so they are graded like every other unowned register, not deferred.
  *
  * ============================================================================
  * WHAT IS DELIBERATELY NOT HERE
@@ -234,9 +239,19 @@ const MT = {
 const MT_MAX = 63;                              // vaxmod_defs.h:106, last valid IPR on a KA655
 
 /* The off-chip registers that belong to the SSC/CMCTL device model, not to this item.  See the
-   file header; tests/excdiff.js excludes exactly this set from its randomized MTPR/MFPR pool. */
-const IPR_DEVICE = [MT.ICCS, MT.NICR, MT.ICR, MT.TODR, MT.CSRS, MT.CSRD, MT.CSTS, MT.CSTD,
+   file header; tests/excdiff.js excludes exactly this set from its randomized MTPR/MFPR pool.
+   MEASURED CORRECTION (pcjsvax-b4b): MT.NICR/MT.ICR used to be listed here on the assumption they
+   were device-owned, but vax_sysdev.c's ReadIPR/WriteIPR (845-988) has NO `case` for either -- both
+   fall to the SAME `default:` (-> SSCBTO_BTO) as any other reserved register number, confirmed
+   live against the oracle (tests/timerdiff.js's caseNicrIcrInert()).  Removed so readIPR()/
+   writeIPR() below route them through the BTO default instead of a device model that was never
+   real.  IORESET stays listed for WriteIPR's sake only -- ReadIPR (845-919) has no
+   `case MT_IORESET` either, so an MFPR of it ALSO hits the BTO default on real SIMH; that read-
+   side asymmetry pre-dates this item, is untouched by it, and remains a disclosed, ungraded gap
+   (excdiff's IPR_POOL below excludes IORESET from BOTH directions because one Set drives both). */
+const IPR_DEVICE = [MT.ICCS, MT.TODR, MT.CSRS, MT.CSRD, MT.CSTS, MT.CSTD,
                     MT.RXCS, MT.RXDB, MT.TXCS, MT.TXDB, MT.CADR, MT.MSER, MT.IORESET];
+const IPR_DEVICE_SET = new Set(IPR_DEVICE);
 
 /* Hardwired CVAX system identification, vaxmod_defs.h:84-85. */
 const CVAX_SID = (10 << 24), CVAX_UREV = 6;
@@ -1463,7 +1478,9 @@ class VAXExc {
      * readIPR(prn)
      *
      * vax_sysdev.c:845, ReadIPR() -- the off-chip half.  See the file header for what is and is
-     * not modelled.
+     * not modelled.  A prn NOT in IPR_DEVICE -- no device owns it, which includes MT.NICR/MT.ICR,
+     * architecturally-named IPRs this SIMH model wires to nothing (pcjsvax-b4b) -- reproduces the
+     * `default:` case exactly: read 0 AND set the bus-timeout bit (BTO only, vax_sysdev.c:913).
      *
      * @this {VAXExc}
      * @param {number} prn
@@ -1472,14 +1489,17 @@ class VAXExc {
     readIPR(prn)
     {
         if (prn === MT.SID) return (CVAX_SID | CVAX_UREV) | 0;
-        if (this.iprDevice) return this.iprDevice.read(prn) | 0;
-        return 0;                                               // SSC default: BTO, reads 0
+        if (IPR_DEVICE_SET.has(prn) && this.iprDevice) return this.iprDevice.read(prn) | 0;
+        this.sscBto = (this.sscBto | SSCBTO_BTO) | 0;           // SSC default: BTO only, reads 0
+        return 0;
     }
 
     /**
      * writeIPR(prn, val)
      *
-     * vax_sysdev.c:921, WriteIPR() -- the off-chip half.
+     * vax_sysdev.c:921, WriteIPR() -- the off-chip half.  A prn NOT in IPR_DEVICE -- no device
+     * owns it, which includes MT.NICR/MT.ICR (pcjsvax-b4b) -- reproduces the `default:` case
+     * exactly: drop the write AND set the bus-timeout bit (BTO only, vax_sysdev.c:982).
      *
      * @this {VAXExc}
      * @param {number} prn
@@ -1490,8 +1510,8 @@ class VAXExc {
         if (prn === MT.SID || prn === MT.CONPC || prn === MT.CONPSL) {
             throw new VAXFault(VAXFAULT.RESOP);                 // read-only / halt registers
         }
-        if (this.iprDevice) { this.iprDevice.write(prn, val); return; }
-        /* SSC default: sets the bus-timeout bit and drops the write. */
+        if (IPR_DEVICE_SET.has(prn) && this.iprDevice) { this.iprDevice.write(prn, val); return; }
+        this.sscBto = (this.sscBto | SSCBTO_BTO) | 0;           // SSC default: BTO only, drop write
     }
 }
 
