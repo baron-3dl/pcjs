@@ -41,9 +41,13 @@
  *     twice.  Judged to belong with pcjsvax-bfb (the console item), which already owns the IPR half
  *     of the identical registers; this file leaves the memory-mapped half exactly as undecoded as
  *     it always was, so whichever item lands the model first wires BOTH address paths against it.
- *   - The SSC's two programmable timers T0/T1 (+0x100..+0x11C) and their address-strobe compare
- *     registers (+0x130/+0x134/+0x140/+0x144) -- explicitly the timer items' scope per this item's
- *     own text, not this one's, and no ROM boot-entry instruction this item measured needed them.
+ *   - UPDATE (pcjsvax-055): the SSC's two programmable timers T0/T1 (+0x100..+0x11C) ARE now
+ *     decoded -- see the "SSC PROGRAMMABLE TIMERS T0/T1" section further down this file, and the
+ *     readReg()/writeReg() cases for REG_T0CSR..REG_T1VEC.  This bullet is left in place, not
+ *     deleted, only to record that they were ONCE deliberately out of scope here; do not read it
+ *     as still describing the current decode.  Their address-strobe NEIGHBORS (ADS0M/ADS0K/ADS1M/
+ *     ADS1K, +0x130/+0x134/+0x140/+0x144) were decoded earlier still, by pcjsvax-bfb -- see the
+ *     SSCADS_MASK constant's own doc comment below for why they are a different, simpler animal.
  *
  * ============================================================================
  * WHAT HAPPENS TO EVERYTHING ELSE IN THIS BLOCK (two DIFFERENT answers, not one -- veracity finding)
@@ -120,7 +124,7 @@
 
 import { VAX } from "./defines.js";
 import { NVR_BASE, NVR_LENGTH } from "./nvr.js";
-import { SSCBTO_BTO, SSCBTO_RWT } from "./exc.js";
+import { SSCBTO_BTO, SSCBTO_RWT, IPL_HMIN } from "./exc.js";
 
 const SSC_BASE = VAX.PHYSMEM.SSC_BASE >>> 0;
 const SSC_LENGTH = VAX.PHYSMEM.SSC_LENGTH;
@@ -141,6 +145,14 @@ const REG_RXCS = 0x20;
 const REG_RXDB = 0x21;
 const REG_TXCS = 0x22;
 const REG_TXDB = 0x23;
+const REG_T0CSR = 0x40;
+const REG_T0INT = 0x41;
+const REG_T0NI  = 0x42;
+const REG_T0VEC = 0x43;
+const REG_T1CSR = 0x44;
+const REG_T1INT = 0x45;
+const REG_T1NI  = 0x46;
+const REG_T1VEC = 0x47;
 
 /* SSC bus-timeout register, vax_sysdev.c:179-183 and :1279-1280/1376-1378 (ssc_rd/ssc_wr case
    0x08) -- pcjsvax-bfb's own romdiff boundary-advance, instruction #28 (a READ of SSC+0x20).  NOT
@@ -177,19 +189,80 @@ const SSCOTP_MASK = 0x0000000F;
 
 /* SSC address-strobe compare registers (ADS0M/ADS0K/ADS1M/ADS1K), vax_sysdev.c:226 (SSCADS_MASK)
    and :1336-1345/1442-1454 (ssc_rd/ssc_wr cases 0x4C/0x4D/0x50/0x51) -- pcjsvax-bfb's own romdiff
-   boundary-advance, instruction #29 (a READ of SSC+0x130 = ADS0M).  DELIBERATELY NOT the SSC T0/T1
-   TIMER registers themselves (+0x100..+0x11C, TMR_CSR/TMR_TNIR/TMR_TIVR): those are genuine
-   counting/interrupt-delivering state -- pcjsvax-055 owns the per-instruction timer machinery
-   those need (split out from pcjsvax-954, which landed the CVAX on-chip ICCS/TODR clock but NOT
-   the SSC's separate T0/T1 hardware -- see KNOWN_UNIMPLEMENTED_READ/WRITE below, which is what
-   keeps a reference to those registers faulting, not silently succeeding, until 055 lands), and
-   this item's own scope (the console) has no reason to race it.  ADS0M/ADS0K/ADS1M/ADS1K are a
-   DIFFERENT, much simpler animal despite living in the same address neighborhood: plain masked RW
-   storage with NO counting, NO interrupt, NO side effect of any kind on either the read or the
-   write side -- vax_sysdev.c's own bodies are a bare `return ssc_adsm[i]` / `ssc_adsm[i] = val &
-   SSCADS_MASK`. Decoding them here does not touch, anticipate, or duplicate anything the timer
-   item needs. */
+   boundary-advance, instruction #29 (a READ of SSC+0x130 = ADS0M).  Deliberately NOT the SAME
+   animal as the SSC T0/T1 TIMER registers a few lines below in physical address space (+0x100..
+   +0x11C, TMR_CSR/TMR_TNIR/TMR_TIVR, pcjsvax-055): those are genuine counting/interrupt-delivering
+   state (see the "SSC PROGRAMMABLE TIMERS" section below), while ADS0M/ADS0K/ADS1M/ADS1K are
+   plain masked RW storage with NO counting, NO interrupt, NO side effect of any kind on either the
+   read or the write side -- vax_sysdev.c's own bodies are a bare `return ssc_adsm[i]` /
+   `ssc_adsm[i] = val & SSCADS_MASK`. Decoding them here does not touch, anticipate, or duplicate
+   anything the timer registers need, and this paragraph's decode predates pcjsvax-055 and is
+   unchanged by it. */
 const SSCADS_MASK = (0x3FFFFFFC | 0);
+
+/*
+ * ============================================================================
+ * SSC PROGRAMMABLE TIMERS T0/T1 (pcjsvax-055) -- vax_sysdev.c:1508-1642
+ * ============================================================================
+ * Two independent 32-bit down-counters (stored here, as on real SIMH, as UP-counters that OVERFLOW
+ * past 0xFFFFFFFF -- TIR holds the two's-complement of "how far to go", so "counting up by 1" and
+ * "counting down by 1" are the same bit pattern) at rg 0x40-0x43 (T0) and 0x44-0x47 (T1):
+ * T#CSR (control/status), T#INT (TIR, the live interval register -- READ-ONLY, vax_sysdev.c's
+ * ssc_wr() has no `case` for 0x41/0x45 at all), T#NI (TNIR, the RELOAD value XFR copies into TIR),
+ * T#VEC (TIVR, the dynamic interrupt vector, masked by TMR_VEC_MASK on WRITE only).
+ *
+ * TIMING MODEL, DECIDED HERE, mirroring clk.js's own precedent exactly (pcjsvax-954's file header,
+ * "TIMING MODEL, DECIDED HERE"): real SIMH's tmr_sched()/tmr_svc() schedule tmr_incr() from the
+ * SIMH event queue, using WALL-CLOCK MICROSECONDS -- *except* for one case it carves out itself,
+ * vax_sysdev.c:1608-1625 (tmr_sched()): `if (ADDR_IS_ROM(fault_PC) && usecs_sched < TMR_INC)` (a
+ * short delay requested from ROM code) schedules by INSTRUCTION COUNT instead
+ * (`sim_activate(&sysd_unit[tmr], usecs_sched)`, whose base unit IS instructions, vs.
+ * `sim_activate_after_d()`'s explicit real-time form used otherwise) -- SIMH's own comment at
+ * vax_sysdev.c:540-543 names this: the ROM's calibration/delay loops need a deterministic,
+ * host-speed-independent clock, so SIMH gives them one.  This engine has NO wall-clock concept at
+ * all (HANDOFF.md 7: EHKAA's own dispatch counts already vary run to run for exactly that reason),
+ * so tick() below always counts INSTRUCTIONS -- which is not a looser approximation of SIMH's
+ * general behavior, it is a literal port of the ONE branch of tmr_sched() this project's whole
+ * engine is structurally able to reach (real ROM code, run through this emulator, has no OTHER
+ * clock to be scheduled against) -- confirmed by testing FROM the ROM address window (tests/
+ * tmrdiff.js's run_mode_counting_rom case) so `ADDR_IS_ROM(fault_PC)` is genuinely true on the
+ * live oracle too, not merely assumed.  The non-ROM / long-delay wall-clock branch is NOT modelled
+ * (no test in this tree runs T0/T1-driven code outside the ROM window) -- exactly the same scope
+ * boundary clk.js draws around TODR's wall-clock path vs. its own instruction-driven tick.
+ *
+ * INTERRUPT SEAM: T0/T1 are DYNAMIC-vector hardware interrupt sources, IPL 0x14 (vaxmod_defs.h's
+ * IPL_TMR0/IPL_TMR1 both resolve to `(0x14 - IPL_HMIN)`, i.e. the SAME absolute level as TTI/TTO/
+ * CSI/CSO -- IPL_HMIN itself), bits 15/16 (vaxmod_defs.h INT_V_TMR0=15/INT_V_TMR1=16) -- the exact
+ * (lvl, bit) pair hwintdiff.js's dynamic_tmr0/dynamic_tmr1/dynamic_tmr0_reprogrammed cases already
+ * exercise against a SYNTHETIC prime, proving the seam itself is sound for this shape.  Wired here
+ * via addInterruptSource(IPL_HMIN, bit, (cpu) => this.tivr[i]) -- a LIVE closure over `this.tivr`,
+ * not a value captured at wiring time, so a vector rewritten after the request is raised but before
+ * it is acknowledged still resolves correctly (mirrors ConsoleVAX's own self-wiring-in-constructor
+ * precedent, console.js:131-135, rather than clk.js's older external-wiring convention -- self-
+ * wiring is followed here because, like ConsoleVAX, this device's vector storage IS `this`, so there
+ * is no reason to make a caller thread it through separately).  Installed ONLY when `exc` is
+ * provided (SSCVAX's existing optional-dependency contract -- omit it and T0/T1 behave exactly as
+ * any other device-less register: readable/writable, but never able to raise a request).
+ */
+/* TMR_CSR bits, vax_sysdev.c:191-198. */
+const TMR_CSR_ERR = 0x80000000 | 0;             // error, W1C
+const TMR_CSR_DON = 0x00000080;                 // done, W1C
+const TMR_CSR_IE  = 0x00000040;                 // interrupt enable
+const TMR_CSR_SGL = 0x00000020;                 // single step, WO
+const TMR_CSR_XFR = 0x00000010;                 // transfer TNIR->TIR, WO
+const TMR_CSR_STP = 0x00000004;                 // stop-on-overflow
+const TMR_CSR_RUN = 0x00000001;                 // run
+const TMR_CSR_W1C = (TMR_CSR_ERR | TMR_CSR_DON) | 0;
+const TMR_CSR_RW  = (TMR_CSR_IE | TMR_CSR_STP | TMR_CSR_RUN);
+
+/* TMR_VEC_MASK, vax_sysdev.c:222 -- applied to TIVR on WRITE only; QB_VEC_MASK (exc.js) is applied
+   AGAIN, generically, to every hardware vector at acknowledge time -- see the doc comment above. */
+const TMR_VEC_MASK = 0x000003FC;
+
+/* vaxmod_defs.h:362-363,422-423: T0/T1 share IPL 0x14 (= IPL_HMIN, the same absolute level as
+   TTI/TTO/CSI/CSO) and are distinguished purely by request BIT. */
+const INT_V_TMR0 = 15;
+const INT_V_TMR1 = 16;
 
 /*
  * ============================================================================
@@ -199,9 +272,8 @@ const SSCADS_MASK = (0x3FFFFFFC | 0);
  * UNCASED `rg` return 0/silent-success (see readReg()'s/writeReg()'s own doc comments) is ONLY
  * correct for `rg` values vax_sysdev.c's REAL ssc_rd()/ssc_wr() switches ALSO do not case. It is
  * WRONG for an `rg` value that IS cased on real SIMH but this file has simply not ported yet --
- * TODR (0x1B), the console-STORAGE registers CSRS/CSRD/CSTS/CSTD (0x1C-0x1F, a different device
- * from the console UART this item owns), and above all the SSC T0/T1 timer registers (0x40-0x47,
- * explicitly deferred to pcjsvax-055).  Those registers have REAL, NON-TRIVIAL behavior on real
+ * TODR (0x1B) and the console-STORAGE registers CSRS/CSRD/CSTS/CSTD (0x1C-0x1F, a different device
+ * from the console UART this item owns). Those registers have REAL, NON-TRIVIAL behavior on real
  * hardware (a counting timer, a live clock) that returning 0/silently-dropping does NOT reproduce
  * -- and unlike a genuine fault, a silent wrong answer has NO observable signal at all, so nothing
  * would ever catch the ROM proceeding on fabricated timer state.  MEASURED DIRECTLY: applying the
@@ -213,23 +285,28 @@ const SSCADS_MASK = (0x3FFFFFFC | 0);
  * tests/romdiff.js's boundary-advance keeps naming it as the next thing to implement, precisely as
  * it named SSC+0x10C itself.
  *
+ * pcjsvax-055 REMOVED the SSC T0/T1 timer registers (0x40-0x47) from BOTH sets below -- the ONLY
+ * item permitted to (see this file's own history: entries are removed ONLY in the same change that
+ * implements them, never speculatively -- see the "DRIFT RISK IS ASYMMETRIC" warning that shipped
+ * with this item's own rd record).  readReg()/writeReg() now case all eight; see the "SSC
+ * PROGRAMMABLE TIMERS" section above.
+ *
  * Two sets, not one, because vax_sysdev.c's ssc_rd()/ssc_wr() switches are NOT symmetric --
  * T0INT/T1INT (0x41/0x45) are READ-only status flags with no `case` in ssc_wr() at all (a TRUE
- * gap on the write side even though the SAME offset is real on the read side), and CSRD/CSTD
- * (0x1D/0x1F) are similarly one-directional the other way.  Each set is transcribed directly from
+ * gap on the write side even though the SAME offset is real on the read side, exactly like CSRD/
+ * CSTD (0x1D/0x1F) below, which are similarly one-directional the other way) -- so 0x41/0x45 were
+ * NEVER in KNOWN_UNIMPLEMENTED_WRITE to begin with (a write to them was already a genuine,
+ * unconditional no-op, matching real hardware, before this item touched anything) and this item
+ * makes NO change to the WRITE set for those two numbers.  Each set is transcribed directly from
  * vax_sysdev.c's own case labels (:1264-1345 read, :1352-1458 write), not inferred from the other.
  */
 const KNOWN_UNIMPLEMENTED_READ = new Set([
     0x1B,                               // TODR -- owned by clk.js's IPR path, not mirrored here
-    0x1C, 0x1D, 0x1E,                   // CSRS/CSRD/CSTS -- console STORAGE, a different device
-    0x40, 0x41, 0x42, 0x43,             // T0CSR/T0INT/T0NI/T0VEC -- pcjsvax-055
-    0x44, 0x45, 0x46, 0x47              // T1CSR/T1INT/T1NI/T1VEC -- pcjsvax-055
+    0x1C, 0x1D, 0x1E                    // CSRS/CSRD/CSTS -- console STORAGE, a different device
 ]);
 const KNOWN_UNIMPLEMENTED_WRITE = new Set([
     0x1B,                               // TODR
-    0x1C, 0x1E, 0x1F,                   // CSRS/CSTS/CSTD (CSRD has NO write case -- a true gap)
-    0x40, 0x42, 0x43,                   // T0CSR/T0NI/T0VEC (T0INT has NO write case -- a true gap)
-    0x44, 0x46, 0x47                    // T1CSR/T1NI/T1VEC (T1INT has NO write case -- a true gap)
+    0x1C, 0x1E, 0x1F                    // CSRS/CSTS/CSTD (CSRD has NO write case -- a true gap)
 ]);
 
 /**
@@ -252,6 +329,21 @@ export default class SSCVAX {
         this.exc = exc || null;
         this.console = console || null;
         this.reset();
+        /*
+         * pcjsvax-055: self-wire T0/T1's dynamic-vector interrupt sources, mirroring ConsoleVAX's
+         * own self-wiring-in-constructor precedent (console.js:131-135) rather than clk.js's older
+         * external-wiring convention -- see the "SSC PROGRAMMABLE TIMERS" doc comment above for why.
+         * `(cpu) => this.tivr[i]` is a LIVE closure, resolved at ACKNOWLEDGE time by exc.js's
+         * deviceVector() (not memoized here) -- required for dynamic_tmr0_reprogrammed-shaped
+         * correctness (hwintdiff.js already proves the seam itself honours this; this closure is
+         * what makes SSCVAX's OWN storage honour it too).  Skipped entirely when `exc` is omitted,
+         * matching every other exc-dependent register above (REG_BTO): T0/T1 stay readable/
+         * writable but can never raise a request.
+         */
+        if (this.exc) {
+            this.exc.addInterruptSource(IPL_HMIN, INT_V_TMR0, (cpu) => this.tivr[0]);
+            this.exc.addInterruptSource(IPL_HMIN, INT_V_TMR1, (cpu) => this.tivr[1]);
+        }
     }
 
     /**
@@ -278,6 +370,111 @@ export default class SSCVAX {
         this.cnf = SSCCNF_BLO;                 // vax_sysdev.c:684, nvr_reset() -- see REG_CNF's doc
         this.adsm = [0, 0];                    // vax_sysdev.c:253, ssc_adsm[2] = { 0 }
         this.adsk = [0, 0];                    // vax_sysdev.c:254, ssc_adsk[2] = { 0 }
+        /*
+         * pcjsvax-055: T0/T1 timer state.  vax_sysdev.c's sysd_powerup() (:1776-1792) zeroes ONLY
+         * tmr_tivr[] (the vector) -- tmr_csr[]/tmr_tir[]/tmr_tnir[] are NOT touched by powerup at
+         * all; they are zeroed by sysd_reset() instead (:1748-1753, a plain `reset all`).  This
+         * class's reset() is documented above as modelling powerup, not reset (see that doc comment)
+         * -- but since reset() here runs ONLY from the constructor (a brand-new instance), and a
+         * brand-new instance's csr/tir/tnir are already 0 with no other write path to make them
+         * anything else, "the powerup value" and "the reset value" are the SAME zero for these
+         * three arrays too, exactly as that doc comment already establishes for the rest of this
+         * class's state.  tivr[] is zeroed here because powerup actually does zero it (not merely
+         * by coincidence of construction).
+         */
+        this.tcsr = [0, 0];                    // tmr_csr[2]
+        this.tir  = [0, 0];                    // tmr_tir[2]  (the live TIR; see readReg's T#INT)
+        this.tnir = [0, 0];                    // tmr_tnir[2] (the XFR reload source)
+        this.tivr = [0, 0];                    // tmr_tivr[2] -- vax_sysdev.c:1783, sysd_powerup()
+    }
+
+    /**
+     * tick(cpu)
+     *
+     * The per-instruction device-service hook (cpustate.js's `cpu.tmr` slot, wired the same way
+     * `cpu.clk` wires ClkVAX -- see cpustate.js's own doc comment on both).  See the "SSC
+     * PROGRAMMABLE TIMERS" file-header section for why counting INSTRUCTIONS, unconditionally, is
+     * the correct port of tmr_sched()'s ROM-address/short-delay branch rather than an approximation
+     * of it.  `cpu` is accepted (matching ClkVAX.tick()'s own signature) but unused: T0/T1 need
+     * nothing from the CPU beyond "one instruction retired," and raise their own request through
+     * `this.exc`, already bound at construction.
+     *
+     * @this {SSCVAX}
+     * @param {Object} cpu
+     */
+    tick(cpu)
+    {
+        if (this.tcsr[0] & TMR_CSR_RUN) this._tmrIncr(0, 1);
+        if (this.tcsr[1] & TMR_CSR_RUN) this._tmrIncr(1, 1);
+    }
+
+    /**
+     * _tmrIncr(tmr, inc)
+     *
+     * vax_sysdev.c:1575-1600, tmr_incr() -- ported literally, including the "ERR only after a
+     * SECOND unacknowledged overflow" DON/ERR asymmetry and the RUN-gated reload-and-continue.
+     * Unsigned overflow detection (`next < cur`) is done on VALUES ALREADY NORMALIZED via `>>> 0`
+     * -- see defines.js's rule that a signed int32 relational compare is the hazard, not the mask;
+     * both operands here are plain non-negative JS numbers by the time they are compared, so `<`
+     * is safe.  `inc` is always 1 in this file (tick()'s per-instruction call and writeReg()'s SGL
+     * synchronous call) -- vax_sysdev.c's own callers never pass anything else either (tmr_svc()'s
+     * `~tmr_tir[tmr]+1` is a WALL-CLOCK usec delta this file's instruction-driven model has no
+     * equivalent for; see the file header) -- so multi-wrap-in-one-call is not a case this needs to
+     * handle, and does not.
+     *
+     * @this {SSCVAX}
+     * @param {number} tmr 0 or 1
+     * @param {number} inc
+     */
+    _tmrIncr(tmr, inc)
+    {
+        let cur = this.tir[tmr] >>> 0;
+        let next = (cur + inc) >>> 0;
+        if (next < cur) {                                  // overflow (wrapped past 0xFFFFFFFF)
+            this.tir[tmr] = 0;
+            if (this.tcsr[tmr] & TMR_CSR_DON) this.tcsr[tmr] = (this.tcsr[tmr] | TMR_CSR_ERR) | 0;
+            else this.tcsr[tmr] = (this.tcsr[tmr] | TMR_CSR_DON) | 0;
+            if (this.tcsr[tmr] & TMR_CSR_STP) this.tcsr[tmr] = (this.tcsr[tmr] & ~TMR_CSR_RUN) | 0;
+            if (this.tcsr[tmr] & TMR_CSR_RUN) this.tir[tmr] = this.tnir[tmr] | 0;   // reload, continue
+            if ((this.tcsr[tmr] & TMR_CSR_IE) && this.exc) {
+                this.exc.raiseInterrupt(IPL_HMIN, tmr ? INT_V_TMR1 : INT_V_TMR0);
+            }
+        } else {
+            this.tir[tmr] = next | 0;
+        }
+    }
+
+    /**
+     * _tmrCsrWr(tmr, val)
+     *
+     * vax_sysdev.c:1515-1554, tmr_csr_wr() -- ported in SIMH's own order (the order is observable:
+     * XFR's TNIR->TIR copy happens BEFORE the RUN/SGL branch consults TIR, and the CLR_INT check at
+     * the end reads the POST-write csr against the PRE-write `before`).  `sim_cancel`/`tmr_sched`'s
+     * real-time scheduling calls have no equivalent here -- see _tmrIncr()'s doc comment -- RUN
+     * alone gates tick(), so there is nothing to "cancel" or "(re)activate": clearing RUN silently
+     * stops future tick()s from calling _tmrIncr(), and setting it silently resumes them.
+     *
+     * @this {SSCVAX}
+     * @param {number} tmr 0 or 1
+     * @param {number} val the FULL merged longword writeReg() received (see writeReg()'s own
+     *   byte/word pre-merge doc comment)
+     */
+    _tmrCsrWr(tmr, val)
+    {
+        let before = this.tcsr[tmr];
+        this.tcsr[tmr] = (this.tcsr[tmr] & ~(val & TMR_CSR_W1C)) | 0;         // W1C ERR/DON
+        this.tcsr[tmr] = ((this.tcsr[tmr] & ~TMR_CSR_RW) | (val & TMR_CSR_RW)) | 0;   // IE/STP/RUN
+        if (val & TMR_CSR_XFR) this.tir[tmr] = this.tnir[tmr] | 0;
+        if (val & TMR_CSR_RUN) {
+            /* real SIMH cancels/reschedules its event here; nothing to do -- see the doc comment */
+        } else if (val & TMR_CSR_SGL) {
+            this._tmrIncr(tmr, 1);
+            if (this.tir[tmr] === 0) this.tir[tmr] = this.tnir[tmr] | 0;      // vax_sysdev.c:1549-1550
+        }
+        if ((before & (TMR_CSR_DON | TMR_CSR_IE)) !== 0 &&
+            (this.tcsr[tmr] & (TMR_CSR_DON | TMR_CSR_IE)) === 0) {
+            if (this.exc) this.exc.clearInterrupt(IPL_HMIN, tmr ? INT_V_TMR1 : INT_V_TMR0);
+        }
     }
 
     /**
@@ -338,6 +535,21 @@ export default class SSCVAX {
             return this.console ? this.console.sscRead(rg) : 0;
         case REG_TXDB:
             return 0;
+        /*
+         * pcjsvax-055: T#INT (TIR) is the LIVE interval register.  vax_sysdev.c's tmr_tir_rd()
+         * INTERPOLATES this from the SIMH event queue while running (`sim_activate_time(...)`,
+         * vax_sysdev.c:1485-1499); this file has no lazy/scheduled state to interpolate FROM --
+         * tick() advances `this.tir[i]` eagerly, every instruction, so the stored value already
+         * IS the live one and no interpolation step is needed to reproduce the same read.
+         */
+        case REG_T0CSR: return this.tcsr[0];
+        case REG_T0INT: return this.tir[0];
+        case REG_T0NI:  return this.tnir[0];
+        case REG_T0VEC: return this.tivr[0];
+        case REG_T1CSR: return this.tcsr[1];
+        case REG_T1INT: return this.tir[1];
+        case REG_T1NI:  return this.tnir[1];
+        case REG_T1VEC: return this.tivr[1];
         }
         return KNOWN_UNIMPLEMENTED_READ.has(rg) ? null : 0;
     }
@@ -402,6 +614,21 @@ export default class SSCVAX {
             return this.console ? this.console.sscWrite(rg, val) : true;
         case REG_RXDB:
             return true;
+        /*
+         * pcjsvax-055.  T0INT/T1INT (0x41/0x45) are DELIBERATELY ABSENT from this switch -- see
+         * KNOWN_UNIMPLEMENTED_WRITE's own doc comment: vax_sysdev.c's ssc_wr() has no `case` for
+         * them either, so a write silently no-ops (the trailing `return true` below), matching real
+         * hardware exactly.  This is also what self-resolves the byte/word write fault pcjsvax-bfb
+         * disclosed for T0INT/T1INT: writeWord()/writeByte()'s read-modify-merge now gets a REAL
+         * `cur` from readReg() (T0INT/T1INT are cased on read) instead of null, so the merge
+         * succeeds and lands here -- a genuine no-op, not a fault.
+         */
+        case REG_T0CSR: this._tmrCsrWr(0, val); return true;
+        case REG_T0NI:  this.tnir[0] = val | 0; return true;
+        case REG_T0VEC: this.tivr[0] = (val & TMR_VEC_MASK) | 0; return true;
+        case REG_T1CSR: this._tmrCsrWr(1, val); return true;
+        case REG_T1NI:  this.tnir[1] = val | 0; return true;
+        case REG_T1VEC: this.tivr[1] = (val & TMR_VEC_MASK) | 0; return true;
         }
         return KNOWN_UNIMPLEMENTED_WRITE.has(rg) ? false : true;
     }
@@ -588,4 +815,9 @@ export function makeSscController(ssc, nvr)
     };
 }
 
-export { SSC_BASE, SSC_LENGTH };
+export {
+    SSC_BASE, SSC_LENGTH,
+    REG_T0CSR, REG_T0INT, REG_T0NI, REG_T0VEC, REG_T1CSR, REG_T1INT, REG_T1NI, REG_T1VEC,
+    TMR_CSR_ERR, TMR_CSR_DON, TMR_CSR_IE, TMR_CSR_SGL, TMR_CSR_XFR, TMR_CSR_STP, TMR_CSR_RUN,
+    TMR_VEC_MASK, INT_V_TMR0, INT_V_TMR1
+};
