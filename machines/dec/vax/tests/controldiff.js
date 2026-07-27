@@ -680,18 +680,29 @@ function emitCase(lines, cmds, iCase, c)
 /**
  * runSimh(simhBin, iniText)
  *
+ * Its own scratch directory, per call -- distinct from and NEVER the same as main()'s
+ * opts.scratch (which loadMutant() receives but never uses).  HANDOFF.md pcjsvax-bd1: this
+ * directory was created and never removed, the actual leak behind the 306 abandoned
+ * /tmp/vax-controldiff-* directories found on this disk -- `dir` was returned but every call
+ * site discards it (`let {out} = runSimh(...)`), so nothing downstream ever used it for
+ * debugging either.  Cleaned up here, unconditionally, same as busdiff.js's runSimh().
+ *
  * @param {string} simhBin
  * @param {string} iniText
- * @returns {{out: string, dir: string}}
+ * @returns {{out: string}}
  */
 function runSimh(simhBin, iniText)
 {
     let dir = fs.mkdtempSync(path.join(os.tmpdir(), "vax-controldiff-"));
-    let iniPath = path.join(dir, "run.ini");
-    fs.writeFileSync(iniPath, iniText);
-    let out = execFileSync(simhBin, [iniPath], {maxBuffer: 1 << 30, encoding: "utf8"});
-    fs.writeFileSync(path.join(dir, "run.out"), out);
-    return {out, dir};
+    try {
+        let iniPath = path.join(dir, "run.ini");
+        fs.writeFileSync(iniPath, iniText);
+        let out = execFileSync(simhBin, [iniPath], {maxBuffer: 1 << 30, encoding: "utf8"});
+        fs.writeFileSync(path.join(dir, "run.out"), out);
+        return {out};
+    } finally {
+        fs.rmSync(dir, {recursive: true, force: true});
+    }
 }
 
 /**
@@ -1328,27 +1339,41 @@ async function main()
         let i = argv.indexOf(name);
         return i >= 0 && i + 1 < argv.length ? argv[i + 1] : def;
     };
+    let scratchArg = getArg("--scratch", null);
+    /* Only a directory THIS run created is ours to remove -- a caller-supplied --scratch is the
+       caller's, never auto-deleted here. */
+    let autoScratch = scratchArg === null;
     let opts = {
         cases: +getArg("--cases", 60),
         calls: +getArg("--calls", 80),
         seed: +getArg("--seed", 0xFAB0FAB0),
-        scratch: getArg("--scratch", fs.mkdtempSync(path.join(os.tmpdir(), "vaxcontrol-")))
+        scratch: scratchArg || fs.mkdtempSync(path.join(os.tmpdir(), "vaxcontrol-"))
     };
-    let simh = findSimh(getArg("--simh", null));
-    let fSelfCheck = argv.indexOf("--selfcheck") >= 0;
+    let simh, fSelfCheck = argv.indexOf("--selfcheck") >= 0;
+    let keepScratch = false;
 
-    console.log(`VAX control-flow differential -- SIMH: ${simh}`);
-    console.log(`seed=0x${hex(opts.seed)} scratch=${opts.scratch}\n`);
+    /* Every exit path -- --selfcheck (pass or fail), the differential's own deliberate
+       evidence-preserving FAIL (see the "kept in" message below, unchanged), and an unexpected
+       thrown error -- runs through this try/finally.  HANDOFF.md pcjsvax-bd1: an earlier revision
+       called process.exit() directly from the --selfcheck branch and let uncaught exceptions
+       reach the bottom .catch(), and NEITHER path ever removed opts.scratch -- an auto-created
+       temp dir this file leaked unconditionally outside its one documented retention case. */
+    try {
+        simh = findSimh(getArg("--simh", null));
 
-    if (fSelfCheck) {
-        let ok = await selfCheck(simh, opts);
-        console.log(ok ? "\nSELF-CHECK PASS: every injected defect was detected."
-                       : "\nSELF-CHECK FAIL: at least one injected defect went undetected.");
-        process.exit(ok ? 0 : 1);
-    }
+        console.log(`VAX control-flow differential -- SIMH: ${simh}`);
+        console.log(`seed=0x${hex(opts.seed)} scratch=${opts.scratch}\n`);
 
-    let executeControl = await loadMutant(null, opts.scratch);
-    let problems = [];
+        if (fSelfCheck) {
+            let ok = await selfCheck(simh, opts);
+            console.log(ok ? "\nSELF-CHECK PASS: every injected defect was detected."
+                           : "\nSELF-CHECK FAIL: at least one injected defect went undetected.");
+            if (!ok) process.exitCode = 1;
+            return;
+        }
+
+        let executeControl = await loadMutant(null, opts.scratch);
+        let problems = [];
 
     /* ------------------------------------------------------------------ single-instruction */
     let single = phaseSingle(simh, executeControl, opts);
@@ -1399,13 +1424,17 @@ async function main()
         console.log("FAIL");
         for (let p of problems) console.log("  " + p);
         console.log(`\nreproduce with --seed ${opts.seed}; SIMH scripts kept in ${opts.scratch}`);
-        process.exit(1);
+        process.exitCode = 1;
+        keepScratch = true;                 // deliberate: this FAIL keeps scratch for reproduction
+        return;
     }
     console.log("PASS: branch/jump/call/stack execution is indistinguishable from SIMH across every phase.");
-    fs.rmSync(opts.scratch, {recursive: true, force: true});
+    } catch (e) {
+        console.error("ERROR: " + (e && e.stack || e));
+        process.exitCode = 2;
+    } finally {
+        if (autoScratch && !keepScratch) fs.rmSync(opts.scratch, {recursive: true, force: true});
+    }
 }
 
-main().catch((e) => {
-    console.error("ERROR: " + (e && e.stack || e));
-    process.exit(2);
-});
+main();

@@ -1076,6 +1076,10 @@ function main()
     if (nCases < MIN_CASES_FLOOR) {
         console.log("\nFAILED: --cases %d is below the enforced floor (%d); this run would under-cover " +
             "and must not be allowed to pass.", nCases, MIN_CASES_FLOOR);
+        /* Scratch was just created above and nothing has used it yet -- remove it here rather than
+           process.exit()-ing past the try/finally below, which only guards the run that follows
+           (HANDOFF.md pcjsvax-bd1). */
+        fs.rmSync(scratch, {recursive: true, force: true});
         process.exit(1);
     }
 

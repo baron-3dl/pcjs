@@ -1504,6 +1504,20 @@ function main()
         trace: getArg("--trace", null),
         scratch: fs.mkdtempSync(path.join(os.tmpdir(), "cpudiff-"))
     };
+    /* Every exit path -- the args-floor FAIL, --dump-case, --selfcheck, a normal FAIL/PASS, or an
+       uncaught exception -- runs through this try/finally, so scratch is always removed.
+       HANDOFF.md pcjsvax-bd1: this file had NO rmSync of opts.scratch anywhere, on any path --
+       every invocation leaked, which is why 29 abandoned /tmp/cpudiff-* directories were found on
+       this disk. */
+    try {
+        return mainInner(opts);
+    } finally {
+        fs.rmSync(opts.scratch, {recursive: true, force: true});
+    }
+}
+
+function mainInner(opts)
+{
     let fSelfcheck = process.argv.indexOf("--selfcheck") >= 0;
     let fSkipEhkaa = process.argv.indexOf("--skip-ehkaa") >= 0;
     let simh = findSimh(getArg("--simh", null));
@@ -1513,7 +1527,8 @@ function main()
        minutes on EHKAA first.  The floors below do not scale down with --cases. */
     if (opts.cases < MIN_CASES) {
         console.error(`--cases ${opts.cases} is below the floor of ${MIN_CASES}; the coverage floors do not scale down.`);
-        process.exit(1);
+        process.exitCode = 1;
+        return;
     }
 
     console.log(`SIMH: ${simh}`);
@@ -1717,7 +1732,8 @@ function report(problems)
     if (problems.length) {
         console.error("\nFAILURES:");
         for (let p of problems) console.error("  " + p);
-        process.exit(1);
+        process.exitCode = 1;
+        return;
     }
     console.log("\nOK");
 }

@@ -865,9 +865,10 @@ function selfcheck()
     if (survived.length) {
         console.error("\nFAILURES:");
         for (let n of survived) console.error(`  SELFCHECK: mutation "${n}" was NOT caught -- that is a coverage hole, not a pass`);
-        process.exit(1);
+        return false;
     }
     console.log("\nOK");
+    return true;
 }
 
 /* ------------------------------------------------------------------------------------------- *
@@ -876,33 +877,49 @@ function selfcheck()
 
 function getArg(name, dflt) { let i = process.argv.indexOf(name); return (i >= 0 && i + 1 < process.argv.length) ? process.argv[i + 1] : dflt; }
 
+function cleanupScratch(scratch)
+{
+    try { fs.rmSync(scratch, {recursive: true, force: true}); }
+    catch (e) { console.log(`  (could not remove scratch ${scratch}: ${e.message})`); }
+}
+
 function main()
 {
     let simh = findSimh(getArg("--simh", null));
     let scratch = fs.mkdtempSync(path.join(os.tmpdir(), "consoledif-"));
     console.log(`consoledif.js: simh=${simh} scratch=${scratch}`);
 
-    if (process.argv.indexOf("--selfcheck") >= 0) {
-        selfcheck();
-        return;
+    /* Every exit path -- success, an assertion FAIL, or a --selfcheck failure -- runs through
+       this try/finally, so scratch is always removed.  selfcheck() returns a boolean rather than
+       calling process.exit() itself, the same shape conoutdiff.js's selfcheck() uses for the same
+       reason (HANDOFF.md pcjsvax-bd1): an earlier revision of THIS file never removed scratch on
+       ANY path -- not success, not failure -- because there was no rmSync() call anywhere in main(). */
+    try {
+        if (process.argv.indexOf("--selfcheck") >= 0) {
+            if (!selfcheck()) process.exitCode = 1;
+            return;
+        }
+
+        let problems = [];
+        console.log("\n=== REAL phase ===");
+        for (let p of phaseReal(simh, scratch)) problems.push(p);
+
+        console.log("\n=== DEVTRACE phase (patch 0006) ===");
+        for (let p of phaseDevtrace(simh, scratch)) problems.push(p);
+
+        console.log("\n=== INTERRUPT phase ===");
+        for (let p of phaseInterrupt(simh, scratch)) problems.push(p);
+
+        if (problems.length) {
+            console.error(`\nFAILED (${problems.length} problem(s)):`);
+            for (let p of problems) console.error("  - " + p);
+            process.exitCode = 1;
+            return;
+        }
+        console.log("\nPASSED.");
+    } finally {
+        cleanupScratch(scratch);
     }
-
-    let problems = [];
-    console.log("\n=== REAL phase ===");
-    for (let p of phaseReal(simh, scratch)) problems.push(p);
-
-    console.log("\n=== DEVTRACE phase (patch 0006) ===");
-    for (let p of phaseDevtrace(simh, scratch)) problems.push(p);
-
-    console.log("\n=== INTERRUPT phase ===");
-    for (let p of phaseInterrupt(simh, scratch)) problems.push(p);
-
-    if (problems.length) {
-        console.error(`\nFAILED (${problems.length} problem(s)):`);
-        for (let p of problems) console.error("  - " + p);
-        process.exit(1);
-    }
-    console.log("\nPASSED.");
 }
 
 main();

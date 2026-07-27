@@ -881,81 +881,91 @@ function main()
     let scratch = fs.mkdtempSync(path.join(os.tmpdir(), "cdgdiff-"));
     let opts = {scratch};
 
-    let errors = [];
-    if (nCacr < CACR_CASES_FLOOR) {
-        errors.push(`--cacr-cases ${nCacr} is below the enforced floor of ${CACR_CASES_FLOOR}`);
-    }
-    if (nAlias < ALIAS_CASES_FLOOR) {
-        errors.push(`--alias-cases ${nAlias} is below the enforced floor of ${ALIAS_CASES_FLOOR}`);
-    }
-    if (errors.length) {
-        for (let e of errors) console.log("FAILED: " + e);
-        process.exit(1);
-    }
+    /* Every exit path -- an undersized-args FAIL, an uncaught exception from buildCases/
+       runCasesSimh/grade, a --selfcheck failure, or a clean PASS -- runs through this
+       try/finally, so scratch is always removed (HANDOFF.md pcjsvax-bd1: an earlier revision
+       left scratch behind on the args-floor exit and on any thrown exception, because
+       process.exit(1) and an unguarded throw both skip past the rmSync() that previously ran
+       only on the success path). */
+    try {
+        let errors = [];
+        if (nCacr < CACR_CASES_FLOOR) {
+            errors.push(`--cacr-cases ${nCacr} is below the enforced floor of ${CACR_CASES_FLOOR}`);
+        }
+        if (nAlias < ALIAS_CASES_FLOOR) {
+            errors.push(`--alias-cases ${nAlias} is below the enforced floor of ${ALIAS_CASES_FLOOR}`);
+        }
+        if (errors.length) {
+            for (let e of errors) console.log("FAILED: " + e);
+            process.exitCode = 1;
+            return;
+        }
 
-    console.log("cdgdiff: SIMH = %s", simh);
-    console.log("cdgdiff: seed = 0x%s, cacr-cases = %d, alias-cases = %d", hex(seed), nCacr, nAlias);
+        console.log("cdgdiff: SIMH = %s", simh);
+        console.log("cdgdiff: seed = 0x%s, cacr-cases = %d, alias-cases = %d", hex(seed), nCacr, nAlias);
 
-    let {cases, meta} = buildCases(seed, nAlias, nCacr);
-    console.log("cdgdiff: %d cases (alias %d, nonalias %d, cacr %d, merge %d, backed %d)",
-        cases.length, meta.alias.length, meta.nonalias.length, meta.cacr.length,
-        meta.merge.length, meta.backed.length);
+        let {cases, meta} = buildCases(seed, nAlias, nCacr);
+        console.log("cdgdiff: %d cases (alias %d, nonalias %d, cacr %d, merge %d, backed %d)",
+            cases.length, meta.alias.length, meta.nonalias.length, meta.cacr.length,
+            meta.merge.length, meta.backed.length);
 
-    let simhResults = runCasesSimh(simh, opts, cases);
-    sampleHeap();
+        let simhResults = runCasesSimh(simh, opts, cases);
+        sampleHeap();
 
-    let problems = grade(cases, meta, simhResults);
-    problems.push(...coverage(meta, simhResults));
+        let problems = grade(cases, meta, simhResults);
+        problems.push(...coverage(meta, simhResults));
 
-    console.log("\nALIAS  (%d pairs + %d non-pairs): %s", meta.alias.length, meta.nonalias.length,
-        problems.some((p) => /ALIAS|NONALIAS/.test(p)) ? "FAIL" : "MATCH");
-    console.log("CACR   (%d cases, all 4 lanes both seeds): %s", meta.cacr.length,
-        problems.some((p) => /CACR/.test(p)) ? "FAIL" : "MATCH");
-    console.log("MERGE  (%d cases, byte lanes 0-3 + aligned word lanes): %s", meta.merge.length,
-        problems.some((p) => /MERGE/.test(p)) ? "FAIL" : "MATCH");
-    console.log("BACKED (%d addresses across the 64MB range): %s", meta.backed.length,
-        problems.some((p) => /BACKED/.test(p)) ? "FAIL" : "MATCH");
+        console.log("\nALIAS  (%d pairs + %d non-pairs): %s", meta.alias.length, meta.nonalias.length,
+            problems.some((p) => /ALIAS|NONALIAS/.test(p)) ? "FAIL" : "MATCH");
+        console.log("CACR   (%d cases, all 4 lanes both seeds): %s", meta.cacr.length,
+            problems.some((p) => /CACR/.test(p)) ? "FAIL" : "MATCH");
+        console.log("MERGE  (%d cases, byte lanes 0-3 + aligned word lanes): %s", meta.merge.length,
+            problems.some((p) => /MERGE/.test(p)) ? "FAIL" : "MATCH");
+        console.log("BACKED (%d addresses across the 64MB range): %s", meta.backed.length,
+            problems.some((p) => /BACKED/.test(p)) ? "FAIL" : "MATCH");
 
-    if (fSelfCheck) {
-        console.log("\nSelf-check: every mutation of the SHIPPED path must be caught.");
-        for (let name of Object.keys(MUTATIONS)) {
-            let undo = null, caught = false, why = "";
-            try {
-                undo = MUTATIONS[name]();
-                let p = grade(cases, meta, simhResults);
-                caught = p.length > 0;
-                why = caught ? p[0].split("\n")[0].slice(0, 120) : "NO PROBLEMS REPORTED";
-            } catch (e) {
-                caught = true;
-                why = "threw: " + e.message.split("\n")[0];
-                if (/precondition failed/.test(e.message)) {
-                    caught = false;                 // a no-op mutation proves NOTHING -- see MUTATIONS
+        if (fSelfCheck) {
+            console.log("\nSelf-check: every mutation of the SHIPPED path must be caught.");
+            for (let name of Object.keys(MUTATIONS)) {
+                let undo = null, caught = false, why = "";
+                try {
+                    undo = MUTATIONS[name]();
+                    let p = grade(cases, meta, simhResults);
+                    caught = p.length > 0;
+                    why = caught ? p[0].split("\n")[0].slice(0, 120) : "NO PROBLEMS REPORTED";
+                } catch (e) {
+                    caught = true;
+                    why = "threw: " + e.message.split("\n")[0];
+                    if (/precondition failed/.test(e.message)) {
+                        caught = false;                 // a no-op mutation proves NOTHING -- see MUTATIONS
+                    }
+                } finally {
+                    if (undo) undo();
                 }
-            } finally {
-                if (undo) undo();
+                console.log("  %s %s (%s)", name.padEnd(26), caught ? "CAUGHT" : "SURVIVED", why);
+                if (!caught) problems.push(`SELFCHECK: mutation '${name}' was not caught -- ${why}`);
             }
-            console.log("  %s %s (%s)", name.padEnd(26), caught ? "CAUGHT" : "SURVIVED", why);
-            if (!caught) problems.push(`SELFCHECK: mutation '${name}' was not caught -- ${why}`);
+            /* The un-mutated tree must still be clean after all that restoring. */
+            let after = grade(cases, meta, simhResults);
+            if (after.length) {
+                problems.push(`SELFCHECK: the tree did not restore cleanly -- ${after[0]}`);
+            }
         }
-        /* The un-mutated tree must still be clean after all that restoring. */
-        let after = grade(cases, meta, simhResults);
-        if (after.length) {
-            problems.push(`SELFCHECK: the tree did not restore cleanly -- ${after[0]}`);
+
+        console.log("\npeak heap: %sMB (bound %dMB)", (PEAK_HEAP / (1024 * 1024)).toFixed(1),
+            MAX_HEAP_BYTES / (1024 * 1024));
+        if (problems.length) {
+            console.log("\nFAILED (%d):", problems.length);
+            for (let p of problems.slice(0, 60)) console.log("  " + p);
+            if (problems.length > 60) console.log("  ... and %d more", problems.length - 60);
+            process.exitCode = 1;
+            return;
         }
+        console.log("\nPASS: CDG is indistinguishable from SIMH over %d cases (aliasing, the CACR " +
+            "diagnostic-parity side effect, the byte/word write merge, and end-to-end backing).", cases.length);
+    } finally {
+        fs.rmSync(scratch, {recursive: true, force: true});
     }
-
-    fs.rmSync(scratch, {recursive: true, force: true});
-
-    console.log("\npeak heap: %sMB (bound %dMB)", (PEAK_HEAP / (1024 * 1024)).toFixed(1),
-        MAX_HEAP_BYTES / (1024 * 1024));
-    if (problems.length) {
-        console.log("\nFAILED (%d):", problems.length);
-        for (let p of problems.slice(0, 60)) console.log("  " + p);
-        if (problems.length > 60) console.log("  ... and %d more", problems.length - 60);
-        process.exit(1);
-    }
-    console.log("\nPASS: CDG is indistinguishable from SIMH over %d cases (aliasing, the CACR " +
-        "diagnostic-parity side effect, the byte/word write merge, and end-to-end backing).", cases.length);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) == path.resolve(fileURLToPath(import.meta.url))) {

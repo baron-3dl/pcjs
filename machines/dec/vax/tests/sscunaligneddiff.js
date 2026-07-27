@@ -653,6 +653,12 @@ function main()
 
     let allFailures = [];
 
+    /* Wraps the run so an uncaught exception (e.g. from phaseFixed()/selfcheck()) still removes
+       scratch -- the pre-existing cleanup below already ran on every NORMAL exit path (opt-in
+       retained only via VAX_SSCUDIFF_KEEP), but an exception thrown before reaching it bypassed
+       that line entirely (HANDOFF.md pcjsvax-bd1). */
+    try {
+
     console.log("PHASE 1 (fixed matrix)");
     let fixedFailures = phaseFixed(bin, scratch);
     allFailures = allFailures.concat(fixedFailures);
@@ -674,7 +680,9 @@ function main()
     console.log("\nPEAK HEAP");
     checkPeakHeap(allFailures);
 
-    if (!process.env["VAX_SSCUDIFF_KEEP"]) fs.rmSync(scratch, {recursive: true, force: true});
+    } finally {
+        if (!process.env["VAX_SSCUDIFF_KEEP"]) fs.rmSync(scratch, {recursive: true, force: true});
+    }
 
     if (allFailures.length) {
         console.log(`\nFAIL (${allFailures.length} failures)`);

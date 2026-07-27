@@ -1645,12 +1645,25 @@ async function main()
     let simhBin = findSimh(getArg("--simh", null));
     let fSelfCheck = argv.indexOf("--selfcheck") >= 0;
     let fSkipEhkaa = argv.indexOf("--skip-ehkaa") >= 0;
-    let scratch = getArg("--scratch", fs.mkdtempSync(path.join(os.tmpdir(), "vaxmmu-")));
+    let scratchArg = getArg("--scratch", null);
+    /* Only a directory THIS run created is ours to remove -- a caller-supplied --scratch is the
+       caller's, never auto-deleted here.  `||`, not a default *argument*, so mkdtempSync() runs
+       only when --scratch was NOT given -- the previous `getArg("--scratch", fs.mkdtempSync(...))`
+       evaluated its default eagerly on every call, so passing --scratch explicitly still created
+       and then orphaned one throwaway vaxmmu-* directory per invocation (HANDOFF.md pcjsvax-bd1). */
+    let autoScratch = scratchArg === null;
+    let scratch = scratchArg || fs.mkdtempSync(path.join(os.tmpdir(), "vaxmmu-"));
     fs.mkdirSync(scratch, {recursive: true});
 
     console.log("VAX MMU differential test");
     console.log("  SIMH binary: %s", simhBin);
     console.log("  ops=%d seed=0x%s scratch=%s", nOps, hex(seed), scratch);
+
+    /* Every exit path -- requireMmuSupport() throwing, a FAIL, a PASS, or any other thrown
+       exception -- runs through this try/finally, so scratch is always removed.  HANDOFF.md
+       pcjsvax-bd1: this file had NO rmSync of scratch anywhere, on any path -- 37 abandoned
+       /tmp/vaxmmu-* directories were found on this disk. */
+    try {
     requireMmuSupport(simhBin, scratch);
 
     let errors = [];
@@ -1769,14 +1782,18 @@ async function main()
     if (errors.length) {
         console.log("\nFAILED (%d):", errors.length);
         for (let f of errors) console.log("  " + f);
-        process.exit(1);
+        process.exitCode = 1;
+        return;
     }
     console.log("\nPASS: MMUVAX is indistinguishable from SIMH over %d randomized operations%s.",
         ex.stats.nOps, eh? " and " + eh.stats.nOps + " EHKAA operations" : "");
+    } finally {
+        if (autoScratch) fs.rmSync(scratch, {recursive: true, force: true});
+    }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) == path.resolve(fileURLToPath(import.meta.url))) {
-    main().catch((e) => { console.error(e); process.exit(1); });
+    main().catch((e) => { console.error(e); process.exitCode = 1; });
 }
 
 export {

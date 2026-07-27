@@ -1402,6 +1402,11 @@ function main()
     let allFailures = [];
     let reportedNotReached = [];
 
+    /* Every exit path -- success, an assertion/coverage FAIL, or an uncaught exception from
+       proveDeterminism()/selfcheck() -- runs through this try/finally, so scratch is always
+       removed (HANDOFF.md pcjsvax-bd1: this file had no rmSync of scratch anywhere, on any path). */
+    try {
+
     console.log("PHASE 1 (fixed matrix)");
     try {
         let fixedFailures = phaseFixed(bin, scratch);
@@ -1442,6 +1447,10 @@ function main()
         console.log("\nCASES THAT DID NOT REACH COMPARISON:");
         for (let n of reportedNotReached) console.log(`  ${n}`);
         allFailures.push(`${reportedNotReached.length} case(s) never reached comparison`);
+    }
+
+    } finally {
+        fs.rmSync(scratch, {recursive: true, force: true});
     }
 
     if (allFailures.length) {

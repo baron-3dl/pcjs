@@ -1090,6 +1090,12 @@ function main()
 
     let allFailures = [];
 
+    /* Every exit path -- success, an assertion/coverage FAIL, or an uncaught exception from any
+       phase -- runs through this try/finally, so scratch is always removed (HANDOFF.md
+       pcjsvax-bd1: this file had no rmSync of scratch anywhere, on any path -- 33 abandoned
+       /tmp/tmrdiff-* dirs found). */
+    try {
+
     console.log("PHASE 1 (fixed matrix)");
     let fixedFailures = phaseFixed(bin, scratch);
     allFailures = allFailures.concat(fixedFailures);
@@ -1116,6 +1122,10 @@ function main()
         let sc = selfcheck();
         for (let r of sc.results) console.log(`  ${r.name}: ${r.caught ? "CAUGHT" : "SURVIVED"}`);
         if (!sc.allCaught) allFailures.push("selfcheck: one or more mutations SURVIVED");
+    }
+
+    } finally {
+        fs.rmSync(scratch, {recursive: true, force: true});
     }
 
     if (allFailures.length) {

@@ -1766,30 +1766,46 @@ async function main()
         let i = argv.indexOf(name);
         return i >= 0 && i + 1 < argv.length ? argv[i + 1] : def;
     };
+    let scratchArg = getArg("--scratch", null);
+    /* Only a directory THIS run created is ours to remove -- a caller-supplied --scratch is the
+       caller's, never auto-deleted here.  `||`, not a default *argument*, so mkdtempSync() runs
+       only when --scratch was NOT given: the previous `getArg("--scratch", fs.mkdtempSync(...))`
+       evaluated its default eagerly on every call, so passing --scratch explicitly still created
+       and then orphaned one throwaway vaxdecode-* directory per invocation (HANDOFF.md
+       pcjsvax-bd1). */
+    let autoScratch = scratchArg === null;
     let opts = {
         cases: +getArg("--cases", 4000),
         faults: +getArg("--faults", 600),
         seed: +getArg("--seed", 0xC0FFEE),
         trace: getArg("--trace", null),
-        scratch: getArg("--scratch", fs.mkdtempSync(path.join(os.tmpdir(), "vaxdecode-"))),
+        scratch: scratchArg || fs.mkdtempSync(path.join(os.tmpdir(), "vaxdecode-")),
         ehkaaExe: getArg("--ehkaa", path.join(vaxRepo(), "open-simh/VAX/tests/ehkaa.exe"))
     };
     let simh = findSimh(getArg("--simh", null));
     let fSkipEHKAA = argv.indexOf("--skip-ehkaa") >= 0;
     let fSelfCheck = argv.indexOf("--selfcheck") >= 0;
+    let keepScratch = false;
 
     console.log(`VAX decode differential -- SIMH: ${simh}`);
     console.log(`seed=0x${hex(opts.seed)} scratch=${opts.scratch}\n`);
 
-    if (fSelfCheck) {
-        let ok = await selfCheck(simh, opts);
-        console.log(ok ? "\nSELF-CHECK PASS: every injected defect was detected."
-                       : "\nSELF-CHECK FAIL: at least one injected defect went undetected.");
-        process.exit(ok ? 0 : 1);
-    }
+    /* Every exit path -- --selfcheck (pass or fail), the differential's own deliberate
+       evidence-preserving FAIL (see the "kept in" message below, unchanged), and an unexpected
+       thrown error -- runs through this try/finally.  HANDOFF.md pcjsvax-bd1: an earlier revision
+       called process.exit() directly from the --selfcheck branch and let uncaught exceptions
+       reach the bottom .catch(), and NEITHER path ever removed opts.scratch. */
+    try {
+        if (fSelfCheck) {
+            let ok = await selfCheck(simh, opts);
+            console.log(ok ? "\nSELF-CHECK PASS: every injected defect was detected."
+                           : "\nSELF-CHECK FAIL: at least one injected defect went undetected.");
+            if (!ok) process.exitCode = 1;
+            return;
+        }
 
-    let VAXDecoder = await loadMutant(null, opts.scratch);
-    let problems = [];
+        let VAXDecoder = await loadMutant(null, opts.scratch);
+        let problems = [];
 
     /* ---------------------------------------------------------------- EHKAA */
     let ehkaa = null;
@@ -1880,13 +1896,17 @@ async function main()
         console.log("FAIL");
         for (let p of problems) console.log("  " + p);
         console.log(`\nreproduce with --seed ${opts.seed}; SIMH scripts and traces kept in ${opts.scratch}`);
-        process.exit(1);
+        process.exitCode = 1;
+        keepScratch = true;                 // deliberate: this FAIL keeps scratch for reproduction
+        return;
     }
     console.log("PASS: decode and operand resolution are indistinguishable from SIMH across every phase.");
-    fs.rmSync(opts.scratch, {recursive: true, force: true});
+    } catch (e) {
+        console.error("ERROR: " + (e && e.stack || e));
+        process.exitCode = 2;
+    } finally {
+        if (autoScratch && !keepScratch) fs.rmSync(opts.scratch, {recursive: true, force: true});
+    }
 }
 
-main().catch((e) => {
-    console.error("ERROR: " + (e && e.stack || e));
-    process.exit(2);
-});
+main();
