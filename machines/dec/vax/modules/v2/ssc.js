@@ -83,43 +83,66 @@
  * divergence a LATER boundary advance would hit blind.
  *
  * ============================================================================
- * WHAT IS NOT MODELLED: unaligned access that spans TWO adjacent register-space longwords
+ * UNALIGNED ACCESS SPANNING TWO ADJACENT REGISTER-SPACE LONGWORDS -- pcjsvax-855, CORRECTED PREMISE
  * ============================================================================
- * CORRECTED (pcjsvax-320 veracity re-dispatch) -- the previous version of this section claimed
- * "no code path, on real SIMH or here, stitches two adjacent registers together for an unaligned
- * reference."  That is FALSE for every case except a byte access and a word access at offset 1,
- * and it was recorded here as a premise, not measured -- exactly the failure mode HANDOFF.md's §7
- * exists to name.  MEASURED directly against the real oracle (SSC+0x0C = 0, SSC+0x10 = 0x5A5A5A5A):
+ * CORRECTED TWICE.  First (pcjsvax-320 veracity re-dispatch): an earlier version of this section
+ * claimed "no code path, on real SIMH or here, stitches two adjacent registers together for an
+ * unaligned reference."  That is FALSE for every case except a byte access and a word access at
+ * offset 1.  MEASURED directly against the real oracle (SSC+0x0C = 0, SSC+0x10 = 0x5A5A5A5A):
  *
  *     MOVB @#2014000F        -> one longword only (register 0x0C)      claim HOLDS for bytes
  *     MOVW @#2014000F        -> 0x5A00                                 STITCHED across 0x0C/0x10
  *     MOVL @#2014000D        -> 0x5A000000                             STITCHED across 0x0C/0x10
  *
- * vax_mmu.h's `Read()` (the dispatcher every actual instruction goes through, NOT ReadB/ReadW/ReadL
- * directly) routes a WORD at an offset congruent to 3 mod 4, and ANY unaligned LONGWORD, through
- * `wl = ReadU(pa, ...)` and `wh = ReadU(pa1, ...)` where `pa1 = ((pa + 4) & PAMASK) & ~03` -- TWO
- * INDEPENDENT `ReadRegU()`/`ssc_rd()` calls against TWO DIFFERENT `rg` values, then stitched exactly
- * as memory.js's readWordMemory()/readLongMemory() stitch two RAM longwords.  ReadB/ReadW/ReadL
- * (single-longword, no stitch) are the ALIGNED fast path only; `Read()` picks between them and the
- * unaligned/stitching path by alignment, the same branch bus.js's getWord()/getLong() already make
- * for ordinary RAM.
+ * Second, and this is the one that matters for THIS file (pcjsvax-855 itself): the first correction
+ * assumed, without checking, that the stitch above therefore belonged HERE, in ssc.js's own
+ * readWord()/readLong()/writeWord()/writeLong() -- a plausible-sounding but UNVERIFIED claim about
+ * WHERE in this port the C source's Read()/Write() shape had to live, exactly the class of error
+ * HANDOFF.md's §7 exists to name.  It does not belong here.  mmu.js's `readData()`/`writeData()`
+ * (an exact, already-shipped port of vax_mmu.h's `Read()`/`Write()`, mmu.js ~line 630/705) are THE
+ * canonical entry point every operand memory access in this engine goes through -- decode.js's own
+ * interface comment calls `readData()` "identical to the decoder's machine interface", and grepping
+ * this whole module tree confirms it: NOTHING outside mmu.js and bus.js itself ever calls
+ * `bus.getWord()`/`getLong()`/`setWord()`/`setLong()` directly.  `readData()`/`writeData()` already
+ * do EXACTLY the alignment branch vax_mmu.h's `Read()`/`Write()` do -- and for every unaligned
+ * fragment (word bo=1, word bo=3, any unaligned longword) they route through `readU()`/`writeU()`
+ * (mmu.js ~line 927/1016), which computes `let addr = pa & ~0x03` FIRST and only ever calls
+ * `this.bus.getLong(addr)`/`setLong(addr, ...)` -- ALIGNED -- doing the shift/mask/merge themselves,
+ * ENTIRELY WITHIN mmu.js, before this file's own `readReg()`/`writeReg()` switch ever runs.  So:
  *
- * So the accurate claim is: BYTE accesses, and WORD accesses at offset 0/1/2 (i.e. not crossing a
- * longword boundary), stay within ONE register, exactly as readByte()/readWord() below compute them
- * -- but a WORD at offset 3 or an UNALIGNED LONGWORD genuinely reads (or writes) two ADJACENT
- * register-space longwords and combines them, which readWord()/readLong()/writeWord()/writeLong()
- * below do NOT do (each only ever touches the ONE register `addr`'s rg resolves to).
+ *   - ssc.js's readWord()/writeWord() are called by the bus ONLY at bo=0 or bo=2 (mmu.js's readW()/
+ *     writeW() are reached ONLY from readData()'s/writeData()'s ALREADY-ALIGNED fast path).
+ *   - ssc.js's readLong()/writeLong() are called by the bus ONLY at bo=0, for the SAME reason, PLUS
+ *     as the "read/write the containing aligned longword" primitive `readU()`/`writeU()` use for
+ *     EVERY unaligned fragment -- always at an aligned address, never at the original unaligned one.
  *
- * This is NOT mis-graded by anything in scope today: the only address this item's decode ever sees
- * exercised is the aligned base register (tests/romdiff.js), and mchkdiff.js/busdiff.js never probe
- * inside SSC_BASE at all -- see the file header's "WHAT HAPPENS TO EVERYTHING ELSE" section. It IS
- * a real gap in the MODEL for whichever later item decodes enough adjacent SSC registers that a
- * cross-longword unaligned reference becomes reachable; that item must extend readWord()/readLong()
- * /writeWord()/writeLong() to do the two-lookup stitch above (or reproduce Read()/Write()'s wl/wh
- * split exactly, including which side's fault wins if one of the two longwords is undecoded -- not
- * measured here) rather than inherit this file's now-corrected claim that no register ever needs it.
+ * MEASURED, not merely reasoned from the two facts above: an earlier revision of this file added a
+ * two-register stitch directly to readWord()/readLong()/writeWord()/writeLong() (bo=1/bo=3
+ * branches), mirroring vax_mmu.h's shape literally.  tests/sscunaligneddiff.js exercises the exact
+ * MOVW/MOVL sequences the item's own filing names, through REAL `cpu.stepCPU()` execution (not a
+ * direct unit-level call to these methods) -- and it PASSED, matching the real oracle, with those
+ * branches monkeypatched back to their PRE-fix, single-register form.  Mutating code that a real
+ * instruction path never reaches cannot change that path's observable output; that null result is
+ * the proof, not an assumption, that the branches were dead code.  They were removed rather than
+ * shipped: unreachable code graded by nothing but a direct, non-oracle unit probe is exactly the
+ * "mutation must perturb the shipped path" antipattern HANDOFF.md's rule 11 warns about, aimed at
+ * this file's OWN structure instead of at a test.
  *
- * TRACKED AS pcjsvax-855 -- read that item before decoding any SSC register adjacent to another.
+ * So the two-register stitch the item asked for IS modelled, correctly, end to end -- it always
+ * was, via mmu.js, which this item does not need to (and does not) touch.  tests/sscunaligneddiff.js
+ * is the regression this item actually needed: a real-CPU-instruction, oracle-graded case proving
+ * that already-correct behavior for THIS device's registers specifically, since (per this item's own
+ * filing) nothing before it ever drove a cross-longword unaligned SSC reference.  The SSCBASE+
+ * SSCSIZE boundary the item also raised ("which side's fault wins if one longword is undecoded") is
+ * likewise ALREADY correct at the layer that actually owns it: `readU(pa1)`'s `bus.getLong(pa1 & ~3)`
+ * lands in makeSscController()'s own `inRange()`/`nvrInRange()` fallback (this file's existing
+ * `readLongNone`/`writeLongNone` convention) exactly as any other undecoded address does -- no new
+ * code, here or anywhere, was needed for that either.  tests/sscunaligneddiff.js's `boundary_fault`
+ * case grades it directly against the oracle (a genuine machine check, confirmed live) as a
+ * regression, not a claim.
+ *
+ * KNOWN_UNIMPLEMENTED_READ/_WRITE are UNCHANGED by this item -- no entry added or removed (see
+ * those constants' own asymmetric-drift-risk warning).
  */
 
 import { VAX } from "./defines.js";
@@ -639,7 +662,16 @@ export default class SSCVAX {
      * `addr` is the PHYSICAL address (not block-relative), already known by the caller to lie
      * within [SSC_BASE, SSC_BASE + SSC_LENGTH) -- makeSscController() below is what enforces that;
      * these three assume it.  `rg` truncates any misalignment to the containing register, exactly
-     * as vax_sysdev.c's ssc_rd()/ssc_wr() do (see the file header's "WHAT IS NOT MODELLED" note).
+     * as vax_sysdev.c's ssc_rd()/ssc_wr() do.
+     *
+     * pcjsvax-855: these three are called ONLY with an ALREADY-ALIGNED `addr` (word: bo 0 or 2;
+     * longword: bo 0) -- mmu.js's readData()/readU() (an exact port of vax_mmu.h's Read()) resolve
+     * EVERY unaligned CPU-level access (word bo=1/3, any unaligned longword) into a SEQUENCE of
+     * aligned bus.getLong() calls, extracting/merging the sub-longword fragment entirely within
+     * mmu.js, BEFORE this switch ever runs -- see the file header's "UNALIGNED ACCESS SPANNING TWO
+     * ADJACENT REGISTER-SPACE LONGWORDS" section for the measurement that proved this (an earlier
+     * revision added a two-register stitch here; a real-CPU-instruction differential showed it was
+     * unreachable dead code and it was removed rather than shipped).
      *
      * @this {SSCVAX}
      * @param {number} addr
@@ -677,6 +709,10 @@ export default class SSCVAX {
      * before handing the FULL merged longword to writeReg(), which is exactly what lets a byte
      * write to a W1C register (there are none decoded here yet, but the next one added inherits
      * this correctly) see only the ONE byte's worth of new bits.
+     *
+     * pcjsvax-855: as with the read side above, these are called ONLY at an already-aligned `addr`
+     * -- mmu.js's writeData()/writeU() do the unaligned-fragment merge themselves, one aligned
+     * bus.setLong() at a time, before this switch ever runs.  See readLong()'s doc comment.
      *
      * @this {SSCVAX}
      * @param {number} addr
