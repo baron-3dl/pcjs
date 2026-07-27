@@ -153,10 +153,26 @@ const ORACLE_FULL_MULTIPLE = 2;
     THE FLOOR IS THE ITEM'S SCOPE BOUNDARY, NOT THE MEASUREMENT: pcjsvax-bfb owns the ROM's power-on
     output up to and including its "normal system tests" announcement, which is the 4th complete line
     the ROM writes, and explicitly does NOT own the self-test countdown that follows it (that belongs
-    to the timer items).  MEASURED at the time of writing: the two engines agree over 68 bytes and the
-    4th line ends at byte 64, so there are 4 bytes of headroom -- deliberate slack, because a floor
-    set AT the measurement is a tripwire, not a floor.  The byte count is looked up in the live
-    oracle capture, never written here (see the file header). */
+    to the timer items).  The byte count is looked up in the live oracle capture, never written here
+    (see the file header).
+
+    MEASURED WHEN THIS FILE WAS WRITTEN (pcjsvax-bfb): the two engines agreed over 68 bytes, and the
+    4th line ends at byte 64 -- 4 bytes of headroom, deliberate slack, because a floor set AT the
+    measurement is a tripwire rather than a floor.
+
+    RE-MEASURED after pcjsvax-b8a decoded the CQBIC doorbell: they now agree over the WHOLE
+    reproducible oracle prefix -- through the `40..39..…31..` countdown and into the `?53` dump the
+    oracle itself produces -- and the ROM no longer reports `?91`.  Three runs on the same host gave
+    104, 115 and 115 matching bytes, differing only because the ORACLE's reproducible prefix differed
+    (104, 295 and 167 bytes); this machine's own stream was byte-identical across all three.
+
+    THE FLOOR IS DELIBERATELY NOT RAISED TO MATCH, and that is a measurement rather than caution: the
+    5th complete line (the countdown) ends at byte 106 and the 6th at byte 108, so a floor of 5 or 6
+    lines would have FAILED the 104-byte run.  Past the first timer-paced test the oracle is
+    reproducible in CONTENT and not in LENGTH -- exactly what the file header says -- so a line floor
+    out there is an intermittent test, which is worse than no floor at all.  What holds the
+    doorbell's gain instead is tests/dbldiff.js, which grades the register itself rather than the
+    ROM's reaction to it. */
 const BANNER_MATCH_FLOOR_LINES = 4;
 
 /** ABSOLUTE peak-heap ceiling, in MB (HANDOFF.md standing rule 14).  MEASURED for the shipped

@@ -183,6 +183,15 @@ export default class BusVAX extends Component {
      * store, exactly as vax_sysdev.c's cdg_rd()/cdg_wr() do -- so there is no address in it left
      * for isReserved() to answer "reserved but undecoded" about.
      *
+     * IOPAGE_BASE IS still in this list as of pcjsvax-b8a, even though addIoPage()/cqipc.js now
+     * decode two bytes of it (the CQBIC doorbell).  That is the SSC_BASE situation, resolved the
+     * other way, and addIoPage()'s doc comment gives the measured reason: tests/mchkdiff.js and
+     * tests/cqmerrdiff.js both derive their probe pools from the array below, and cqmerrdiff's whole
+     * subject IS this range's unbacked Qbus mechanism.  So isReserved() answers "true" for the two
+     * decoded bytes as well -- the same coarse, per-RANGE answer it already gives for the SSC's
+     * decoded sub-registers, and for the same reason.  Per-address decode status is not this
+     * predicate's question and never has been.
+     *
      * NVR_BASE was MISSING from BusVAX.RESERVED until pcjsvax-446's veracity review caught the gap
      * (standing rule 7: scope lives in code, not comments -- this comment already claimed "SSC,
      * NVR" were covered while the array below did not list them).  It sits past REG_BASE's span
@@ -449,6 +458,44 @@ export default class BusVAX extends Component {
     addRegBlock(devices)
     {
         this.addMemory(VAX.PHYSMEM.REG_BASE >>> 0, VAX.PHYSMEM.REG_LENGTH, MemoryVAX.TYPE.CONTROLLER, makeRegController(devices));
+    }
+
+    /**
+     * addIoPage(devices)
+     *
+     * pcjsvax-b8a: decodes VAX.PHYSMEM.IOPAGE_BASE -- the KA655's Qbus I/O page -- for however many
+     * Qbus device windows the caller has built.  Today that is exactly ONE, cqipc.js's DBLVAX over
+     * the two bytes of the CQBIC doorbell; the ROM's read of it at instruction #2,424,717 is what
+     * `?91` was (see cqipc.js's header).
+     *
+     * IT REUSES regblock.js's makeRegController() ON PURPOSE, and the reuse is the point rather than
+     * a convenience: that dispatcher's whole contract is "answer for the sub-ranges a device claims,
+     * and fall through to MemoryVAX.readNone()/writeNone() for everything else, address by address."
+     * Falling through is what preserves this range's existing behaviour, because an unbacked I/O-page
+     * reference is NOT the register-space mechanism -- CPUStateVAX.onBusFault() routes it by ADDRESS
+     * (VAX.isQbusAddr()) to vax_io.c's ReadQb()/WriteQb() semantics: cq_merr() on both directions,
+     * a machine check on reads only, and never ssc_bto.  Nothing about that changes here; the
+     * controller sits above it and claims two bytes.
+     *
+     * THE I/O PAGE STAYS IN BusVAX.RESERVED, unlike SSC_BASE and CDG_BASE which left that array when
+     * they were decoded.  The precedent is deliberately NOT followed, for a reason that is measurable
+     * rather than stylistic: 2 of this range's 8192 bytes are decoded, and TWO instruments derive
+     * their probe pools from BusVAX.RESERVED -- tests/mchkdiff.js and tests/cqmerrdiff.js, the
+     * latter of which exists to grade this exact range's unbacked mechanism.  Dropping the entry
+     * would delete cqmerrdiff's own subject from its pool and leave a green gate measuring nothing,
+     * which is HANDOFF.md standing rule 13.  isReserved()'s doc comment says what that predicate does
+     * and does not answer; this range is now in the same partially-decoded state SSC_BASE was in.
+     *
+     * COST: VAX.PHYSMEM.IOPAGE_LENGTH is 0x2000, exactly BusVAX.BLOCK_SIZE, so this call constructs
+     * ONE MemoryVAX -- not the 64 addRegBlock() makes or the 8192 addCdg() makes (see that method's
+     * doc comment and HANDOFF.md standing rule 14).
+     *
+     * @this {BusVAX}
+     * @param {Array<{base: number, length: number, dev: Object}>} devices
+     */
+    addIoPage(devices)
+    {
+        this.addMemory(VAX.PHYSMEM.IOPAGE_BASE >>> 0, VAX.PHYSMEM.IOPAGE_LENGTH, MemoryVAX.TYPE.CONTROLLER, makeRegController(devices));
     }
 
     /**
@@ -972,7 +1019,7 @@ BusVAX.BLOCK_SIZE = 0x2000;
  * Physical ranges this component reserves but does NOT decode.  See isReserved().
  */
 BusVAX.RESERVED = [
-    [VAX.PHYSMEM.IOPAGE_BASE, VAX.PHYSMEM.IOPAGE_LENGTH],
+    [VAX.PHYSMEM.IOPAGE_BASE, VAX.PHYSMEM.IOPAGE_LENGTH],   // still here after pcjsvax-b8a -- see addIoPage()
     [VAX.PHYSMEM.REG_BASE,    VAX.PHYSMEM.REG_LENGTH],
     [VAX.PHYSMEM.CQM_BASE,    VAX.PHYSMEM.CQM_LENGTH],
     [VAX.PHYSMEM.NVR_BASE,    VAX.PHYSMEM.NVR_LENGTH]    // added pcjsvax-446: was a gap (see isReserved())

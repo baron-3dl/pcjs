@@ -24,14 +24,45 @@
  * `exc` reference and reads/writes THROUGH it rather than keeping a second, divergeable copy.  SCR,
  * SEAR and MBR are new state, owned here.
  *
- * SCOPE, deliberately narrow (see HANDOFF.md rule 5, "never speculatively implement"): CQIPC
- * (`cq_ipc`, the inter-processor doorbell/W1C register at CQIPCBASE, a DIFFERENT regtable entry --
- * vax_sysdev.c's regtable, not this file's range) is NOT decoded here.  DSER's write-side
- * `if (val & CQDSER_SME) cq_ipc = cq_ipc & ~CQIPC_QME;` side effect
- * on cq_ipc is therefore not reproduced; nothing in this item's boot-entry trace writes DSER with
- * CQDSER_SME set (mirroring EHKAA's own already-established pattern of exercising only a fraction
- * of a register's full bit space -- see docs/reference/ehkaa-profile.md).  If a LATER boundary shows
- * the ROM setting that bit, or touching CQIPC directly, that is the item that must add them.
+ * SCOPE: CQIPC (`cq_ipc`, the inter-processor doorbell/W1C register at CQIPCBASE, a DIFFERENT
+ * regtable entry -- vax_sysdev.c's regtable, not this file's range) is still not decoded here; it is
+ * cqipc.js's, added by pcjsvax-b8a.  What this file DOES now reproduce -- disclosed as a gap right
+ * here until a `cq_ipc` existed to reproduce it on -- is cqbic_wr()'s ONE cross-register side
+ * effect: `if (val & CQDSER_SME) cq_ipc = cq_ipc & ~CQIPC_QME;` (vax_io.c:515-516).  It is reached
+ * through `setIpc()` and `CQIPCVAX.clearQme()` below -- the register that owns the bit owns the
+ * clear, so no second copy of CQIPC_QME exists here -- and tests/dbldiff.js grades it through real
+ * instructions in both directions (SME set, and SME clear).  An instance constructed WITHOUT
+ * setIpc() (tests/qdmadiff.js builds one; a DMA never writes DSER) keeps exactly the behaviour it
+ * had before pcjsvax-b8a, and that is a wiring decision the CALLER makes, not a silent default:
+ * `hasIpc()` below lets a test state which one it is holding.
+ *
+ * ============================================================================
+ * A DISCOVERED DEFECT IN THIS FILE'S SUB-LONGWORD DSER WRITE -- MEASURED, NOT FIXED HERE
+ * ============================================================================
+ * pcjsvax-b8a found this while wiring the SME side effect above, and follows the precedent
+ * tests/cqmerrdiff.js set for pcjsvax-1be: a defect discovered outside the discovering item's fence
+ * is DISCLOSED and FILED, never silently absorbed and never silently fixed (HANDOFF.md rule 7).
+ *
+ * writeWord()/writeByte() below read-modify-MERGE the written lane against the register's current
+ * contents and hand the merged longword to writeReg(), whose DSER case does `cqDser & ~val`.  For
+ * SCR and MBR that is exactly cqbic_wr()'s `nval` and is right.  For DSER it is NOT: the C's DSER
+ * case reads `val`, the SHIFTED but UNMERGED value, so the untouched lanes contribute ZERO to the
+ * AND-NOT.  The merge puts `cqDser`'s OWN current bits into those lanes, and `x & ~x` is 0, so every
+ * DSER bit outside the written lane is CLEARED by a write that should not have touched it.
+ *
+ * MEASURED on the live oracle, cq_dser preloaded to 0xBD through `DEPOSIT QBA DSER`, one
+ * instruction, and reproduced against this file in the same shape:
+ *
+ *      MOVB #00,@#20080005   oracle: cq_dser = BD (unchanged)      this file: cqDser = 00
+ *      MOVB #00,@#20080004   oracle: cq_dser = BD (unchanged)      this file: cqDser = BD
+ *
+ * -- so the lane-0 case agrees and the lane-1 case does not.  It is unreachable in every differential
+ * this gate runs today, which is why it was green: nothing writes DSER sub-longword with DSER
+ * already non-zero.  It is NOT fixed here because pcjsvax-b8a's fence is the doorbell, and a
+ * register-semantics fix belongs with its own graded cases in cqmerrdiff.js's or a successor's
+ * scope.  What pcjsvax-b8a DOES do is refuse to build on it: writeReg()'s `sval` argument carries
+ * the C's own unmerged value, so the SME branch reads the right quantity even while the AND-NOT
+ * beside it reads the wrong one.
  *
  * ============================================================================
  * THE SCATTER-GATHER MAP AND THE DMA DATA PATH (pcjsvax-e22)
@@ -95,6 +126,8 @@ const CQMBR_MASK   = (0x1FFF8000 | 0);
    file's copy can be edited without the other's failing its own differential. */
 const CQDSER_SNX      = 0x00000001;
 const CQDSER_LST      = 0x00000008;
+const CQDSER_SME      = 0x00000010;      // vax_io.c:70 -- slave memory error; the ONLY bit whose
+                                         // WRITE has a side effect outside this register (see setIpc())
 const CQDSER_ERR_MASK = 0x000000A5;
 
 /* vaxmod_defs.h:196-199, vax_io.c:104-105, :111-113, vax_defs.h:257-268. */
@@ -131,8 +164,31 @@ export default class CQBICVAX {
         this.exc = exc;
         this.bus = bus;
         this.memSize = memSize >>> 0;
+        this.ipc = null;
         this.reset();
     }
+
+    /**
+     * setIpc(ipc) / hasIpc()
+     *
+     * Wires cqbic_wr()'s DSER<SME> side effect to the register that owns `cq_ipc` -- see the file
+     * header.  Separate from the constructor because the two devices are constructed independently
+     * (cqipc.js's CQIPCVAX takes no arguments) and because a caller that has no CQIPC is a legitimate
+     * configuration, not an error: tests/qdmadiff.js's machine has none and grades nothing that
+     * writes DSER.  `hasIpc()` exists so a test can ASSERT which configuration it is grading rather
+     * than infer it from behaviour -- a silently-unwired side effect is the shape of gap HANDOFF.md
+     * standing rule 6 is about.
+     *
+     * @this {CQBICVAX}
+     * @param {Object} ipc a CQIPCVAX (cqipc.js)
+     */
+    setIpc(ipc) { this.ipc = ipc || null; }
+
+    /**
+     * @this {CQBICVAX}
+     * @returns {boolean}
+     */
+    hasIpc() { return !!this.ipc; }
 
     /**
      * reset()
@@ -184,7 +240,7 @@ export default class CQBICVAX {
     }
 
     /**
-     * writeReg(rg, val)
+     * writeReg(rg, val, sval)
      *
      * vax_io.c:495-527.  `case 2: case 3:` (MEAR/SEAR) are READ-ONLY latches on real hardware: a
      * program WRITE to either one is itself a bus error (`cq_merr()` + a synchronous machine check,
@@ -197,15 +253,26 @@ export default class CQBICVAX {
      * (ka655.js's BDR, ssc.js's uncased offsets); it happens to have been RIGHT here by construction
      * only because MEAR/SEAR really do fault and every other rg reaching this switch is cased.
      *
+     * `sval` (pcjsvax-b8a) is the C's OWN `val` at this point -- shifted into its lane by
+     * `val = val << sc` and NOT merged with the register's current contents.  Only ONE branch of
+     * cqbic_wr() reads it rather than `nval`: the DSER case's `if (val & CQDSER_SME)` cross-clear of
+     * cq_ipc<QME>.  It is threaded through as a separate argument rather than recovered from `val`
+     * because they are genuinely two different quantities in the C, and because the merge that
+     * produces `val` here is measurably NOT equivalent to the C's for DSER -- see the DISCOVERED
+     * DEFECT note in the file header.  For a longword write the two are equal, which is why the
+     * default is `val` and why writeLong() passes nothing.
+     *
      * @this {CQBICVAX}
      * @param {number} rg
-     * @param {number} val
+     * @param {number} val the MERGED longword (the C's `nval`)
+     * @param {number} [sval] the SHIFTED, unmerged written value (the C's `val`); defaults to `val`,
+     *   which is exactly what the C's longword path leaves it as
      * @returns {boolean} true for a handled write (cased and applied); false ONLY for MEAR/SEAR,
      *   which must genuinely fault -- never returned for "not cased" (see readReg()'s doc comment;
      *   the trailing default below returns true, a silent accept, matching cqbic_wr()'s own
      *   default-less switch).
      */
-    writeReg(rg, val)
+    writeReg(rg, val, sval = val)
     {
         switch (rg) {
         case REG_SCR:
@@ -213,6 +280,10 @@ export default class CQBICVAX {
             return true;
         case REG_DSER:
             this.exc.cqDser = (this.exc.cqDser & ~val) & CQDSER_MASK;
+            /* vax_io.c:515-516, and the ONLY place cq_ipc is touched from outside cqipc.js.  Wired
+               by setIpc(); an instance without one is unchanged from before pcjsvax-b8a (see the
+               file header, and hasIpc()). */
+            if (this.ipc && (sval & CQDSER_SME)) this.ipc.clearQme();
             return true;
         case REG_MEAR:
         case REG_SEAR:
@@ -247,22 +318,18 @@ export default class CQBICVAX {
     /**
      * writeLong(addr, val) / writeWord(addr, val) / writeByte(addr, val)
      *
-     * vax_io.c:495-528's byte/word path computes TWO shifted values -- `nval` (read-modify-MERGED
-     * with the current register, `t = cqbic_rd(pa)`, exactly ssc.js's writeWord()/writeByte()
-     * pattern) for SCR/MBR, and plain shifted `val` (no merge) for DSER's W1C semantics, so that a
-     * byte/word W1C write clears bits only in its own lane rather than being merged against a
-     * register the FINAL step is going to AND-NOT anyway.  `writeReg()` above already expects the
-     * MERGED-longword shape SCR/MBR/DSER's C bodies each individually produce (SCR/MBR: `nval`;
-     * DSER: `val` itself, which -- once shifted into its own lane and combined with zero elsewhere
-     * -- IS `cq_dser`'s post-clear intent one bit at a time, since `& ~val` on the untouched lanes'
-     * zero bits is a no-op).  So a single read-modify-merge into a full longword, passed to
-     * writeReg(), reproduces every case correctly without special-casing DSER: for SCR/MBR it is
-     * exactly `nval`; for DSER, merging the shifted byte against the CURRENT `cqDser` value (rather
-     * than zero) and handing the WHOLE THING to writeReg() -- which does `cqDser & ~val` -- clears
-     * only the bits the write's own byte lane could have set, because the merge's OTHER lanes carry
-     * `cqDser`'s OWN current bits, and `cqDser & ~cqDser-bit` for an unwritten lane is a no-op
-     * exactly where it needs to be.  MEAR/SEAR (read-only, a bus error to write at all) never reach
-     * writeReg() successfully either way, so the merge there is moot.
+     * vax_io.c:495-528's byte/word path computes TWO values from the written one -- `nval`,
+     * read-modify-MERGED with the current register (`t = cqbic_rd(pa)`, exactly ssc.js's
+     * writeWord()/writeByte() pattern), and plain shifted `val`, with NO merge -- and its switch
+     * then reads whichever one each register wants: SCR and MBR read `nval`, DSER reads `val`.
+     *
+     * BOTH are computed here and BOTH are passed down, as writeReg()'s `val` and `sval`.  An earlier
+     * revision passed only the merged one and argued that it was equivalent for DSER as well; it is
+     * not, and that argument is the DISCOVERED DEFECT the file header now records with the
+     * measurement that overturned it.  The AND-NOT is left as it was -- fixing DSER's register
+     * semantics is not pcjsvax-b8a's fence -- but the SME branch beside it reads `sval`, which IS
+     * the quantity the C reads.  MEAR/SEAR (read-only, a bus error to write at all) never reach
+     * writeReg() successfully either way, so neither value matters there.
      *
      * @this {CQBICVAX}
      */
@@ -275,7 +342,7 @@ export default class CQBICVAX {
         if (cur === null) return false;
         let sc = (addr & 2) ? 16 : 0;
         let merged = ((val & 0xFFFF) << sc) | (cur & ~(0xFFFF << sc));
-        return this.writeReg(rg, merged | 0);
+        return this.writeReg(rg, merged | 0, ((val & 0xFFFF) << sc) | 0);
     }
 
     writeByte(addr, val)
@@ -285,7 +352,7 @@ export default class CQBICVAX {
         if (cur === null) return false;
         let sc = (addr & 3) << 3;
         let merged = ((val & 0xFF) << sc) | (cur & ~(0xFF << sc));
-        return this.writeReg(rg, merged | 0);
+        return this.writeReg(rg, merged | 0, ((val & 0xFF) << sc) | 0);
     }
 
     /* ------------------------------------------------------------------------------------- *
@@ -715,5 +782,6 @@ export class CQMAPVAX {
     writeByte(addr, val) { return this.cqbic.mapRegWrite(addr, val & 0xFF, 1); }
 }
 
-export { CQSCR_POK, CQSCR_MASK, CQDSER_MASK, CQMEAR_MASK, CQSEAR_MASK, CQMBR_MASK,
-         CQMAP_BASE, CQMAPSIZE, CQMAP_VLD, CQMAP_PAG, QBMAMASK, VA_M_OFF };
+export { CQSCR_POK, CQSCR_MASK, CQDSER_MASK, CQDSER_SME, CQMEAR_MASK, CQSEAR_MASK, CQMBR_MASK,
+         CQMAP_BASE, CQMAPSIZE, CQMAP_VLD, CQMAP_PAG, QBMAMASK, VA_M_OFF,
+         CQBIC_BASE, REG_SCR, REG_DSER, REG_MEAR, REG_SEAR, REG_MBR };
