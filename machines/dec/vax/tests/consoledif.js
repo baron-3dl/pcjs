@@ -44,6 +44,25 @@
  *   SELFCHECK  --selfcheck: the five NAMED mutations done condition 6 requires, at minimum, each
  *              proven caught against the REAL case that would expose it.
  *
+ * ============================================================================
+ * COVERAGE DESIGN -- STATED, NOT ASSUMED (process note, post-merge veracity re-dispatch)
+ * ============================================================================
+ * This file takes ONLY `--simh PATH` and `--selfcheck` -- there is no `--cases N` flag and
+ * therefore no numeric floor to enforce, unlike romdiff.js's `--ssc-base-cases` or hwintdiff.js's
+ * dynamic-vector cases.  That is a DELIBERATE design, not an oversight: every phase here walks a
+ * FIXED, hand-enumerated case list (REAL_CASES, the DEVTRACE program, the two INTERRUPT kinds),
+ * and coverage is asserted as EIGHT BOOLEAN "was this actually exercised" gates (phaseReal()'s
+ * sawIpr/sawSsc/sawInputDir/sawOutputDir/sawPolled/sawIntEnabled, phaseInterrupt()'s sawTti/sawTto)
+ * over that fixed enumeration -- nothing here can shrink by passing a smaller number, because
+ * there is no number to pass.  This satisfies HANDOFF.md standing rule 4's INTENT ("coverage
+ * assertions must fail the run and must not scale down with case count") by construction rather
+ * than by a floor check, the same design hwintdiff.js's own REAL_CASES/SYNTHETIC_CASES already
+ * uses and was ruled correct for.  This file's OTHER checks (not these eight gates specifically)
+ * have already caught real bugs during this item's own development -- an inverted pass/fail in the
+ * ssc-mirror-diverges-from-ipr selfcheck mutation, and a one-instruction interrupt-timing fencepost
+ * caught by the INTERRUPT phase's live PC/PSL comparison -- so the harness as a whole is exercised,
+ * not merely present; the eight boolean gates are what stands in for a numeric floor specifically.
+ *
  *      node machines/dec/vax/tests/consoledif.js [--simh PATH] [--selfcheck]
  */
 
