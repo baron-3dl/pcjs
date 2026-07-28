@@ -100,8 +100,11 @@
  *     reader is rq_tmrsvc(), the once-per-second WALL-CLOCK timer this tree does not model, and the
  *     HAT == HTMO fence below is what keeps that timer from firing in a graded case.  A mutation
  *     for it was not written, because there is nothing it could change.
- *   - CONTROLLER INTERRUPT DELIVERY.  pcjsvax-aef; every case supplies SA_S1H_VEC == 0 and
- *     `assertExclusions()` FAILS the run if one does not.
+ *   - CONTROLLER INTERRUPT DELIVERY.  LANDED in pcjsvax-aef and graded by tests/mscpintdiff.js --
+ *     so this is a SCOPE boundary, not a gap.  Every case here still supplies SA_S1H_VEC == 0 and
+ *     `assertExclusions()` still FAILS the run if one does not, because this file grades IN-BAND
+ *     ITERATION COUNTS that an SCB dispatch inside the wait loops would silently change (and it
+ *     installs no SCB handler for the RQ vector, so a delivered interrupt would HALT at PC 1).
  *
  *      node machines/dec/vax/tests/mscpunitdiff.js [options]
  *        --simh PATH       microvax3900 (else $SIMH_CPU_BIN/$SIMH_BIN, else the scratch build)
@@ -1620,7 +1623,11 @@ function assertExclusions(cases, sim, failures)
     for (let c of cases) {
         if (c.s1dat & SA_S1H_VEC) {
             failures.push(`exclusion: case ${c.idx} "${c.name}" supplies an S1 word with a non-zero ` +
-                `SA_S1H_VEC; interrupt DELIVERY is pcjsvax-aef's work`);
+                `SA_S1H_VEC.  Interrupt delivery LANDED in pcjsvax-aef and is graded by ` +
+                `tests/mscpintdiff.js; this fence is now a SCOPE boundary, not a gap -- every wait ` +
+                `in this file is an IN-BAND loop whose ITERATION COUNT is graded, an SCB dispatch ` +
+                `inside one would fold interrupt delivery into a measurement of the controller's ` +
+                `event schedule, and no SCB handler is installed for the RQ vector here at all.`);
         }
         if (c.s1dat & SA_S1H_IE) {
             failures.push(`exclusion: case ${c.idx} "${c.name}" supplies an S1 word with SA_S1H_IE set`);

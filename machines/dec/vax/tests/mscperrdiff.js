@@ -85,7 +85,9 @@
  *     therefore NO do-file that makes the oracle take that arm, rq.js throws by name, and
  *     assertExclusions() FAILS the run if a graded case reaches it.  This was re-measured for this
  *     item and not inherited from pcjsvax-346's note.
- *   - CONTROLLER INTERRUPT DELIVERY (pcjsvax-aef); every case supplies SA_S1H_VEC == 0.
+ *   - CONTROLLER INTERRUPT DELIVERY.  LANDED in pcjsvax-aef and graded by tests/mscpintdiff.js --
+ *     a SCOPE boundary here, not a gap; every case still supplies SA_S1H_VEC == 0.  See
+ *     assertExclusions() for why letting one in would corrupt this file's own measurement.
  *
  *      node machines/dec/vax/tests/mscperrdiff.js [options]
  *        --simh PATH       microvax3900 (else $SIMH_CPU_BIN/$SIMH_BIN, else the scratch build)
@@ -2193,7 +2195,11 @@ function assertExclusions(cases, sim, js, failures, acc)
         let c = cases[i], s = sim[i], j = js[i];
         if (c.s1dat & SA_S1H_VEC) {
             failures.push(`exclusion: case ${c.idx} "${c.name}" supplies an S1 word with a non-zero ` +
-                `SA_S1H_VEC; interrupt DELIVERY is pcjsvax-aef's work`);
+                `SA_S1H_VEC.  Interrupt delivery LANDED in pcjsvax-aef and is graded by ` +
+                `tests/mscpintdiff.js; this fence is now a SCOPE boundary, not a gap -- every wait ` +
+                `in this file is an IN-BAND loop whose ITERATION COUNT is graded, an SCB dispatch ` +
+                `inside one would fold interrupt delivery into a measurement of the controller's ` +
+                `event schedule, and no SCB handler is installed for the RQ vector here at all.`);
         }
         if (c.s1dat & SA_S1H_IE) {
             failures.push(`exclusion: case ${c.idx} "${c.name}" supplies an S1 word with SA_S1H_IE set`);

@@ -455,6 +455,94 @@ export function mscpDispatch(text)
 }
 
 /**
+ * intSeam(text)
+ *
+ * THE INTERRUPT SEAM'S SCOPE, DERIVED (pcjsvax-aef).  Three things, none of them written down:
+ *
+ *   initGuard / ringGuard   the SET of SA_S1H_* bits each of rq_init_int() and rq_ring_int() tests
+ *                           before calling rq_setint().
+ *   initCallers/ringCallers the C functions that CALL each of them, in source order.
+ *   setintCallers           every function that reaches rq_setint() at all.
+ *
+ * *** WHY THIS IS DERIVED AND NOT ASSERTED IN A COMMENT. ***  rq_init_int() tests SA_S1H_IE AND
+ * SA_S1H_VEC; rq_ring_int() tests SA_S1H_VEC ALONE.  tests/mscpintdiff.js's whole argument is that
+ * those two conditions DIFFER -- its IE-clear/VEC-set case exists only to separate them -- so if a
+ * vendor tree ever "fixed" rq_ring_int() to test IE too, that case would stop distinguishing
+ * anything and would go on passing.  A coverage floor cannot see its own premise dissolve; this
+ * can.  Likewise the CALLER COUNTS are what tests/mscpintdiff.js's "an init interrupt at each of
+ * steps 2, 3 and 4" and "both rq_putdesc() ring-interrupt arms" floors are sized from: three
+ * rq_init_int() call sites and two rq_ring_int() ones, counted here rather than in the test.
+ *
+ * @param {string} text pdp11_rq.c
+ * @returns {Object}
+ */
+export function intSeam(text)
+{
+    /* Enclosing-function attribution.  SIMH's C is K&R: the body's `{` and `}` are alone in column
+       0, and the signature is on the line(s) above.  A call recorded with no enclosing function
+       would be a call this check cannot police, so that is an error rather than a skip. */
+    let lines = stripComments(text).split("\n");
+    let bodies = new Map();                             /* fn name -> array of body lines */
+    let cur = null, prev = "";
+    for (let raw of lines) {
+        if (raw === "{" && cur === null) {
+            let m = /\b(rq_[a-z_0-9]+)\s*\(/.exec(prev);
+            if (m) { cur = m[1]; bodies.set(cur, []); }
+            else cur = "";                              /* a function this extraction does not name */
+        } else if (raw === "}" && cur !== null) {
+            cur = null;
+        } else if (cur) {
+            bodies.get(cur).push(raw);
+        }
+        if (raw.trim()) prev = raw;
+    }
+    for (let n of ["rq_init_int", "rq_ring_int", "rq_setint", "rq_clrint", "rq_inta"]) {
+        if (!bodies.has(n)) {
+            throw new Error(`mscpscope: ${n}() has no body this extraction could find in ` +
+                `pdp11_rq.c -- the interrupt seam's scope is unknown, and every coverage floor ` +
+                `tests/mscpintdiff.js sizes from it would be sized from nothing`);
+        }
+    }
+
+    /* The guard: the `if (...)` whose consequent is `rq_setint (cp);`, read from the joined body so
+       rq_init_int()'s two-line condition is one string. */
+    let guardOf = (fn) => {
+        let joined = bodies.get(fn).join(" ").replace(/\s+/g, " ");
+        let m = /if \((.*?)\)\s*rq_setint \(/.exec(joined);
+        if (!m) {
+            throw new Error(`mscpscope: ${fn}() does not call rq_setint() behind an \`if\` this ` +
+                `extraction can read.  Its guard is the premise tests/mscpintdiff.js's IE/VEC ` +
+                `asymmetry cases rest on and it may not be assumed`);
+        }
+        let bits = [...new Set((m[1].match(/SA_S1H_[A-Z]+/g) || []))].sort();
+        if (!bits.length) {
+            throw new Error(`mscpscope: ${fn}()'s rq_setint() guard "${m[1]}" tests no SA_S1H_ bit`);
+        }
+        return {expr: m[1].trim(), bits};
+    };
+
+    let callersOf = (target) => {
+        let out = [];
+        for (let [fn, body] of bodies) {
+            if (fn === target) continue;
+            let n = 0;
+            for (let l of body) if (new RegExp(`\\b${target} \\(`).test(l)) n++;
+            for (let k = 0; k < n; k++) out.push(fn);
+        }
+        return out;
+    };
+
+    return {
+        initGuard: guardOf("rq_init_int"),
+        ringGuard: guardOf("rq_ring_int"),
+        initCallers: callersOf("rq_init_int"),
+        ringCallers: callersOf("rq_ring_int"),
+        setintCallers: callersOf("rq_setint"),
+        clrintCallers: callersOf("rq_clrint")
+    };
+}
+
+/**
  * extract(simhPath)
  * @param {?string} simhPath
  * @returns {Object}
@@ -485,7 +573,7 @@ export function extract(simhPath)
     let lad = rwValidLadder(c, {ST: st, SB: sb, I: inv});
     return {dir, op: defines(h, "OP"), st, sb, inv, pe,
             ladder: lad.ladder, deadRungCommentedOut: lad.deadRungCommentedOut,
-            dispatch: mscpDispatch(c), drv: drvTable(c)};
+            dispatch: mscpDispatch(c), drv: drvTable(c), intSeam: intSeam(c)};
 }
 
 /**
@@ -600,13 +688,40 @@ export function checkScope(simhPath)
         }
     }
 
+    /* PHASE S, pcjsvax-aef: THE INTERRUPT SEAM'S ASYMMETRY, asserted against the C rather than
+       against a comment.  rq_init_int() must test BOTH SA_S1H_IE and SA_S1H_VEC and rq_ring_int()
+       must test SA_S1H_VEC and NOT SA_S1H_IE.  If a vendor tree ever made the two conditions the
+       same, tests/mscpintdiff.js's IE-clear/VEC-set case would stop separating them and would go
+       on passing -- a coverage floor cannot notice its own premise dissolving, so this does. */
+    {
+        let i = e.intSeam;
+        let want = (fn, g, bits) => {
+            let got = g.bits.join("+");
+            if (got !== bits.join("+")) {
+                failures.push(`PHASE S: ${fn}()'s rq_setint() guard is \`${g.expr}\`, which tests ` +
+                    `{${got}}; tests/mscpintdiff.js's asymmetry cases require {${bits.join("+")}}`);
+            }
+        };
+        want("rq_init_int", i.initGuard, ["SA_S1H_IE", "SA_S1H_VEC"]);
+        want("rq_ring_int", i.ringGuard, ["SA_S1H_VEC"]);
+        if (i.initGuard.bits.join("+") === i.ringGuard.bits.join("+")) {
+            failures.push(`PHASE S: rq_init_int() and rq_ring_int() now test the SAME condition, so ` +
+                `no host program can tell them apart and tests/mscpintdiff.js's whole argument is ` +
+                `vacuous`);
+        }
+        if (i.setintCallers.join(",") !== "rq_init_int,rq_ring_int") {
+            failures.push(`PHASE S: rq_setint() is called from [${i.setintCallers.join(", ")}]; ` +
+                `rq.js models exactly the two arms rq_init_int and rq_ring_int`);
+        }
+    }
+
     return {dir: e.dir, nOp: Object.keys(e.op).length, nSt: Object.keys(e.st).length,
             nSwitch: Object.keys(e.dispatch).length, nDrv: e.drv.length,
             nSb: Object.keys(e.sb).length, nI: Object.keys(e.inv).length,
             nPe: Object.keys(e.pe).length, nLadder: e.ladder.length,
             failures, op: e.op, st: e.st, dispatch: e.dispatch, drv: e.drv,
             sb: e.sb, inv: e.inv, pe: e.pe, ladder: e.ladder,
-            deadRungCommentedOut: e.deadRungCommentedOut};
+            deadRungCommentedOut: e.deadRungCommentedOut, intSeam: e.intSeam};
 }
 
 function main()
@@ -621,6 +736,9 @@ function main()
     console.log(`  ${r.nSb} SB_ sub-codes, ${r.nI} I_ invalid-command codes, ${r.nPe} PE_ port ` +
         `errors, ${r.nLadder} rq_rw_valid() branches (${r.nLadder - 1} refusals + accept)` +
         (r.deadRungCommentedOut ? "" : "  *** the 'reasonable lbn' rung is LIVE ***"));
+    console.log(`  interrupt seam: rq_init_int {${r.intSeam.initGuard.bits.join("+")}} from ` +
+        `[${r.intSeam.initCallers.join(", ")}]; rq_ring_int {${r.intSeam.ringGuard.bits.join("+")}} ` +
+        `from [${r.intSeam.ringCallers.join(", ")}]`);
     if (process.argv.includes("--print")) {
         console.log(`  OP: ${Object.keys(r.op).map((k) => `${k}=${r.op[k]}`).join(" ")}`);
         console.log(`  ST: ${Object.keys(r.st).map((k) => `${k}=${r.st[k]}`).join(" ")}`);
