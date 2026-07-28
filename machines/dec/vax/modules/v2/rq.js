@@ -269,16 +269,40 @@ const SA_S4H_SF     = 0x0100;                   // spec fnc NI
 const SA_S4H_LF     = 0x0002;                   // send last fail
 const SA_S4H_GO     = 0x0001;                   // go
 
-const PE_PRE        = 1;                        // packet read err
-const PE_PWE        = 2;                        // packet write err
-const PE_QRE        = 6;                        // queue read err
-const PE_QWE        = 7;                        // queue write err
-const PE_HAT        = 9;                        // host access tmo
-const PE_ICI        = 14;                       // inv conn ident
-const PE_PIE        = 20;                       // prot incompat
-const PE_PPF        = 21;                       // prg/poll err
-const PE_MRE        = 22;                       // map reg rd err
-const PE_NSR        = 478;                      // no such rsrc -- the free packet list ran dry
+/** The THIRTEEN UQSSP PORT ERRORS (pdp11_uqssp.h:112-124), name -> value, in the header's order.
+    PUBLISHED as a table for the same reason OP and ST are: tests/mscpscope.js re-derives it from
+    pdp11_uqssp.h on every differential run and FAILS on any difference, and rq_fatal() puts one of
+    these in SA as `SA_ER | err` and in `perr`, so a wrong number here is a wrong number a host reads
+    out of a register.  The set includes THREE this tree cannot construct (T11/SND/RCV are "NI" in
+    the header and rq_fatal() is never called with them) and one it must not (PE_MRE -- see below);
+    they are here because the SET is the C's, and tests/mscperrdiff.js reports by NAME which port
+    errors a run never produced rather than leaving them silently absent (standing rule 6). */
+const PE = {
+    PRE: 1,             // packet read err
+    PWE: 2,             // packet write err
+    QRE: 6,             // queue read err
+    QWE: 7,             // queue write err
+    HAT: 9,             // host access tmo -- rq_tmrsvc()'s WALL-CLOCK timer, excluded by name
+    ICI: 14,            // inv conn ident
+    PIE: 20,            // prot incompat
+    PPF: 21,            // prg/poll err
+    MRE: 22,            // map reg rd err -- pcjsvax-5c1's excluded branch; qdmadiff has a tripwire
+    T11: 475,           // T11 err NI
+    SND: 476,           // SND err NI
+    RCV: 477,           // RCV err NI
+    NSR: 478            // no such rsrc -- the free packet list ran dry
+};
+
+const PE_PRE        = PE.PRE;
+const PE_PWE        = PE.PWE;
+const PE_QRE        = PE.QRE;
+const PE_QWE        = PE.QWE;
+const PE_HAT        = PE.HAT;
+const PE_ICI        = PE.ICI;
+const PE_PIE        = PE.PIE;
+const PE_PPF        = PE.PPF;
+const PE_MRE        = PE.MRE;
+const PE_NSR        = PE.NSR;
 
 const SA_COMM_QQ    = -8;                       // unused
 const SA_COMM_PI    = -6;                       // purge int
@@ -337,27 +361,95 @@ const ST = {
     BBR: 20, DIA: 31, V_SUB: 5, V_INV: 8
 };
 
-/* Invalid-command SUBCODES (pdp11_mscp.h:188-192).  *** I_BCNT AND I_VRSN ARE THE SAME VALUE ***
-   (12 << ST_V_INV), as are I_LBN and I_FMTI (28 << ST_V_INV) -- the header reuses the numbers for
-   different commands.  Written as four names because the C has four; a reader who finds two of them
-   comparing equal is looking at the header's own doing, not at a transcription error. */
-const I_OPCD        = 8 << ST.V_INV;            // inv opcode
-const I_BCNT        = 12 << ST.V_INV;           // inv byte cnt
-const I_VRSN        = 12 << ST.V_INV;           // inv version
-const I_LBN         = 28 << ST.V_INV;           // inv LBN
-const I_FMTI        = 28 << ST.V_INV;           // inv format
+/** The SEVEN invalid-command SUBCODES (pdp11_mscp.h:188-194), name -> value, each `n << ST_V_INV`.
+    *** I_BCNT AND I_VRSN ARE THE SAME VALUE *** (12 << ST_V_INV), as are I_LBN and I_FMTI
+    (28 << ST_V_INV) -- the header reuses the numbers for different commands.  Seven names because
+    the C has seven; a reader who finds two of them comparing equal is looking at the header's own
+    doing, not at a transcription error.  PUBLISHED as a table so tests/mscpscope.js can re-derive it
+    and FAIL on any difference (standing rule 5): these are half of every refusal this controller
+    sends, and I_BCNT vs I_LBN is the difference between "your byte count is wrong" and "your block
+    number is wrong" for the SAME command. */
+const I = {
+    OPCD: 8 << ST.V_INV,        // inv opcode
+    FLAG: 9 << ST.V_INV,        // inv flags
+    MODF: 10 << ST.V_INV,       // inv modifier
+    BCNT: 12 << ST.V_INV,       // inv byte cnt
+    LBN: 28 << ST.V_INV,        // inv LBN
+    VRSN: 12 << ST.V_INV,       // inv version
+    FMTI: 28 << ST.V_INV        // inv format
+};
 
-/* Status SUBCODES (pdp11_mscp.h:167-181).  Each is `n << ST_V_SUB` -- written that way rather than
-   folded to a number, because ST.V_SUB is one of the two entries mscpscope.js re-derives and a
-   folded constant would not move with it. */
-const SB_SUC_ON     = 8 << ST.V_SUB;            // already online
-const SB_OFL_NV     = 1 << ST.V_SUB;            // no volume
-const SB_AVL_INU    = 32 << ST.V_SUB;           // in use
-const SB_WPR_SW     = 128 << ST.V_SUB;          // swre write lock
-const SB_WPR_HW     = 256 << ST.V_SUB;          // hwre write lock
-const SB_HST_OA     = 1 << ST.V_SUB;            // odd address
-const SB_HST_OC     = 2 << ST.V_SUB;            // odd count
-const SB_HST_NXM    = 3 << ST.V_SUB;            // nx memory
+const I_OPCD        = I.OPCD;
+const I_BCNT        = I.BCNT;
+const I_VRSN        = I.VRSN;
+const I_LBN         = I.LBN;
+const I_FMTI        = I.FMTI;
+
+/** The FIFTEEN status SUBCODES (pdp11_mscp.h:170-184), name -> value, each `n << ST_V_SUB` --
+    written that way rather than folded to a number, because ST.V_SUB is one of the two entries
+    mscpscope.js re-derives and a folded constant would not move with it.  The tape-only ones
+    (SUC_IGN, SUC_EOT, SUC_RO, OFL_INOP, DAT_RDE) and the two host-error ones this Qbus DMA path
+    never produces (HST_PAR, HST_PTE) are in the table because the SET is the C's; which of them a
+    run actually constructed is reported BY NAME by tests/mscperrdiff.js rather than left implicit. */
+const SB = {
+    SUC_IGN: 1 << ST.V_SUB,     // t: unload ignored
+    SUC_ON: 8 << ST.V_SUB,      // b: already online
+    SUC_EOT: 32 << ST.V_SUB,    // t: EOT encountered
+    SUC_RO: 128 << ST.V_SUB,    // t: read only
+    OFL_NV: 1 << ST.V_SUB,      // b: no volume
+    OFL_INOP: 2 << ST.V_SUB,    // t: inoperative
+    AVL_INU: 32 << ST.V_SUB,    // b: in use
+    WPR_SW: 128 << ST.V_SUB,    // b: swre wlk
+    WPR_HW: 256 << ST.V_SUB,    // b: hwre wlk
+    HST_OA: 1 << ST.V_SUB,      // b: odd addr
+    HST_OC: 2 << ST.V_SUB,      // d: odd count
+    HST_NXM: 3 << ST.V_SUB,     // b: nx memory
+    HST_PAR: 4 << ST.V_SUB,     // b: parity err
+    HST_PTE: 5 << ST.V_SUB,     // b: mapping err
+    DAT_RDE: 7 << ST.V_SUB      // t: read err
+};
+
+const SB_SUC_ON     = SB.SUC_ON;
+const SB_OFL_NV     = SB.OFL_NV;
+const SB_AVL_INU    = SB.AVL_INU;
+const SB_WPR_SW     = SB.WPR_SW;
+const SB_WPR_HW     = SB.WPR_HW;
+const SB_HST_OA     = SB.HST_OA;
+const SB_HST_OC     = SB.HST_OC;
+const SB_HST_NXM    = SB.HST_NXM;
+
+/** *** rq_rw_valid()'s LADDER, AS A SCOPE DECLARATION (pcjsvax-3c3). ***
+ *
+ *  This is the same kind of object as MSCP_OP_HANDLER below and carries the same weight: it is NOT
+ *  a second implementation and rwValid() does not read it.  It is the ORDERED list of statuses the
+ *  C's rq_rw_valid() can return, one entry per `return` in pdp11_rq.c:2312-2349, and
+ *  tests/mscpscope.js SLICES THAT FUNCTION OUT OF THE C ON EVERY RUN, evaluates each returned
+ *  expression against the ST/SB/I tables it also derives, and FAILS on any difference in VALUE OR
+ *  ORDER.
+ *
+ *  *** THE ORDER IS THE ASSERTION, NOT THE SET. ***  rq_rw_valid() returns the FIRST match, so a
+ *  command that is both odd-count and off the end of the disk answers ST_HST|SB_HST_OC and not
+ *  ST_CMD|I_BCNT.  Two rungs swapped leave the reachable SET of codes identical and change what
+ *  every doubly-invalid command answers -- which is why tests/mscperrdiff.js posts commands that
+ *  trip two rungs at once and grades which one won, and why --selfcheck there carries a mutation
+ *  that permutes this ladder inside rwValid().
+ *
+ *  The LAST entry is the accept arm (status 0).  `RW_VALID_LADDER.length - 1` is therefore the
+ *  number of REFUSALS, and that count is a coverage floor derived from the C rather than typed. */
+const RW_VALID_LADDER = [
+    {name: "not-attached",          sts: ST.OFL | SB.OFL_NV},
+    {name: "not-online",            sts: ST.AVL},
+    {name: "odd-buffer-address",    sts: ST.HST | SB.HST_OA},
+    {name: "odd-byte-count",        sts: ST.HST | SB.HST_OC},
+    {name: "unreasonable-bc",       sts: ST.CMD | I.BCNT},
+    {name: "beyond-rct-copy-1",     sts: ST.CMD | I.LBN},
+    {name: "rct-bc-not-512",        sts: ST.CMD | I.BCNT},
+    {name: "spiral-into-rct",       sts: ST.CMD | I.BCNT},
+    {name: "write-into-rct",        sts: ST.CMD | I.LBN},
+    {name: "software-write-lock",   sts: ST.WPR | SB.WPR_SW},
+    {name: "hardware-write-lock",   sts: ST.WPR | SB.WPR_HW},
+    {name: "accepted",              sts: 0}
+];
 
 /* Unit identifier class (pdp11_mscp.h:37) */
 const UID_DISK      = 2;                        // disk class
@@ -377,9 +469,14 @@ const UF_MSK        = UF_CMR | UF_CMW;          // settable flags
     EF_LOG appears both with and without an actual log packet, and both are graded. */
 const EF_LOG        = 0x0020;                   // b: error log
 
-/** ERROR-LOG flags and formats (pdp11_mscp.h:130-138).  LF_SNR is the only log flag rq_hbe() and
-    rq_dte() ever set, FM_BAD is the host-bus-error format and FM_SDE the small-disk-error one. */
+/** ERROR-LOG flags and formats (pdp11_mscp.h:130-140).  LF_SNR is the only log flag rq_hbe(),
+    rq_dte() and rq_plf() ever set; FM_CNT is the PORT LAST-FAILURE format, FM_BAD the
+    host-bus-error one and FM_SDE the small-disk-error one.  *** FM_CNT IS ZERO ***, so rq_plf()'s
+    response "opcode" word is `(0 << RSP_OPF_V_OPC) | (LF_SNR << RSP_OPF_V_FLG)` == 0x0100 -- a
+    host that expects a non-zero opcode there sees nothing and a differential that searched the
+    trace for one would report the packet as missing while it was being produced. */
 const LF_SNR        = 0x0001;                   // b: seq # reset
+const FM_CNT        = 0;                        // b: port lf err
 const FM_BAD        = 1;                        // b: bad host addr
 const FM_SDE        = 4;                        // d: sm disk err
 
@@ -557,14 +654,36 @@ const HBE_CIDD_V_CLS = 8;
 const HBE_VER_V_SVER = 0;
 const HBE_VER_V_HVER = 8;
 
+/** PORT LAST FAILURE (pdp11_mscp.h:440-451), the packet rq_plf() builds.  Its body is the SAME
+    shape as rq_hbe()'s -- four controller-ID words then a version word -- and then ONE word that is
+    the whole point: PLF_ERR carries the PE_ code the controller died of, which is the only way a
+    host ever learns WHY a previous incarnation of this controller went dead. */
+const PLF_LNT       = 24;
+const PLF_CIDA      = 8;                        // ctrl ID
+const PLF_CIDB      = 9;
+const PLF_CIDC      = 10;
+const PLF_CIDD      = 11;
+const PLF_VER       = 12;                       // ctrl version
+const PLF_ERR       = 13;                       // err
+const PLF_CIDD_V_MOD = 0;
+const PLF_CIDD_V_CLS = 8;
+const PLF_VER_V_SVER = 0;
+const PLF_VER_V_HVER = 8;
+
 /* pdp11_mscp.h:100-105 */
 const CF_RPL        = 0x8000;                   // ctrl bad blk repl
 const CF_ATN        = 0x0080;                   // enb attention
-/** `if ((cp->cflgs & CF_THS) == 0) return OK;` opens rq_hbe(), rq_dte() and rq_plf(): with THIS
-    HOST messages disabled -- which is the state after every reset, since rq_reset() sets `cflgs`
-    to CF_RPL alone -- an error log is silently not built and the caller is told it succeeded.  A
-    host turns it on with SET CONTROLLER CHARACTERISTICS, and BOTH states are graded, because they
-    produce the same END packet and a different number of packets on the response ring. */
+/** `if ((cp->cflgs & CF_THS) == 0) return OK;` opens rq_hbe() and rq_dte(): with THIS HOST messages
+    disabled -- which is the state after every reset, since rq_reset() sets `cflgs` to CF_RPL alone
+    -- an error log is silently not built and the caller is told it succeeded.  A host turns it on
+    with SET CONTROLLER CHARACTERISTICS, and BOTH states are graded, because they produce the same
+    END packet and a different number of packets on the response ring.
+    *** IT DOES NOT OPEN rq_plf() OR rq_una(), AND THIS COMMENT USED TO SAY IT OPENED rq_plf().
+    (HANDOFF.md standing rule 12.) ***  rq_plf() has no CF_THS test at all: its first statement is
+    `if (!rq_deqf (cp, &pkt)) return ERR;`.  So a host that re-initialises a DEAD controller and sets
+    SA_S4H_LF in its GO word gets the last-failure datagram whether or not it has ever enabled error
+    logging -- and it gets it BEFORE it could have, because CF_THS is cleared by the rq_reset() the
+    fatal itself performed.  tests/mscperrdiff.js grades exactly that sequence. */
 const CF_THS        = 0x0010;                   // enb this host msgs
 
 /* ------------------------------------------------------------------------------------------- *
@@ -1083,6 +1202,24 @@ export default class RQVAX {
         this.irq = 0;
         this.cq = {ioff: 0, ba: 0, lnt: 0, idx: 0};
         this.rq = {ioff: 0, ba: 0, lnt: 0, idx: 0};
+        /* *** THE PER-UNIT FIELDS rq_reset() DELIBERATELY LEAVES ALONE, WHICH A FRESH PROCESS
+           NEVERTHELESS STARTS AT ZERO. ***  `io_complete`, `io_status` and `iostarttime` live in
+           SIMH's static UNIT array, so rq_reset() not clearing them means they survive a
+           `reset -p all` -- and a fresh simulator still starts with them at the C's global zero.
+           reset() is one boundary; THIS is the other, and they are not the same.
+           pcjsvax-3c3 found this by leaking one.  A case that ABORTS a transfer in flight leaves
+           io_complete SET (rq_abo()'s sim_cancel does not clear it), and with the field surviving
+           powerUp() the flag crossed from one --selfcheck pass into the NEXT pass's FIRST case,
+           whose first accepted READ then entered rq_svc()'s BOTTOM end holding a stale buffer.  The
+           symptom was every single mutation reporting the SAME memory difference in case 0 --
+           HANDOFF.md standing rule 16 exactly: the mutations were being "caught" by a defect in the
+           harness's own pass boundary rather than by the case that was supposed to kill them. */
+        for (let u of this.units) {
+            u.ioComplete = 0;
+            u.ioStatus = 0;
+            u.ioStart = 0;
+            if (u.rqxb) u.rqxb.fill(0);
+        }
         this.reset();
     }
 
@@ -2053,7 +2190,9 @@ export default class RQVAX {
                     /* sim_activate_after (units + RQ_TIMER, 1000000) -- the wall-clock host-access
                        timer, NOT modelled; see the file header's exclusion and the oracle-side
                        HAT == HTMO assertion that keeps it out of reach. */
-                    if ((this.saw & SA_S4H_LF) && this.perr) this.plf();
+                    if ((this.saw & SA_S4H_LF) && this.perr) this.plf(this.perr);
+                    /* CLEARED WHETHER OR NOT THE PACKET WAS BUILT, and whether or not rq_plf()
+                       succeeded -- the C ignores its return value here. */
                     this.perr = 0;
                 }
                 break;
@@ -2651,17 +2790,31 @@ export default class RQVAX {
     /**
      * abo(pkt, q)
      *
-     * rq_abo() (pdp11_rq.c:1984-2025).  Everything ABORT does beyond answering ST_SUC is a search of
-     * the unit's IN-FLIGHT packet (`cpkt`) and its DEFERRED queue (`pktq`) for a matching reference
-     * number, and only rq_rw() ever puts a packet in either -- so with an idle unit the C's `tpkt`
-     * stays 0, the `if (tpkt)` arm does not run, and the answer is ST_SUC with ABO_LNT whether or
-     * not the unit even exists.  *** ABORT NEVER REPORTS ST_OFL. ***  That is the whole of its
-     * reachable behaviour here and it is graded; the search arms throw by name if a unit is ever
-     * found holding a packet, which is a state pcjsvax-346 creates and this item cannot.
+     * rq_abo() (pdp11_rq.c:1984-2025), COMPLETE as of pcjsvax-3c3 -- the three search arms included.
      *
-     * `ref = GETP32 (pkt, ABO_REFL)` is deliberately NOT computed: it is read only by the search
-     * arms, and computing a value nothing uses would be a comment claiming coverage the code does
-     * not have (HANDOFF.md standing rule 12).
+     * Everything ABORT does beyond answering ST_SUC is a search of the unit's IN-FLIGHT packet
+     * (`cpkt`) and its DEFERRED queue (`pktq`) for a matching reference number, and only rq_rw()
+     * ever puts a packet in either.  With an idle unit the C's `tpkt` stays 0, the `if (tpkt)` arm
+     * does not run, and the answer is ST_SUC with ABO_LNT whether or not the unit even exists.
+     * *** ABORT NEVER REPORTS ST_OFL. ***
+     *
+     * SIX things about the search are the C's and every one of them is separately observable:
+     *   1. THE THREE ARMS ARE `else if`, so a reference that matches BOTH the in-flight packet and
+     *      a queued one cancels only the in-flight one.
+     *   2. Arms 1 and 2 read CMD_REFL; arm 3 reads RSP_REFL -- *** WHICH IS THE SAME WORD (2). ***
+     *      Two names for one offset in one function; transcribed as the C spells them so a reader
+     *      who checks the header finds what the C says rather than what a tidier version would.
+     *   3. THE CURRENT-PACKET ARM CANCELS THE DRIVE AND ARMS THE QUEUE THREAD.  `sim_cancel (uptr)`
+     *      kills a transfer that may be mid-chunk, and `sim_activate (RQ_QUEUE, rq_qtime)` is what
+     *      then drains anything left on that unit's queue.  It does NOT clear `io_complete`, so a
+     *      transfer cancelled between its two halves leaves that flag set -- see reset()'s note.
+     *   4. Arm 2 unlinks the HEAD of the deferred queue by hand (`uptr->pktq = pak[tpkt].link`)
+     *      rather than through rq_deqh().
+     *   5. Arm 3 walks from the head looking at `pak[prv].link`, so it starts at the SECOND entry --
+     *      the head is arm 2's job -- and its loop variable `tpkt` ends up 0 when nothing matched.
+     *   6. THE CANCELLED PACKET IS ANSWERED FIRST, with ST_ABO and RSP_LNT (12), and the ABORT's own
+     *      ST_SUC/ABO_LNT response goes out AFTER it.  Two packets, in that order, and a host that
+     *      granted only one response descriptor sees the ST_ABO one.
      *
      * @this {RQVAX}
      * @param {number} pkt
@@ -2672,14 +2825,35 @@ export default class RQVAX {
     {
         let lu = this.pd(pkt, CMD_UN);                      /* unit # */
         let cmd = this.getp(pkt, CMD_OPC, CMD_OPC_V_OPC, CMD_OPC_M_OPC);
+        let ref = this.getp32(pkt, ABO_REFL);               /* cmd ref # */
+        let tpkt = 0;                                       /* set no mtch */
         let u = this.getucb(lu);                            /* get unit */
-        if (u && (u.cpkt || u.pktq)) {
-            throw new RQUnimplemented("rq.js: ABORT against a unit holding a packet searches " +
-                "uptr->cpkt and uptr->pktq for a matching reference number and CANCELS the " +
-                "transfer with ST_ABO.  pcjsvax-346 made that state reachable but did not take it " +
-                "into scope -- cancelling a transfer is neither a transfer nor a unit command -- " +
-                "so it still throws by name and tests/mscprwdiff.js FAILS the run if a graded " +
-                "case sends ABORT to a unit with a packet in flight");
+        if (u) {
+            if (u.cpkt && this.getp32(u.cpkt, CMD_REFL) === ref) {      /* curr pkt? match ref? */
+                tpkt = u.cpkt;                              /* save match */
+                u.cpkt = 0;                                 /* gonzo */
+                u.due = null;                               /* sim_cancel (uptr) */
+                this.activateQueue(this.qtime);
+            } else if (u.pktq && this.getp32(u.pktq, CMD_REFL) === ref) {   /* head of q? */
+                tpkt = u.pktq;                              /* save match */
+                u.pktq = this.pakLink[tpkt];                /* unlink */
+            } else {
+                let prv = u.pktq;                           /* srch pkt q */
+                if (prv) {
+                    while ((tpkt = this.pakLink[prv])) {    /* walk list */
+                        if (this.getp32(tpkt, RSP_REFL) === ref) {      /* match? unlink */
+                            this.pakLink[prv] = this.pakLink[tpkt];
+                            break;
+                        }
+                        prv = tpkt;                         /* no match, next */
+                    }
+                }
+            }
+            if (tpkt) {                                     /* found target? */
+                let tcmd = this.getp(tpkt, CMD_OPC, CMD_OPC_V_OPC, CMD_OPC_M_OPC);
+                this.putr(tpkt, tcmd | OP.END, 0, ST.ABO, RSP_LNT, UQ_TYP_SEQ);
+                if (!this.putPkt(tpkt, true)) return false;
+            }
         }
         this.putr(pkt, cmd | OP.END, 0, ST.SUC, ABO_LNT, UQ_TYP_SEQ);
         return this.putPkt(pkt, true);
@@ -2688,13 +2862,28 @@ export default class RQVAX {
     /**
      * gcs(pkt, q)
      *
-     * rq_gcs() (pdp11_rq.c:2057-2081).  GET COMMAND STATUS reports the WORKING BYTE COUNT of the
-     * unit's in-flight transfer, and its whole four-condition test -- unit exists AND has a current
-     * packet AND that packet's reference matches AND its opcode is at least OP_ACC -- collapses to
-     * FALSE for an idle unit.  So the reachable answer is the else arm: BOTH status words ZEROED,
-     * ST_SUC, GCS_LNT, and again NO ST_OFL even for a unit that does not exist.  The zeroing is the
-     * observable part: the host's own command words at GCS_STSL/GCS_STSH are overwritten, so a
+     * rq_gcs() (pdp11_rq.c:2059-2081), COMPLETE as of pcjsvax-3c3.
+     *
+     * GET COMMAND STATUS reports the WORKING BYTE COUNT of the unit's in-flight transfer, and its
+     * test is a FOUR-TERM `&&`: the unit exists AND has a current packet AND that packet's reference
+     * matches AND its opcode is at least OP_ACC.  All four must hold; for an idle unit the second
+     * term is already false and the answer is the else arm -- BOTH status words ZEROED, ST_SUC,
+     * GCS_LNT, and NO ST_OFL even for a unit that does not exist.  The zeroing is the observable
+     * part of THAT arm: the host's own command words at GCS_STSL/GCS_STSH are overwritten, so a
      * controller that skipped the else arm would return the host's data and look plausible.
+     *
+     * *** THE FOURTH TERM IS `>= OP_ACC` ON THE RAW OPCODE, AND IT IS NOT REDUNDANT. ***  OP_ACC is
+     * 16 and the five transfer opcodes are 16/18/32/33/34, so every packet rq_rw() can have left in
+     * `cpkt` passes it -- but the comparison is against the WHOLE opcode field, and it is written
+     * this way in the C because nothing else guarantees what put a packet there.  Reproduced rather
+     * than simplified to "it is always true here".
+     *
+     * *** WHAT IT REPORTS IS THE WORK REMAINING, NOT THE WORK DONE. ***  RW_WBCL is decremented as
+     * chunks complete, so a GET COMMAND STATUS issued against a transfer in flight answers with the
+     * bytes STILL TO GO -- and against one whose disk I/O has been issued but whose bottom end has
+     * not run, it answers with the FULL original count.  Which of those a host sees is a fact about
+     * the SCHEDULE, which is why tests/mscperrdiff.js grades the value the ORACLE reported rather
+     * than one predicted here.
      *
      * @this {RQVAX}
      * @param {number} pkt
@@ -2705,15 +2894,17 @@ export default class RQVAX {
     {
         let lu = this.pd(pkt, CMD_UN);                      /* unit # */
         let cmd = this.getp(pkt, CMD_OPC, CMD_OPC_V_OPC, CMD_OPC_M_OPC);
+        let ref = this.getp32(pkt, GCS_REFL);               /* ref # */
         let u = this.getucb(lu);                            /* valid lu? */
-        if (u && u.cpkt) {
-            throw new RQUnimplemented("rq.js: GET COMMAND STATUS against a unit with a current " +
-                "packet reports that transfer's working byte count.  pcjsvax-346 made that state " +
-                "reachable but did not take it into scope; tests/mscprwdiff.js FAILS the run if a " +
-                "graded case sends GET COMMAND STATUS to a unit with a packet in flight");
+        let tpkt = u ? u.cpkt : 0;                          /* queued pkt? */
+        if (u && tpkt && this.getp32(tpkt, CMD_REFL) === ref &&      /* match ref? */
+            this.getp(tpkt, CMD_OPC, CMD_OPC_V_OPC, CMD_OPC_M_OPC) >= OP.ACC) {     /* rd/wr cmd? */
+            this.spd(pkt, GCS_STSL, this.pd(tpkt, RW_WBCL));
+            this.spd(pkt, GCS_STSH, this.pd(tpkt, RW_WBCH));
+        } else {
+            this.spd(pkt, GCS_STSL, 0);                     /* return 0 */
+            this.spd(pkt, GCS_STSH, 0);
         }
-        this.spd(pkt, GCS_STSL, 0);                         /* return 0 */
-        this.spd(pkt, GCS_STSH, 0);
         this.putr(pkt, cmd | OP.END, 0, ST.SUC, GCS_LNT, UQ_TYP_SEQ);
         return this.putPkt(pkt, true);
     }
@@ -3025,8 +3216,8 @@ export default class RQVAX {
             t = this.readW(ba, tbc, ma, u.rqxb);            /* fetch buffer */
             abc = tbc - t;                                  /* any xfer? */
             if (t) {                                        /* nxm? */
-                this.putp32(pkt, RW_WBCL, (bc - abc) >>> 0);        /* adj bc */
-                this.putp32(pkt, RW_WBAL, (ba + abc) >>> 0);        /* adj ba */
+                this.putp32(pkt, RW_WBCL, this.nxmResidual(bc, tbc, t));    /* adj bc */
+                this.putp32(pkt, RW_WBAL, this.nxmAddr(ba, tbc, t));        /* adj ba */
                 if (this.hbe(u)) this.rwEnd(u, EF_LOG, ST.HST | SB_HST_NXM);
                 return;
             }
@@ -3034,8 +3225,8 @@ export default class RQVAX {
             this.diskTrace(u, "sim_disk_rdsect", bl, tbc);
             if ((cmd === OP.RD) && !err) {                  /* read? */
                 if ((t = this.writeW(ba, tbc, ma, u.rqxb))) {        /* store, nxm? */
-                    this.putp32(pkt, RW_WBCL, (bc - (tbc - t)) >>> 0);
-                    this.putp32(pkt, RW_WBAL, (ba + (tbc - t)) >>> 0);
+                    this.putp32(pkt, RW_WBCL, this.nxmResidual(bc, tbc, t));
+                    this.putp32(pkt, RW_WBAL, this.nxmAddr(ba, tbc, t));
                     if (this.hbe(u)) this.rwEnd(u, EF_LOG, ST.HST | SB_HST_NXM);
                     return;
                 }
@@ -3527,6 +3718,32 @@ export default class RQVAX {
     cmpNxmAddr(bc, i, ba) { return (bc - i) >>> 0; }
 
     /**
+     * nxmResidual(bc, tbc, t) / nxmAddr(ba, tbc, t)
+     *
+     * The TWO adjustments rq_svc() makes to the working fields when a host DMA comes back short --
+     * `PUTP32 (pkt, RW_WBCL, bc - abc)` and `PUTP32 (pkt, RW_WBAL, ba + abc)` with `abc == tbc - t`.
+     *
+     * *** `t` IS WHAT THE DMA DID **NOT** MOVE, SO THE SUBTRAHEND IS `tbc - t` AND NOT `t`, AND IT
+     * IS SUBTRACTED FROM `bc` AND NOT FROM `tbc`. ***  On a transfer smaller than RQ_MAXFR those two
+     * are equal and every value agrees; on a CHUNKED one `bc` is the whole remaining count and `tbc`
+     * is only this chunk, so the residual a host reads back after a mid-chunk bus error is the
+     * bytes STILL OUTSTANDING ACROSS THE WHOLE COMMAND.  A model that reported the chunk's own
+     * shortfall passes every single-chunk case.
+     *
+     * The WRITE arm and the READ arm are the same arithmetic written twice in the C (once through a
+     * local `abc`, once inline) and they are ONE method here so that a mutation of the residual
+     * perturbs both -- which is what stops a "fix" of one arm being masked by the other agreeing.
+     * The COMPARE arm is deliberately NOT routed through these: it uses `bc - i` for BOTH fields,
+     * which is a different (and almost certainly wrong) expression, and cmpNxmAddr() above is its
+     * own seam for exactly that reason.
+     *
+     * @this {RQVAX}
+     */
+    nxmResidual(bc, tbc, t) { return (bc - (tbc - t)) >>> 0; }
+
+    nxmAddr(ba, tbc, t) { return (ba + (tbc - t)) >>> 0; }
+
+    /**
      * diskTrace(u, txt, lbn, len)
      *
      * sim_disk_data_trace() (sim_disk.c) reduced to what `set rq debug=REQ` alone produces.  Its
@@ -3890,20 +4107,65 @@ export default class RQVAX {
     traceReq(line) { this.reqLog.push({t: this.cpu ? this.cpu.nTotalCycles : 0, line}); }
 
     /**
-     * plf()
+     * plf(err)
      *
-     * rq_plf() builds and queues a "last failure" response PACKET, which is packet processing and
-     * therefore out of this item's scope.  It is reachable ONLY by a host that sets SA_S4H_LF in its
-     * step-4 GO word AFTER a fatal error, i.e. by a host that re-initialised a dead controller and
-     * asked for the last-failure log.  Named and thrown rather than silently skipped: a case that
-     * reaches it must fail the run, not quietly grade a controller that answered differently.
+     * rq_plf() (pdp11_rq.c:2713-2738), the PORT LAST FAILURE datagram -- pcjsvax-3c3.
+     *
+     * Reachable ONLY down one path: a host whose controller has gone FATAL re-initialises it and
+     * sets SA_S4H_LF alongside SA_S4H_GO in its step-4 word.  rq_quesvc()'s CST_S4 arm then does
+     * `if ((cp->saw & SA_S4H_LF) && cp->perr) rq_plf (cp, cp->perr); cp->perr = 0;`.
+     *
+     * FOUR things here are the C and each is separately observable:
+     *   1. *** THERE IS NO CF_THS TEST. ***  rq_hbe() and rq_dte() both open with one and rq_plf()
+     *      does not, so the last-failure log arrives on a controller that has never had error
+     *      logging enabled -- and it cannot have, because the fatal's own rq_reset() put `cflgs`
+     *      back to CF_RPL.  A model that copied rq_hbe()'s opening line would produce NOTHING here
+     *      and the difference is one whole packet.
+     *   2. It is a DATAGRAM (UQ_TYP_DAT) whose CONNECTION ID is then overwritten with UQ_CID_DIAG:
+     *      `cp->pak[pkt].d[UQ_HCTC] |= (UQ_CID_DIAG << UQ_HCTC_V_CID)` runs AFTER rq_putr(), which
+     *      has already written UQ_CID_MSCP (0) into that field -- so the OR is not a no-op, it turns
+     *      CID 0 into CID 0xFF.  Ordering those two the other way round leaves CID at 0.
+     *   3. The "opcode" word is FM_CNT, which is ZERO, so RSP_OPF comes out as LF_SNR shifted into
+     *      the FLAG half and nothing in the opcode half.
+     *   4. `perr` is cleared by the CALLER whether or not the packet was built, so a second GO with
+     *      SA_S4H_LF produces no second datagram.
+     *
+     * `err` is the caller's `cp->perr` and not read from state here, exactly as the C passes it.
      *
      * @this {RQVAX}
+     * @param {number} err
+     * @returns {boolean} the C's OK/ERR
      */
-    plf()
+    plf(err)
     {
-        throw new RQUnimplemented("rq.js: SA_S4H_LF with a pending port error requests a last-fail " +
-            "PACKET -- MSCP packet processing is pcjsvax-6a5's later children, not pcjsvax-c2c");
+        /* *** NO traceReq() HERE. ***  rq_plf()'s own sim_debug is DBG_**TRC**, not DBG_REQ -- unlike
+           rq_fatal()'s, which is DBG_REQ and IS traced above.  Every differential in this tree runs
+           the oracle with `set rq debug=REQ` and compares the stream as an ORDERED TEXT SEQUENCE, so
+           a line emitted here that the C emits on another channel is a spurious line failing every
+           case that reaches it.  The packet still appears, as rq_putpkt()'s own `rsp=0100, sts=000A`. */
+        let pkt = this.deqf();                              /* get log pkt */
+        if (pkt === null) return false;
+        this.spd(pkt, ELP_REFL, 0);                         /* ref = 0 */
+        this.spd(pkt, ELP_REFH, 0);
+        this.spd(pkt, ELP_UN, 0);                           /* no unit */
+        this.spd(pkt, ELP_SEQ, 0);                          /* no seq */
+        this.spd(pkt, PLF_CIDA, 0);                         /* cntl ID */
+        this.spd(pkt, PLF_CIDB, 0);
+        this.spd(pkt, PLF_CIDC, 0);
+        this.spd(pkt, PLF_CIDD, (RQVAX.RQ_CLASS << PLF_CIDD_V_CLS) |
+                                (RQVAX.CTLR_TAB[this.ctype].model << PLF_CIDD_V_MOD));
+        /* *** SVER AND HVER ARE THE OTHER WAY ROUND FROM rq_hbe()'s. ***  rq_hbe() writes
+           `(RQ_HVER << HBE_VER_V_HVER) | (RQ_SVER << HBE_VER_V_SVER)` and rq_plf() writes
+           `(RQ_SVER << PLF_VER_V_SVER) | (RQ_HVER << PLF_VER_V_HVER)` -- the same word, the two
+           terms transposed in the source.  Both shift positions are the same numbers, so the two
+           expressions are equal; transcribed in the C's own order anyway. */
+        this.spd(pkt, PLF_VER, (RQVAX.RQ_SVER << PLF_VER_V_SVER) |
+                               (RQVAX.RQ_HVER << PLF_VER_V_HVER));
+        this.spd(pkt, PLF_ERR, err & 0xFFFF);
+        this.putr(pkt, FM_CNT, LF_SNR, ST.CNT, PLF_LNT, UQ_TYP_DAT);
+        /* AFTER rq_putr(), which has just written UQ_CID_MSCP into this field.  See note 2. */
+        this.spd(pkt, UQ_HCTC, this.pd(pkt, UQ_HCTC) | (UQ_CID_DIAG << UQ_HCTC_V_CID));
+        return this.putPkt(pkt, true);
     }
 
     /**
@@ -3950,6 +4212,24 @@ RQVAX.RQ_HVER  = RQ_HVER;
 RQVAX.RQ_CLASS = RQ_CLASS;
 RQVAX.OP = OP;
 RQVAX.ST = ST;
+RQVAX.SB = SB;
+RQVAX.I = I;
+RQVAX.PE = PE;
+RQVAX.RW_VALID_LADDER = RW_VALID_LADDER;
+/** value -> name for the two tables tests/mscperrdiff.js reports coverage over BY NAME.  ST and PE
+    are both many-to-one nowhere -- no two ST_ codes share a value and no two PE_ codes do -- so the
+    inversion is lossless.  SB_ and I_ are NOT (I_BCNT == I_VRSN, SB_OFL_NV == SB_HST_OA), which is
+    why they are reported as the composite status word they appear in rather than on their own. */
+RQVAX.ST_NAME_OF = (function() {
+    let m = {};
+    for (let n of Object.keys(ST)) if (n !== "V_SUB" && n !== "V_INV") m[ST[n]] = n;
+    return m;
+})();
+RQVAX.PE_NAME_OF = (function() {
+    let m = {};
+    for (let n of Object.keys(PE)) m[PE[n]] = n;
+    return m;
+})();
 /** value -> name, inverted from OP so the dispatch never carries a second list of numbers. */
 RQVAX.OP_NAME_OF = (function() {
     let m = {};
@@ -3984,7 +4264,7 @@ export {
     UQ_HLNT, UQ_HCTC, UQ_HCTC_V_CR, UQ_HCTC_M_CR, UQ_HCTC_V_TYP, UQ_HCTC_M_TYP,
     UQ_HCTC_V_CID, UQ_HCTC_M_CID, UQ_TYP_SEQ, UQ_TYP_DAT,
     UQ_CID_MSCP, UQ_CID_TMSCP, UQ_CID_DUP, UQ_CID_DIAG,
-    OP, ST, I_OPCD, I_VRSN, I_FMTI, CMD_NAMES,
+    OP, ST, SB, I, PE, RW_VALID_LADDER, I_OPCD, I_VRSN, I_FMTI, CMD_NAMES,
     MSCP_UNIT_OPS, MSCP_NOP_OPS, MSCP_SCC_OP, MSCP_XFER_OPS,
     MSCP_OP_HANDLER, MSCP_METHOD, MSCP_EXCLUDED, MSCP_NOP_ARM,
     SB_SUC_ON, SB_OFL_NV, SB_AVL_INU, SB_WPR_HW, UID_DISK,
@@ -4013,7 +4293,9 @@ export {
     SB_WPR_SW, SB_HST_OA, SB_HST_OC, SB_HST_NXM, I_BCNT, I_LBN, EF_LOG,
     ELP_REFL, ELP_REFH, ELP_UN, ELP_SEQ,
     HBE_LNT, HBE_CIDA, HBE_CIDB, HBE_CIDC, HBE_CIDD, HBE_VER, HBE_RSV, HBE_BADL, HBE_BADH,
-    LF_SNR, FM_BAD, FM_SDE,
+    LF_SNR, FM_CNT, FM_BAD, FM_SDE,
+    PLF_LNT, PLF_CIDA, PLF_CIDB, PLF_CIDC, PLF_CIDD, PLF_VER, PLF_ERR,
+    PLF_CIDD_V_MOD, PLF_CIDD_V_CLS, PLF_VER_V_SVER, PLF_VER_V_HVER,
     RQ_MAXFR, RQ_MAPXFER, RQ_M_PFN, VA_N_OFF, VA_M_OFF, VA_V_VPN, VA_N_VPN, VA_M_VPN, PTE_V,
     RQ_DEV_NAMES, RQ_TICK_EVENTS_MAX,
     CF_RPL, CF_ATN, CF_THS, RQ_CLASS, RQ_HVER, RQ_SVER, RQ_DHTMO, RQ_DCTMO,
