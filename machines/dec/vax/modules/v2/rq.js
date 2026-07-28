@@ -13,19 +13,23 @@
  * WHAT THIS IS, AND WHAT IT IS NOT
  * ============================================================================
  * pcjsvax-c2c (the UQSSP initialisation state machine), pcjsvax-0b4 (the command/response RING
- * MACHINERY on top of it) and pcjsvax-f52 (UNITS: a user-supplied image attached to a drive, and the
- * seven unit-bearing MSCP commands that need no data transfer), the first three of pcjsvax-6a5's
- * children.  `open-simh/PDP11/pdp11_rq.c` is ~3,600 lines; THIS FILE IS:
+ * MACHINERY on top of it), pcjsvax-f52 (UNITS: a user-supplied image attached to a drive, and the
+ * seven unit-bearing MSCP commands that need no data transfer) and pcjsvax-346 (DATA TRANSFER: the
+ * five commands that move blocks), the first four of pcjsvax-6a5's children.
+ * `open-simh/PDP11/pdp11_rq.c` is ~3,600 lines; THIS FILE IS:
  *   rq_rd(), rq_wr(), rq_reset(), rq_step4(), rq_fatal(), rq_init_int(), rq_ring_int();
- *   BOTH branches of rq_quesvc();
+ *   ALL THREE branches of rq_quesvc(), including the unit queues;
  *   rq_deqf/rq_deqh/rq_enqh/rq_enqt, rq_getpkt/rq_putpkt, rq_getdesc/rq_putdesc, rq_putr;
  *   rq_mscp()'s dispatch, rq_scc(), the OP_CCD/OP_DAP/OP_FLU no-ops and the illegal-opcode default;
  *   drv_tab[], rq_getucb(), rq_putr_unit(), rq_setf_unit(), RQ_WPH/RQ_RMV;
  *   rq_set_type()/rq_set_wlk()/rq_attach()/rq_detach()'s AUTOSIZE arithmetic (sim_disk.c);
- *   rq_abo(), rq_avl(), rq_fmt(), rq_gcs(), rq_gus(), rq_onl(), rq_suc().
- * DISK I/O (rq_rw/rq_svc and the five transfer opcodes), attention/unit-available messages and
- * interrupt DELIVERY are NOT here; each is named in the EXCLUSIONS section below with the fence that
- * keeps a graded case from reaching it.
+ *   rq_abo(), rq_avl(), rq_fmt(), rq_gcs(), rq_gus(), rq_onl(), rq_suc();
+ *   rq_rw(), rq_rw_valid(), BOTH ENDS of rq_svc(), rq_io_complete(), rq_rw_end(), rq_hbe();
+ *   rq_map_ba(), rq_readb(), rq_readw(), rq_writew();
+ *   sim_disk_rdsect()/sim_disk_wrsect()'s RAW arm and sim_disk_data_trace()'s DBG_REQ line.
+ * Attention / unit-available messages, interrupt DELIVERY, ABORT and GET COMMAND STATUS against a
+ * transfer IN FLIGHT, and rq_dte()'s disk-error log are NOT here; each is named in the EXCLUSIONS
+ * section below with the fence that keeps a graded case from reaching it.
  *
  * TWO 16-BIT REGISTERS, NOT FOUR.  `IOLN_RQ` is 004 (pdp11_rq.c:1212) and rq_rd()/rq_wr() decode
  * `(PA >> 1) & 01`: IP at +0, SA at +2.  Measured on the live oracle, `SHOW QBA IOSPACE` prints
@@ -134,22 +138,17 @@
  * ============================================================================
  * SCOPE EXCLUSIONS -- each with the fence that makes it unreachable, not merely unvisited
  * ============================================================================
- *   THE FIVE DATA-TRANSFER MSCP COMMANDS.  rq_mscp() dispatches OP_ACC/CMP/ERS/RD/WR to rq_rw(),
- *     which starts a unit service and moves blocks.  They are pcjsvax-346's work; this file throws
- *     RQUnimplemented BY NAME rather than inventing an answer, and the list is not written down --
- *     it is every opcode whose C HANDLER is `rq_rw`, read out of MSCP_OP_HANDLER below, which
- *     tests/mscpscope.js re-derives from rq_mscp()'s own switch (opcode AND handler) every run.
- *     tests/mscpringdiff.js and tests/mscpunitdiff.js FAIL the run if any graded case sends one.
- *   AN IN-FLIGHT TRANSFER'S PACKET.  rq_abo() and rq_gcs() exist to inspect `uptr->cpkt` and
- *     `uptr->pktq`, and ONLY rq_rw() ever sets `cpkt`.  Their reachable behaviour with an idle unit
- *     IS implemented and graded (ST_SUC, ABO_LNT / GCS_LNT, the zeroed GCS status words); the arms
- *     that walk a unit's packets throw by name if a unit is ever found holding one.  Same for the
- *     `if (q && uptr->cpkt) rq_enqt (&uptr->pktq, pkt)` deferral in rq_avl/rq_onl/rq_suc/rq_fmt,
- *     which IS transcribed -- it is two lines and leaving it out would be a gap pcjsvax-346 has to
- *     rediscover -- but which no command in this file's scope can reach.
- *   THE UNIT QUEUES.  rq_quesvc()'s `for (i = 0; i < RQ_NUMDR; i++)` scan over `uptr->pktq` is
- *     transcribed, but only a deferral can put a packet there and only an in-flight transfer can
- *     cause a deferral, so the body is a throw, not a branch.
+ *   CANCELLING AN IN-FLIGHT TRANSFER.  rq_abo() and rq_gcs() inspect `uptr->cpkt` and `uptr->pktq`
+ *     to abort a transfer or report its working byte count.  pcjsvax-346 made that state REACHABLE
+ *     -- only rq_rw() ever sets `cpkt`, and now it does -- but did not take it into scope:
+ *     cancelling a transfer is neither a transfer nor a unit command.  The idle-unit behaviour IS
+ *     implemented and graded (ST_SUC, ABO_LNT / GCS_LNT, the zeroed GCS status words); the search
+ *     arms throw by name, and tests/mscprwdiff.js FAILS the run if a graded case sends ABORT or GET
+ *     COMMAND STATUS to a unit holding a packet.
+ *   rq_dte(), THE DISK TRANSFER ERROR LOG.  It hangs off `err != 0` from sim_disk, and on a RAW
+ *     container a read past the end of the file returns ZEROS and SCPE_OK rather than an error
+ *     (sim_disk.c:4416).  Only a failing pread(2)/pwrite(2) can reach it, which no do-file can
+ *     arrange, so there is no oracle for it at all -- see dte().
  *   MEDIA REMOVAL.  rq_avl()'s `if ((mdf & MD_SPD) && RQ_RMV (uptr)) sim_disk_unload (uptr)` spins
  *     a removable drive down.  sim_disk_unload() on this platform reaches
  *     sim_os_disk_unload_raw() -- the container is opened in RAW format, because sim_disk's AUTO
@@ -338,8 +337,14 @@ const ST = {
     BBR: 20, DIA: 31, V_SUB: 5, V_INV: 8
 };
 
+/* Invalid-command SUBCODES (pdp11_mscp.h:188-192).  *** I_BCNT AND I_VRSN ARE THE SAME VALUE ***
+   (12 << ST_V_INV), as are I_LBN and I_FMTI (28 << ST_V_INV) -- the header reuses the numbers for
+   different commands.  Written as four names because the C has four; a reader who finds two of them
+   comparing equal is looking at the header's own doing, not at a transcription error. */
 const I_OPCD        = 8 << ST.V_INV;            // inv opcode
+const I_BCNT        = 12 << ST.V_INV;           // inv byte cnt
 const I_VRSN        = 12 << ST.V_INV;           // inv version
+const I_LBN         = 28 << ST.V_INV;           // inv LBN
 const I_FMTI        = 28 << ST.V_INV;           // inv format
 
 /* Status SUBCODES (pdp11_mscp.h:167-181).  Each is `n << ST_V_SUB` -- written that way rather than
@@ -348,7 +353,11 @@ const I_FMTI        = 28 << ST.V_INV;           // inv format
 const SB_SUC_ON     = 8 << ST.V_SUB;            // already online
 const SB_OFL_NV     = 1 << ST.V_SUB;            // no volume
 const SB_AVL_INU    = 32 << ST.V_SUB;           // in use
+const SB_WPR_SW     = 128 << ST.V_SUB;          // swre write lock
 const SB_WPR_HW     = 256 << ST.V_SUB;          // hwre write lock
+const SB_HST_OA     = 1 << ST.V_SUB;            // odd address
+const SB_HST_OC     = 2 << ST.V_SUB;            // odd count
+const SB_HST_NXM    = 3 << ST.V_SUB;            // nx memory
 
 /* Unit identifier class (pdp11_mscp.h:37) */
 const UID_DISK      = 2;                        // disk class
@@ -361,6 +370,18 @@ const UF_RMV        = 0x0080;                   // d: removable
 const UF_CMW        = 0x0002;                   // cmp writes NI
 const UF_CMR        = 0x0001;                   // cmp reads NI
 const UF_MSK        = UF_CMR | UF_CMW;          // settable flags
+
+/** END FLAGS (pdp11_mscp.h:92).  EF_LOG is the only one this tree can reach: rq_svc() sets it on the
+    end packet of a transfer that took a host bus error, and ONLY when rq_hbe() agreed -- which it
+    does whether or not CF_THS is set, because its "logging disabled" arm also returns OK.  So
+    EF_LOG appears both with and without an actual log packet, and both are graded. */
+const EF_LOG        = 0x0020;                   // b: error log
+
+/** ERROR-LOG flags and formats (pdp11_mscp.h:130-138).  LF_SNR is the only log flag rq_hbe() and
+    rq_dte() ever set, FM_BAD is the host-bus-error format and FM_SDE the small-disk-error one. */
+const LF_SNR        = 0x0001;                   // b: seq # reset
+const FM_BAD        = 1;                        // b: bad host addr
+const FM_SDE        = 4;                        // d: sm disk err
 
 /* Command MODIFIERS (pdp11_mscp.h:66-88).  NOTE MD_NXU AND MD_SPD ARE THE SAME BIT (0x0001) with
    different meanings per command -- GET UNIT STATUS reads it as "next unit", AVAILABLE as
@@ -485,19 +506,66 @@ const SCC_VER_V_HVER = 8;
 const SCC_CIDD_V_MOD = 0;
 const SCC_CIDD_V_CLS = 8;
 
-/* Read/write packet words -- referenced ONLY by the DBG_REQ trace line, which prints them for every
-   command whatever the opcode (pdp11_rq.c:1865).  That is why a command packet's untouched tail
-   shows up in the trace, and why the trace is evidence that the WHOLE 64 bytes round-tripped. */
-const RW_BCL        = 8;
+/* ------------------------------------------------------------------------------------------- *
+ * The DATA TRANSFER packet (pdp11_mscp.h:395-417) -- the disk arm, not the tape one.             *
+ *                                                                                                *
+ * *** THE HOST'S FIELDS AND THE CONTROLLER'S WORKING COPIES ARE DIFFERENT WORDS. ***  rq_rw()     *
+ * copies BAL/BAH/BCL/BCH/LBNL/LBNH/MAPL/MAPH into WBAL/WBCL/WBLL/WMPL and then chunks against the *
+ * WORKING copies only; the ORIGINALS stay exactly as the host sent them, and rq_rw_end() reports  *
+ * `bc - wbc` -- BYTES PROCESSED -- back into RW_BCL over the host's own number.  A model that     *
+ * decremented RW_BCL in place would produce a residual of 0 on every successful transfer, which   *
+ * is also what the correct code produces, and would differ only on the failure paths.             *
+ * ------------------------------------------------------------------------------------------- */
+const RW_LNT_D      = 32;                       // disk transfer response length
+const RW_BCL        = 8;                        // byte count
 const RW_BCH        = 9;
-const RW_BAL        = 10;
+const RW_BAL        = 10;                       // buffer descriptor
 const RW_BAH        = 11;
-const RW_LBNL       = 16;
+const RW_MAPL       = 12;                       // map table
+const RW_MAPH       = 13;
+const RW_LBNL       = 16;                       // LBN
 const RW_LBNH       = 17;
+const RW_WBCL       = 18;                       // working bc
+const RW_WBCH       = 19;
+const RW_WBAL       = 20;                       // working ba
+const RW_WBAH       = 21;
+const RW_WBLL       = 22;                       // working lbn
+const RW_WBLH       = 23;
+const RW_WMPL       = 24;                       // working map
+const RW_WMPH       = 25;
 
-/* pdp11_mscp.h:100 */
+/* ERROR LOG packets (pdp11_mscp.h:428-510).  The common header is ELP_; rq_hbe() builds the HOST
+   BUS ERROR body and rq_dte() the DISK TRANSFER ERROR body.  ELP_FF and ELP_EVT are RSP_OPF and
+   RSP_STS -- the same two words rq_putr() always writes -- which is why an error log needs no
+   special path out of rq_putr(): its "opcode" is a FORMAT and its "status" is an EVENT. */
+const ELP_REFL      = 2;                        // ref #
+const ELP_REFH      = 3;
+const ELP_UN        = 4;                        // unit
+const ELP_SEQ       = 5;
+
+const HBE_LNT       = 28;
+const HBE_CIDA      = 8;                        // ctrl ID
+const HBE_CIDB      = 9;
+const HBE_CIDC      = 10;
+const HBE_CIDD      = 11;
+const HBE_VER       = 12;                       // ctrl version
+const HBE_RSV       = 13;                       // reserved
+const HBE_BADL      = 14;                       // bad address
+const HBE_BADH      = 15;
+const HBE_CIDD_V_MOD = 0;
+const HBE_CIDD_V_CLS = 8;
+const HBE_VER_V_SVER = 0;
+const HBE_VER_V_HVER = 8;
+
+/* pdp11_mscp.h:100-105 */
 const CF_RPL        = 0x8000;                   // ctrl bad blk repl
 const CF_ATN        = 0x0080;                   // enb attention
+/** `if ((cp->cflgs & CF_THS) == 0) return OK;` opens rq_hbe(), rq_dte() and rq_plf(): with THIS
+    HOST messages disabled -- which is the state after every reset, since rq_reset() sets `cflgs`
+    to CF_RPL alone -- an error log is silently not built and the caller is told it succeeded.  A
+    host turns it on with SET CONTROLLER CHARACTERISTICS, and BOTH states are graded, because they
+    produce the same END packet and a different number of packets on the response ring. */
+const CF_THS        = 0x0010;                   // enb this host msgs
 
 /* ------------------------------------------------------------------------------------------- *
  * pdp11_rq.c's own constants                                                                    *
@@ -520,6 +588,44 @@ const CST_NAMES = ["CST_S1", "CST_S1_WR", "CST_S2", "CST_S3", "CST_S3_PPA", "CST
 
 const RQ_CLASS      = 1;                        // RQ class: mass storage controllers
 const RQ_NUMBY      = 512;                      // bytes per block
+/** `#define RQ_MAXFR (1 << 16)` (pdp11_rq.c:154) -- the largest byte count ONE unit service will
+    move.  A larger transfer is CHUNKED: rq_svc() moves RQ_MAXFR, rewrites the working buffer
+    address / byte count / block number, and re-activates its own unit at delay 0.  So a 192KB
+    READ is three services, three disk reads and three DMAs -- and exactly ONE end packet. */
+const RQ_MAXFR      = 1 << 16;                  // max xfer
+/** `#define RQ_MAPXFER (1u << 31)` (pdp11_rq.c:155) -- BIT 31 OF THE HOST BUFFER ADDRESS selects a
+    SECOND, MSCP-LEVEL map.  *** IT IS NOT THE CQBIC SCATTER-GATHER MAP. ***  rq_map_ba() reads its
+    entries out of ORDINARY MEMORY with ReadL() at `ma + (VA_GETVPN(ba) << 2)`, where `ma` is the
+    32-bit map-table address the HOST supplied in the command packet's RW_MAPL/RW_MAPH; the address
+    that lookup produces is then handed to Map_ReadB/Map_WriteW and goes through the CQBIC map on
+    top.  Two levels, two tables, and conflating them is the single easiest error in rq_readw().
+    *** THE FLAG BIT IS MASKED OUT OF THE INDEX, AND FINDING THAT COST A MACHINE CHECK. ***
+    rq_map_ba() indexes with VA_GETVPN(ba), and VA_M_VPN is `(1u << (31 - VA_N_OFF)) - 1` -- TWENTY-
+    TWO bits, 0x3FFFFF, NOT the 23 bits a reader counting a 32-bit address minus a 9-bit offset
+    arrives at.  So bit 31 falls off and the entry index is simply the Qbus PAGE NUMBER; the map
+    table sits at `ma` with no bias.  A 23-bit mask puts the index 0x1000000 bytes higher, which on
+    a 16MB machine is not memory at all -- and ReadL() of a non-memory address is ReadReg(), which
+    sets CBTCR's BTO and RWT and takes a MACHINE CHECK *from inside the DMA*.  Measured on the live
+    oracle exactly that way: MCHK code 0x80, BTO = C0000000, the unit left holding cpkt with no
+    response, and the frame's "most recent VA" pointing at the host's polling loop rather than at
+    anything to do with the fault. */
+const RQ_MAPXFER    = 0x80000000;               // mapped xfer
+const RQ_M_PFN      = 0x1FFFFF;                 // map entry PFN
+
+/* vax_defs.h:257-275, the four constants rq_map_ba() borrows from the CPU's own page tables.  They
+   are NOT imported from cqbic.js: the C gets them from vax_defs.h exactly as vax_io.c does, and
+   tests/mscprwdiff.js asserts that this file's VA_M_OFF is cqbic.js's, so the two cannot drift
+   apart without failing a run. */
+const VA_N_OFF      = 9;                        // offset size
+const VA_M_OFF      = (1 << VA_N_OFF) - 1;      // 0x1FF
+const VA_V_VPN      = VA_N_OFF;
+/** `VA_N_VPN` is `(31 - VA_N_OFF)` -- THIRTY-ONE, not 32 -- so the VPN is TWENTY-TWO bits and the
+    mask is 0x3FFFFF.  Computed rather than written as a literal, because the literal a reader
+    derives from "a 32-bit address minus a 9-bit offset" is 0x7FFFFF and it is wrong; see
+    RQ_MAPXFER above for what that costs. */
+const VA_N_VPN      = 31 - VA_N_OFF;
+const VA_M_VPN      = (Math.pow(2, VA_N_VPN) - 1) >>> 0;
+const PTE_V         = 0x80000000;               // valid
 const RQ_MAXDR      = 254;                      // max # drives
 /** RQ_TIMER == RQ_MAXDR and RQ_QUEUE == RQ_MAXDR+1 (pdp11_rq.c:195-196): the DEVICE declares
     RQ_MAXDR+2 units and the last TWO ARE NOT DRIVES.  Published as a number so a reader can check
@@ -540,6 +646,14 @@ const RQ_PKT_SIZE   = RQ_PKT_SIZE_W * 2;
     arm's 200/500 are a DIFFERENT machine and are not what this file models).  All four are SIMH
     REGISTERS: settable and examinable, which is why mscpinitdiff.js pins them on the oracle instead
     of trusting the defaults to be these. */
+/** The absolute bound on events serviced at ONE instruction boundary -- HANDOFF.md standing rule 4
+    (a bound that fails and does not scale with the work).  Derived from the largest transfer
+    rq_rw_valid() will accept: `bc & 0xF0000000` is rejected, so 0x0FFFFFFF bytes is the ceiling,
+    that many bytes is ceil(0x0FFFFFFF / RQ_MAXFR) chunks, and each chunk is a top end and a bottom
+    end.  Slack for the queue services around it.  Computed rather than written down so a change to
+    RQ_MAXFR carries into it. */
+const RQ_TICK_EVENTS_MAX = Math.ceil(0x0FFFFFFF / RQ_MAXFR) * 2 + 16;
+
 const RQ_ITIME      = 450;                      // init time, except stage 4
 const RQ_ITIME4     = 10;                       // stage 4
 const RQ_QTIME      = 100;                      // response time for 'immediate' packets
@@ -693,14 +807,15 @@ const MSCP_OP_HANDLER = {
     rather than a list, so it cannot disagree with MSCP_OP_HANDLER above. */
 const MSCP_METHOD = {
     rq_abo: "abo", rq_avl: "avl", rq_fmt: "fmt", rq_gcs: "gcs",
-    rq_gus: "gus", rq_onl: "onl", rq_scc: "scc", rq_suc: "suc"
+    rq_gus: "gus", rq_onl: "onl", rq_rw: "rw", rq_scc: "scc", rq_suc: "suc"
 };
 
-/** Why `rq_rw` is not in MSCP_METHOD, phrased for the exception a graded case would see. */
-const MSCP_EXCLUDED = {
-    rq_rw: "rq_rw() starts a unit service and moves blocks between the image and host memory; " +
-           "data transfer is pcjsvax-346's work, not pcjsvax-f52's"
-};
+/** WHY THIS IS EMPTY, AND WHY IT STAYS.  Every handler rq_mscp() dispatches to now has a method
+    above -- pcjsvax-346 added `rq_rw`, which was the last one.  The guard in mscp() is NOT dead
+    code: PHASE S re-derives rq_mscp()'s switch from the C on every run, so a vendor update that
+    routed an opcode to a NEW handler would land here, and an empty reason string reads as "no
+    reason recorded, which is itself a defect" rather than as an answer invented on the spot. */
+const MSCP_EXCLUDED = {};
 
 /** Dispatched by the C to a handler that needs a UNIT -- i.e. everything but SET CONTROLLER
     CHARACTERISTICS and the no-op arm.  DERIVED from the handler map rather than written down, so it
@@ -717,9 +832,15 @@ const MSCP_NOP_OPS  = Object.keys(MSCP_OP_HANDLER).filter((n) => MSCP_OP_HANDLER
     machinery and nothing else. */
 const MSCP_SCC_OP   = "SCC";
 
-/** The opcodes still out of scope, DERIVED: every one whose C handler has no method here. */
-const MSCP_XFER_OPS = Object.keys(MSCP_OP_HANDLER).filter(
-    (n) => MSCP_OP_HANDLER[n] !== MSCP_NOP_ARM && !(MSCP_OP_HANDLER[n] in MSCP_METHOD));
+/** THE FIVE DATA-TRANSFER COMMANDS, DERIVED: every opcode whose C handler is rq_rw().  Defined by
+    the HANDLER and not by "whatever rq.js has not implemented yet", because its consumers are
+    FENCES -- tests/mscpringdiff.js and tests/mscpunitdiff.js fail their run if a case sends one,
+    and tests/mscprwdiff.js requires every one of them to have been sent.  Had it stayed "the ops
+    with no method here" it would have silently become EMPTY the moment pcjsvax-346 implemented
+    them, and two differentials' exclusion fences would have gone quietly vacuous -- which is
+    HANDOFF.md standing rule 13 (a gate that stops measuring) with the trigger being progress in
+    the thing being measured, exactly as it was for romdiff. */
+const MSCP_XFER_OPS = Object.keys(MSCP_OP_HANDLER).filter((n) => MSCP_OP_HANDLER[n] === "rq_rw");
 
 /** vax_io.c:155-style autoconfiguration, VERIFIED rather than assumed: `IOBA_AUTO` leaves the RQ
     DIB's base to pdp11_io_lib.c, and tests/mscpinitdiff.js re-reads `SHOW QBA IOSPACE` from the live
@@ -740,6 +861,7 @@ class RQUnimplemented extends Error {}
  *      byteLength                  the container's size in bytes, a non-negative integer
  *      read(offset, length, dst)   fill `dst` (a Uint8Array) with `length` bytes from `offset`,
  *                                  returning the number of bytes actually delivered
+ *      write(offset, length, src)  OPTIONAL -- store `length` bytes of `src` at `offset`
  *
  * and nothing else.  The Node differential wraps `fs`, a browser wraps a `File`/`Blob` read into an
  * ArrayBuffer, and THIS FILE IMPORTS NEITHER -- which is what makes HANDOFF.md 8's decision (ship no
@@ -747,12 +869,20 @@ class RQUnimplemented extends Error {}
  * server.  The controller must not be able to tell which it has, so `attach()` never inspects
  * anything but these two members.
  *
- * *** NOTHING IN THIS ITEM CALLS read(). ***  Block transfer is pcjsvax-346.  It is nevertheless
- * REQUIRED here and checked here, because a provider that silently lacks it would satisfy every
- * grading this file can do and fail only much later, in a different item, against a different
- * oracle -- and because a contract whose unused half is unenforced is not a contract.  The check is
- * itself graded: tests/mscpunitdiff.js attaches three malformed providers and requires each to be
- * refused BY NAME.
+ * `read()` was REQUIRED here from pcjsvax-f52 onwards even though nothing in that item called it,
+ * because a provider that silently lacked it would satisfy every grading f52 could do and fail only
+ * much later, in a different item, against a different oracle.  pcjsvax-346 is that item, and the
+ * check paid: it calls read() on every transfer.
+ *
+ * `write()` IS OPTIONAL, AND ITS ABSENCE IS NOT AN ERROR -- IT IS A READ-ONLY ATTACHMENT.  That is
+ * sim_disk_attach_ex2()'s own behaviour (sim_disk.c:2894-2905): it opens the container "rb+", and
+ * if that fails it reopens "rb", sets UNIT_RO and prints "Unit is read only".  A browser `File` is
+ * exactly such a container.  attach() below reproduces it, and the consequence is OBSERVABLE and
+ * graded rather than asserted: a read-only unit skips autosize's `container < current` clamp, so a
+ * small file leaves a SMALLER capacity than the same file attached writable.
+ *
+ * The check is itself graded: tests/mscpunitdiff.js attaches four malformed providers and requires
+ * each to be refused BY NAME.
  *
  * @param {Object} p
  * @returns {Object} the same provider
@@ -771,6 +901,11 @@ function checkProvider(p)
         throw new Error("rq.js: the image provider has no read(offset, length, dst) -- nothing in " +
             "pcjsvax-f52 calls it, which is exactly why it is checked here rather than discovered " +
             "missing by pcjsvax-346's first data transfer");
+    }
+    if (p.write !== undefined && typeof p.write !== "function") {
+        throw new Error("rq.js: the image provider's write must be a function or absent; a " +
+            "provider with a non-callable `write` would be taken for a writable container and " +
+            "fail on the first OP_WR rather than attaching read-only");
     }
     return p;
 }
@@ -794,12 +929,29 @@ function bufferProvider(buf)
             let n = Math.max(0, Math.min(length, u8.length - offset));
             dst.set(u8.subarray(offset, offset + n));
             return n;
+        },
+        /* pwrite(2)'s semantics, which is what sim_os_disk_wrsect() uses: bytes past the end of the
+           container are DROPPED here rather than extending it, because this buffer cannot grow --
+           and a container that grew would change the unit's capacity underneath the guest.  The
+           return is the count actually stored, exactly as read() returns the count delivered. */
+        write(offset, length, src) {
+            let n = Math.max(0, Math.min(length, u8.length - offset));
+            u8.set(src.subarray(0, n), offset);
+            return n;
         }
     };
 }
 
 /** printf's `%04X`, which is what every field of the DBG_REQ trace is printed with. */
 function h4(v) { return (v & 0xFFFF).toString(16).toUpperCase().padStart(4, "0"); }
+
+/** printf's `%08X`, which is what sim_disk_data_trace()'s `lbn:` and `len:` fields use. */
+function h8(v) { return (v >>> 0).toString(16).toUpperCase().padStart(8, "0"); }
+
+/** The four RQ device names (pdp11_rq.c's rq_dev/rqb_dev/rqc_dev/rqd_dev), indexed by controller
+    number.  Read by sim_uname() and therefore by the disk trace lines; RQB/RQC/RQD are DEV_DIS on
+    a microvax3900 and exist here only so `cnum` stays a genuine parameter. */
+const RQ_DEV_NAMES  = ["RQ", "RQB", "RQC", "RQD"];
 
 /**
  * @class RQVAX
@@ -838,6 +990,10 @@ export default class RQVAX {
         /* The RQ_QUEUE unit's event-queue slot: a deadline in cpu.nTotalCycles units, or null for
            "not active".  `sim_is_active (uptr)` is exactly `queDue !== null`. */
         this.queDue = null;
+        /** Insertion order, the tie-break scp.c's delta list gives events due at the same
+            instruction.  A plain counter, never reset: it decides only relative order. */
+        this.evSeq = 0;
+        this.queSeq = 0;
         this.pakLink = new Uint16Array(RQ_NPKTS);
         this.pakData = new Uint16Array(RQ_NPKTS * RQ_PKT_SIZE_W);
 
@@ -850,7 +1006,17 @@ export default class RQVAX {
 
            The RQ_TIMER and RQ_QUEUE pseudo-units are NOT here -- see the file header. */
         this.units = [RD54_DTYPE, RD54_DTYPE, RD54_DTYPE, RX50_DTYPE].map((dtype, i) => ({
-            plug: i, dtype, flags: 0, uf: 0, capac: DRV_TAB[dtype].lbn, cpkt: 0, pktq: 0, image: null
+            plug: i, dtype, flags: 0, uf: 0, capac: DRV_TAB[dtype].lbn, cpkt: 0, pktq: 0, image: null,
+            /* THE DRIVE'S OWN EVENT-QUEUE SLOT and the three fields rq_io_complete() writes.
+               `due` is `sim_is_active (uptr)` -- a deadline in cpu.nTotalCycles units or null --
+               and it is a SEPARATE slot from the RQ_QUEUE thread's `queDue`, because in the C they
+               are different UNITs on one queue and both can be pending at once.
+               `ioComplete` is what splits rq_svc() into its top and bottom ends, and *** NOTHING
+               CLEARS IT ON RESET ***: rq_reset() calls sim_cancel() on every unit and never touches
+               io_complete, so a controller re-initialised in the middle of a transfer resumes at the
+               BOTTOM end of a read that no longer has a packet.  Reproduced; tests/mscprwdiff.js
+               fences it by requiring every graded case to end with it clear. */
+            due: null, ioStart: 0, ioComplete: 0, ioStatus: 0
         }));
         if (this.units.length !== RQ_NUMDR) {
             throw new Error("rq.js: the units array must hold exactly RQ_NUMDR drives and no " +
@@ -864,6 +1030,21 @@ export default class RQVAX {
         this.descBuf = new Uint8Array(4);
         this.pktBuf = new Uint8Array(RQ_PKT_SIZE);
         this.flagBuf = new Uint8Array(2);
+        /** ONE BYTE at a time is what rq_svc()'s COMPARE loop asks rq_readb() for, and allocating a
+            one-element array per byte of a 64KB compare is precisely what standing rule 14 is
+            about.  One buffer, reused. */
+        this.cmpBuf = new Uint8Array(1);
+        /** ONE 512-byte page, staged for the RQ_MAPXFER loops -- see readB()/readW()/writeW(). */
+        this.pageBuf = new Uint8Array(RQ_NUMBY);
+        /** `uptr->rqxb`, PER UNIT -- `realloc (uptr->rqxb, (RQ_MAXFR >> 1) * sizeof (uint16))`,
+            i.e. RQ_MAXFR BYTES each.  *** PER UNIT AND NOT PER CONTROLLER, AND THAT IS NOT AN
+            ECONOMY QUESTION. ***  Two drives can have transfers in flight at the same time: each
+            rq_svc() top end fills its own rqxb and returns, and the bottom ends run later and in
+            either order, so one shared buffer would let the second top end overwrite the first
+            unit's sectors before its bottom end DMAed them.  Allocated ONCE here and never
+            re-allocated per transfer (standing rule 14); rq_reset()'s realloc() preserves contents
+            and so does this. */
+        for (let u of this.units) u.rqxb = new Uint8Array(RQ_MAXFR);
 
         /** The `set rq debug=REQ` stream -- see the file header.  A diagnostic, not device state:
             nothing here reads it and neither reset() nor powerUp() clears it, because SIMH's debug
@@ -954,10 +1135,16 @@ export default class RQVAX {
            disk, and a model that dropped the image on reset would make every case after the first
            look unattached. */
         for (let u of this.units) {
+            u.due = null;                                   /* sim_cancel (uptr) */
             u.flags = u.flags & ~(U_ONL | U_ATP);
             u.uf = 0;
             u.cpkt = 0;
             u.pktq = 0;
+            /* `io_complete`, `io_status`, `iostarttime` and the contents of `rqxb` are DELIBERATELY
+               NOT cleared: rq_reset()'s per-unit loop is sim_cancel / sim_disk_reset / cnum /
+               flags / uf / cpkt / pktq / realloc(rqxb) and nothing else, and realloc PRESERVES the
+               buffer.  So a controller re-initialised between a read's two halves keeps
+               io_complete set.  tests/mscprwdiff.js fences that state rather than tidying it. */
         }
         /* `for (i = cp->max_plug = 0; i < numunits - 2; i++) if (!DIS && plug > max_plug) max_plug =
            plug;` -- recomputed on every reset, not maintained, and read by exactly one thing:
@@ -1186,10 +1373,43 @@ export default class RQVAX {
 
         let readOnly = !!opts.readOnly || !!(u.flags & U_RO);
         if (DRV_TAB[u.dtype].flgs & RQDF_RO) readOnly = true;
+        /* sim_disk_attach_ex2()'s "rb+" -> "rb" fallback (sim_disk.c:2894-2905): a container that
+           cannot be opened for writing is attached READ ONLY, not refused.  A provider with no
+           write() is that container.  This is not a courtesy -- it changes the autosize arm taken
+           two lines below, and therefore the unit's capacity, which is graded. */
+        if (typeof provider.write !== "function") readOnly = true;
 
+        /* *** AUTOSIZE HAS TWO ARMS AND WHICH ONE RUNS DEPENDS ON THE CONTAINER'S CONTENTS. ***
+           sim_disk_attach_ex2()'s "autosize by changing capacity" arm (sim_disk.c:3271-3287) is:
+
+               if (filesystem_size != -1) {                 // a file system was RECOGNISED
+                   if (filesystem_size >= container_size)   //   the volume declares its own size
+                       container_size = filesystem_size;
+               } else {                                     // unrecognised
+                   if (container_size < current_unit_size && !READ-ONLY)
+                       container_size = current_unit_size;  //   clamp UP to the drive
+               }
+               capac = container_size / 512;
+
+           and `container_size` itself is sim_disk_size(), which already returns the LARGER of the
+           physical file and the file system.  pcjsvax-f52 measured only the second arm, because a
+           pattern-filled scratch file has no file system to recognise -- and recorded the first as
+           unreachable.  A REAL OpenVMS volume reaches it: /home/baron/vax1/data/d0.dsk is
+           1,503,736,320 bytes = 2,936,985 blocks, its ODS-2 storage control block declares 2,940,951
+           sectors, and the oracle reports CAPAC 2,940,951 -- *** A UNIT LARGER THAN ITS OWN
+           CONTAINER, read-only attachment or not. ***  That is what makes a transfer near the end of
+           the volume read past the end of the file and come back zero-filled.
+
+           `filesystemBytes` is how the provider reports it.  Parsing ODS-2 is a FILE SYSTEM
+           PARSER and stays out of this file (pcjsvax-f52's exclusion still stands); what belongs
+           here is the arithmetic, which is the controller's. */
         let container = provider.byteLength;
         let current = u.capac * RQ_NUMBY;
-        if (container < current && !readOnly) container = current;
+        let fsBytes = provider.filesystemBytes;
+        if (typeof fsBytes === "number" && fsBytes >= 0) {
+            if (fsBytes > container) container = fsBytes; /* sim_disk_size(): the larger of the two */
+            if (fsBytes >= container) container = fsBytes;
+        } else if (container < current && !readOnly) container = current;
         u.capac = Math.floor(container / RQ_NUMBY);
 
         u.image = provider;
@@ -1309,6 +1529,120 @@ export default class RQVAX {
            within a few million instructions of a ROM boot, and an int32 coercion here would make the
            deadline go negative and the event fire immediately, forever. */
         this.queDue = this.cpu.nTotalCycles + delay;
+        this.queSeq = this.evSeq++;
+    }
+
+    /**
+     * activateUnit(u, delay)
+     *
+     * `sim_activate (uptr, delay)` for a DRIVE.  Same function as activateQueue() above and the
+     * same guard, on a DIFFERENT event-queue slot: in the C these are different UNITs on one
+     * ordered queue and both can be pending at once (the queue thread waiting out `qtime` while a
+     * drive waits out `xtime`), so one shared deadline would serialise events the simulator
+     * interleaves.
+     *
+     * `evSeq` is the tie-break, and it is the C's delta list rather than an invention: scp.c's
+     * _sim_activate() walks the queue inserting before the first entry whose remaining time is
+     * STRICTLY GREATER, so two events due at the same instruction fire in the order they were
+     * queued.  Ordering them by unit index instead would be indistinguishable in most cases and
+     * wrong whenever a drive and the queue thread come due together, which is exactly what the end
+     * of a transfer arranges.
+     *
+     * @this {RQVAX}
+     * @param {Object} u
+     * @param {number} delay in instructions
+     */
+    activateUnit(u, delay)
+    {
+        if (u.due !== null) return;                         /* sim_is_active -> no-op */
+        if (!this.cpu) throw new Error("rq.js: activateUnit() with no CPU clock -- tick() has never run");
+        u.due = this.cpu.nTotalCycles + delay;
+        u.seq = this.evSeq++;
+    }
+
+    /**
+     * activateUnitNotBefore(u, when)
+     *
+     * `sim_activate_notbefore (uptr, rtime)` (scp.c), which rq_io_complete() uses and nothing else
+     * does.  The C cancels the unit, reads `sim_grtime()`, and then
+     *
+     *      if (0x80000000 <= urtime - rtimenow) _sim_activate (uptr, 0);
+     *      else sim_activate (uptr, urtime - rtimenow);
+     *
+     * -- an UNSIGNED comparison, i.e. "if the requested absolute time has already passed, run now".
+     *
+     * *** THAT PAST-DEADLINE ARM IS THE NORMAL CASE FROM THE SECOND CHUNK ONWARDS, AND IT IS WHY A
+     * MULTI-CHUNK TRANSFER COSTS xtime ONCE RATHER THAN ONCE PER CHUNK. ***  `iostarttime` is set
+     * in rq_rw() and never updated between chunks, so chunk 2's completion asks to run at
+     * `iostarttime + xtime`, which is already behind.  It is measurable -- the host's in-band poll
+     * counts the difference -- and it is the kind of thing a re-derivation gets wrong by writing
+     * the obvious "wait xtime per chunk".
+     *
+     * The C's wrap test is written here as a signed comparison plus an explicit bound: this tree's
+     * clock is a monotonically increasing double, so the two agree for every reachable delta, and a
+     * delta big enough for them to disagree is reported by name rather than silently taken as
+     * "already past".
+     *
+     * @this {RQVAX}
+     * @param {Object} u
+     * @param {number} when absolute deadline in cpu.nTotalCycles units
+     */
+    activateUnitNotBefore(u, when)
+    {
+        if (!this.cpu) throw new Error("rq.js: activateUnitNotBefore() with no CPU clock");
+        u.due = null;                                       /* sim_cancel (uptr) */
+        let now = this.cpu.nTotalCycles;
+        let d = when - now;
+        if (d > 0x7FFFFFFF) {
+            throw new Error("rq.js: activateUnitNotBefore() asked for a deadline " + d + " " +
+                "instructions out.  The C decides past-vs-future with an UNSIGNED 32-bit compare, " +
+                "which reads a delta this large as ALREADY PAST; this tree's clock is a 53-bit " +
+                "double and would wait.  The two models disagree here and nothing may be graded " +
+                "across that boundary.");
+        }
+        this.activateUnit(u, d > 0 ? d : 0);
+    }
+
+    /**
+     * nextEvent()
+     *
+     * The head of the controller's slice of SIMH's event queue: the pending event with the earliest
+     * deadline, ties broken by insertion order.  Returns null when nothing is queued.
+     *
+     * @this {RQVAX}
+     * @returns {?Object} {due, seq, unit} -- `unit` null for the RQ_QUEUE thread
+     */
+    nextEvent()
+    {
+        let best = null;
+        if (this.queDue !== null) best = {due: this.queDue, seq: this.queSeq, unit: null};
+        for (let u of this.units) {
+            if (u.due === null) continue;
+            if (!best || u.due < best.due || (u.due === best.due && u.seq < best.seq)) {
+                best = {due: u.due, seq: u.seq, unit: u};
+            }
+        }
+        return best;
+    }
+
+    /**
+     * dispatchEvent(e)
+     *
+     * Service one queued event: clear its slot FIRST (the C pops the entry off the queue before
+     * calling `uptr->action`, which is what lets a service re-arm its own unit) and then run it.
+     *
+     * @this {RQVAX}
+     * @param {Object} e
+     */
+    dispatchEvent(e)
+    {
+        if (e.unit === null) {
+            this.queDue = null;
+            this.quesvc();
+        } else {
+            e.unit.due = null;
+            this.svc(e.unit);
+        }
     }
 
     /**
@@ -1325,9 +1659,24 @@ export default class RQVAX {
     tick(cpu)
     {
         this.cpu = cpu;
-        if (this.queDue !== null && cpu.nTotalCycles >= this.queDue) {
-            this.queDue = null;
-            this.quesvc();
+        /* `do { ... } while ((reason == SCPE_OK) && (sim_interval <= 0))` -- sim_process_event()
+           services EVERY event whose time has come, not one, and a service that re-arms its own
+           unit at delay 0 is serviced again in the SAME pass.  That is not a corner case here: it
+           is how rq_svc() chunks a transfer larger than RQ_MAXFR, and how a completed command's
+           second queue service (the one that finds the ring empty and clears `pip`) reaches the
+           host.  A loop that serviced one event per instruction would stretch a 3-chunk transfer
+           across 3 extra instructions and every in-band poll count would be wrong. */
+        for (let n = 0; ; n++) {
+            let e = this.nextEvent();
+            if (e === null || cpu.nTotalCycles < e.due) break;
+            if (n > RQ_TICK_EVENTS_MAX) {
+                throw new Error("rq.js: tick() serviced " + n + " events at one instruction " +
+                    "boundary without the queue going quiet.  The largest legal transfer is " +
+                    "0x0FFFFFFF bytes, i.e. " + Math.ceil(0x0FFFFFFF / RQ_MAXFR) + " chunks of two " +
+                    "services each, so a run past this bound is a service re-arming itself " +
+                    "without making progress rather than a large transfer.");
+            }
+            this.dispatchEvent(e);
         }
     }
 
@@ -1350,8 +1699,16 @@ export default class RQVAX {
      * response-ring-full case grants the descriptor BEFORE it halts.  Naming that by exception here
      * beats hanging the differential in sympathy with the oracle.
      *
-     * The bound is `RQ_NPKTS * 2 + 4`: at most every packet in the pool can be delivered, each
-     * costing its own service plus the re-arm, with slack for the poll that finds the ring empty.
+     * *** THE DRIVE UNITS DRAIN TOO, AND THAT IS NOT A GENERALISATION -- IT IS THE C. ***  The
+     * loop stops at the first queue entry carrying UNIT_IDLE; `rq_unit[]`'s drives are
+     * `UNIT_FIX|UNIT_ATTABLE|UNIT_DISABLE|UNIT_ROABLE|UNIT_RAW` with no UNIT_IDLE, so a transfer
+     * still in flight when the host halts RUNS TO COMPLETION inside the HALT instruction -- both
+     * ends of every remaining chunk, the DMA into host memory, and the end packet.  A differential
+     * that halted "before" a transfer would therefore observe the state AFTER it, which is why
+     * tests/mscprwdiff.js measures the schedule with an in-band poll instead.
+     *
+     * The bound covers the pool (every packet delivered, each costing its own service plus the
+     * re-arm) plus the chunks of one maximal transfer, each of which costs a top and a bottom end.
      *
      * @this {RQVAX}
      * @param {Object} cpu
@@ -1359,15 +1716,16 @@ export default class RQVAX {
     drainOnHalt(cpu)
     {
         this.cpu = cpu;
-        for (let n = 0; this.queDue !== null; n++) {
-            if (n > RQ_NPKTS * 2 + 4) {
+        for (let n = 0; ; n++) {
+            let e = this.nextEvent();
+            if (e === null) break;
+            if (n > RQ_NPKTS * 2 + 4 + RQ_TICK_EVENTS_MAX) {
                 throw new Error("rq.js: drainOnHalt() ran " + n + " services without the queue " +
-                    "going idle -- rq_quesvc() is re-arming itself without making progress.  The " +
+                    "going idle -- a service is re-arming itself without making progress.  The " +
                     "usual cause is a deferred response with no host-owned response descriptor, " +
                     "which hangs the real simulator's HALT the same way.");
             }
-            this.queDue = null;
-            this.quesvc();
+            this.dispatchEvent(e);
         }
     }
 
@@ -1712,11 +2070,15 @@ export default class RQVAX {
                finds the ring empty and clears `pip`).
              - the response-queue arm REASSIGNS `pkt`, so draining a deferred response re-arms too. */
         let pkt = 0;
+        /* THE UNIT QUEUES -- live from pcjsvax-346 onwards, because only rq_rw() sets `cpkt` and
+           only a set `cpkt` causes a deferral.  Note the C's `pkt` is the loop's own variable and
+           KEEPS the last value it took: a command drained from a unit queue therefore SUPPRESSES
+           the poll below (`if ((pkt == 0) && cp->pip)`) and re-arms the thread at the bottom, so a
+           host that posts two commands to one busy drive gets them one queue service apart. */
         for (let u of this.units) {                         /* chk unit q's */
             if (u.cpkt || u.pktq === 0) continue;
-            throw new RQUnimplemented("rq.js: a unit queue is non-empty, so a command was deferred " +
-                "behind an in-flight transfer -- only rq_rw() sets uptr->cpkt and only a set cpkt " +
-                "causes a deferral, so this state belongs to pcjsvax-346");
+            pkt = this.deqh(u, "pktq");                     /* get top of q */
+            if (!this.mscp(pkt, false)) return;             /* process */
         }
         if ((pkt === 0) && this.pip) {                      /* polling? */
             let got = this.getPkt();                        /* get host pkt */
@@ -1883,6 +2245,21 @@ export default class RQVAX {
         this.spd(pkt, w, v & 0xFFFF);
         this.spd(pkt, w + 1, (v >>> 16) & 0xFFFF);
     }
+
+    /**
+     * getp32(pkt, w)
+     *
+     * The C's GETP32(p,w) macro, `d[w] | (d[w+1] << 16)` -- LOW WORD FIRST, the counterpart of
+     * putp32().  `>>> 0` because every field it reads (a byte count, a bus address, an LBN) is
+     * unsigned and `d[w+1] << 16` goes negative the moment the high word's top bit is set, which
+     * RQ_MAPXFER guarantees for a mapped transfer's buffer address.
+     *
+     * @this {RQVAX}
+     * @param {number} pkt
+     * @param {number} w
+     * @returns {number}
+     */
+    getp32(pkt, w) { return (this.pd(pkt, w) | (this.pd(pkt, w + 1) << 16)) >>> 0; }
 
     /* --------------------------------------------------------------------------------------- *
      * MSCP command dispatch                                                                     *
@@ -2298,8 +2675,11 @@ export default class RQVAX {
         let u = this.getucb(lu);                            /* get unit */
         if (u && (u.cpkt || u.pktq)) {
             throw new RQUnimplemented("rq.js: ABORT against a unit holding a packet searches " +
-                "uptr->cpkt and uptr->pktq and may cancel an in-flight transfer -- only rq_rw() " +
-                "puts a packet there, and that is pcjsvax-346's work");
+                "uptr->cpkt and uptr->pktq for a matching reference number and CANCELS the " +
+                "transfer with ST_ABO.  pcjsvax-346 made that state reachable but did not take it " +
+                "into scope -- cancelling a transfer is neither a transfer nor a unit command -- " +
+                "so it still throws by name and tests/mscprwdiff.js FAILS the run if a graded " +
+                "case sends ABORT to a unit with a packet in flight");
         }
         this.putr(pkt, cmd | OP.END, 0, ST.SUC, ABO_LNT, UQ_TYP_SEQ);
         return this.putPkt(pkt, true);
@@ -2328,7 +2708,9 @@ export default class RQVAX {
         let u = this.getucb(lu);                            /* valid lu? */
         if (u && u.cpkt) {
             throw new RQUnimplemented("rq.js: GET COMMAND STATUS against a unit with a current " +
-                "packet reports that transfer's working byte count -- transfers are pcjsvax-346's");
+                "packet reports that transfer's working byte count.  pcjsvax-346 made that state " +
+                "reachable but did not take it into scope; tests/mscprwdiff.js FAILS the run if a " +
+                "graded case sends GET COMMAND STATUS to a unit with a packet in flight");
         }
         this.spd(pkt, GCS_STSL, 0);                         /* return 0 */
         this.spd(pkt, GCS_STSH, 0);
@@ -2380,6 +2762,808 @@ export default class RQVAX {
         this.putr(pkt, cmd | OP.END, 0, sts, SCC_LNT, UQ_TYP_SEQ);
         return this.putPkt(pkt, true);
     }
+
+    /* --------------------------------------------------------------------------------------- *
+     * THE FIVE DATA-TRANSFER COMMANDS -- pcjsvax-346                                            *
+     *                                                                                           *
+     * ACCESS, COMPARE, ERASE, READ and WRITE are ONE handler (rq_rw) feeding ONE unit service    *
+     * (rq_svc) whose read and write paths interleave, which is why they are implemented together *
+     * rather than "reads now, writes later": excluding writes would leave rq_rw_valid()'s        *
+     * write-protect ladder unreachable and half of rq_svc()'s branches ungraded.                 *
+     *                                                                                           *
+     * THE SHAPE, because it is not the obvious one:                                              *
+     *   rq_rw()      validates, copies the host's fields into the WORKING fields, and starts the *
+     *                DRIVE's own event-queue slot at delay 0.  It answers nothing.               *
+     *   rq_svc()     runs TWICE per chunk.  Its TOP END issues the disk I/O and returns; the     *
+     *                completion callback re-schedules the unit at `iostarttime + xtime`; its     *
+     *                BOTTOM END does the DMA, advances the working fields and either re-arms     *
+     *                itself for the next chunk or ends the command.                              *
+     *   rq_rw_end()  writes BYTES PROCESSED into the host's own RW_BCL, clears the eight working *
+     *                words, fills in the end packet and sends it.                                *
+     *                                                                                           *
+     * TWO LEVELS OF ADDRESS TRANSLATION, AND THEY ARE DIFFERENT MECHANISMS.  Bit 31 of the       *
+     * buffer address (RQ_MAPXFER) selects an MSCP-LEVEL map whose entries rq_map_ba() reads out  *
+     * of ORDINARY MEMORY; what that produces is a QBUS address, which then goes through the      *
+     * CQBIC scatter-gather map like every other DMA in this file.  rq_readb/rq_readw/rq_writew   *
+     * below are THIN WRAPPERS over cqbic.js's mapReadB/mapReadW/mapWriteW -- pcjsvax-e22's        *
+     * translator, graded by tests/qdmadiff.js over 297 cases -- and this file deliberately does   *
+     * not carry a second one.                                                                    *
+     * --------------------------------------------------------------------------------------- */
+
+    /**
+     * rw(pkt, q)
+     *
+     * rq_rw() (pdp11_rq.c:2268-2308).
+     *
+     * *** THE ORIGINAL PACKET FIELDS ARE NOT TOUCHED. ***  BAL/BAH, BCL/BCH, LBNL/LBNH and
+     * MAPL/MAPH are COPIED into WBAL/WBCL/WBLL/WMPL and the transfer chunks against the copies, so
+     * the end packet can report `original bc - remaining working bc` -- bytes processed -- against
+     * numbers the host still recognises.  A model that decremented the originals in place would
+     * agree on every successful transfer (both give a residual of 0) and differ only where it
+     * matters, on the failure paths.
+     *
+     * `q` is "may this command be deferred".  It is TRUE from the poll and FALSE from the unit-queue
+     * drain, which is what stops a deferred command from being deferred again onto the queue it was
+     * just taken off.
+     *
+     * The FAILURE arm zeroes the host's OWN RW_BCL/RW_BCH -- not the working copies, which were
+     * never written -- so a rejected transfer reports zero bytes processed.
+     *
+     * @this {RQVAX}
+     * @param {number} pkt
+     * @param {boolean} q
+     * @returns {boolean}
+     */
+    rw(pkt, q)
+    {
+        let lu = this.pd(pkt, CMD_UN);                      /* unit # */
+        let cmd = this.getp(pkt, CMD_OPC, CMD_OPC_V_OPC, CMD_OPC_M_OPC);
+        let sts;
+        let u = this.getucb(lu);                            /* unit exist? */
+        if (u) {
+            if (q && u.cpkt) {                              /* need to queue? */
+                this.enqt(u, "pktq", pkt);                  /* do later */
+                return true;
+            }
+            sts = this.rwValid(pkt, u, cmd);                /* validity checks */
+            if (sts === 0) {                                /* ok? */
+                u.cpkt = pkt;                               /* op in progress */
+                this.spd(pkt, RW_WBAL, this.pd(pkt, RW_BAL));
+                this.spd(pkt, RW_WBAH, this.pd(pkt, RW_BAH));
+                this.spd(pkt, RW_WBCL, this.pd(pkt, RW_BCL));
+                this.spd(pkt, RW_WBCH, this.pd(pkt, RW_BCH));
+                this.spd(pkt, RW_WBLL, this.pd(pkt, RW_LBNL));
+                this.spd(pkt, RW_WBLH, this.pd(pkt, RW_LBNH));
+                this.spd(pkt, RW_WMPL, this.pd(pkt, RW_MAPL));
+                this.spd(pkt, RW_WMPH, this.pd(pkt, RW_MAPH));
+                /* `uptr->iostarttime = sim_grtime()` -- the ABSOLUTE time the command started, and
+                   it is NOT refreshed between chunks.  See activateUnitNotBefore(). */
+                u.ioStart = this.cpu ? this.cpu.nTotalCycles : 0;
+                this.activateUnit(u, 0);                    /* activate */
+                return true;                                /* done */
+            }
+        } else sts = ST.OFL;                                /* offline */
+        this.spd(pkt, RW_BCL, 0);                           /* bad packet */
+        this.spd(pkt, RW_BCH, 0);
+        this.putr(pkt, cmd | OP.END, 0, sts, RW_LNT_D, UQ_TYP_SEQ);
+        return this.putPkt(pkt, true);
+    }
+
+    /**
+     * rwValid(pkt, u, cmd)
+     *
+     * rq_rw_valid() (pdp11_rq.c:2311-2348) -- the eleven-rung ladder every transfer descends before
+     * a single block moves, IN ORDER, because the order is the answer: a command that is both odd
+     * and off the end of the disk reports the ODD one.
+     *
+     * Three rungs are easy to get subtly wrong and each is graded:
+     *   - THE ODD-ADDRESS TEST IS SKIPPED FOR OP_ACC AND OP_ERS, because neither touches host
+     *     memory.  So an ACCESS with an odd buffer address is legal and a READ with the same one is
+     *     ST_HST|SB_HST_OA.
+     *   - `lbn >= maxlbn` IS NOT AN ERROR: it is an access to the REPLACEMENT/CONTROL TABLE, which
+     *     lives in the `rcts` blocks past the end of the user area.  It is legal for a READ of
+     *     EXACTLY ONE BLOCK and illegal for anything else -- and illegal for a WRITE or ERASE at any
+     *     size, which is the SECOND `lbn >= maxlbn` test further down the ladder.
+     *   - the spiral test is `lbn + ceil(bc / RQ_NUMBY) > maxlbn`, computed in uint32 (hence the
+     *     `>>> 0` on the sum): a transfer that STARTS inside the disk and RUNS OFF the end is
+     *     I_BCNT, not a short transfer.
+     *
+     * @this {RQVAX}
+     * @param {number} pkt
+     * @param {Object} u
+     * @param {number} cmd
+     * @returns {number} an MSCP status, or 0 for "start the transfer"
+     */
+    rwValid(pkt, u, cmd)
+    {
+        let d = DRV_TAB[u.dtype];                           /* get drive type */
+        let lbn = this.getp32(pkt, RW_LBNL);                /* get lbn */
+        let bc = this.getp32(pkt, RW_BCL);                  /* get byte cnt */
+        let maxlbn = u.capac >>> 0;                         /* get max lbn */
+
+        if (!(u.flags & U_ATT)) return ST.OFL | SB_OFL_NV;  /* not attached? */
+        if (!(u.flags & U_ONL)) return ST.AVL;              /* not online? */
+        if ((cmd !== OP.ACC) && (cmd !== OP.ERS) &&         /* 'real' xfer */
+            (this.pd(pkt, RW_BAL) & 1)) {                   /* odd address? */
+            return ST.HST | SB_HST_OA;                      /* host buf odd */
+        }
+        if (bc & 1) return ST.HST | SB_HST_OC;              /* odd byte cnt? */
+        if (bc & 0xF0000000) return ST.CMD | I_BCNT;        /* 'reasonable' bc? */
+        /* `if (lbn & 0xF0000000) return (ST_CMD | I_LBN);` is COMMENTED OUT in the vendor source,
+           and it is transcribed here as a comment for the same reason: an LBN with any of the top
+           four bits set reaches the RCT test below rather than being rejected, and a reader who
+           "restored" the line would change what a huge LBN answers. */
+        if (lbn >= maxlbn) {                                /* accessing RCT? */
+            if (lbn >= (maxlbn + d.rcts) >>> 0) return ST.CMD | I_LBN;  /* beyond copy 1? */
+            if (bc !== RQ_NUMBY) return ST.CMD | I_BCNT;    /* bc must be 512 */
+        } else if (((lbn + Math.floor((bc + (RQ_NUMBY - 1)) / RQ_NUMBY)) >>> 0) > maxlbn) {
+            return ST.CMD | I_BCNT;                         /* spiral to RCT */
+        }
+        if ((cmd === OP.WR) || (cmd === OP.ERS)) {          /* write op? */
+            if (lbn >= maxlbn) return ST.CMD | I_LBN;       /* accessing RCT? */
+            if (u.uf & UF_WPS) return ST.WPR | SB_WPR_SW;   /* swre wlk? */
+            if (this.wph(u)) return ST.WPR | SB_WPR_HW;     /* hwre wlk? */
+        }
+        return 0;                                           /* success! */
+    }
+
+    /**
+     * svc(u)
+     *
+     * rq_svc() (pdp11_rq.c:2455-2590), the DRIVE unit's action -- and the one function in this file
+     * that runs twice per chunk.
+     *
+     * *** THE TOP/BOTTOM SPLIT IS NOT ASYNCHRONY. ***  This tree's oracle is built NOASYNCH=1
+     * (machines/dec/vax/tests/simh/build.sh passes it, and tests/mscprwdiff.js re-reads it off the
+     * binary rather than trusting the script), so sim_disk.c's AIO_CALL macro reduces to
+     * `if (_callback) (_callback) (uptr, r);` -- the completion callback runs INLINE, inside
+     * sim_disk_rdsect_a(), before it returns.  What the split buys is therefore not concurrency but
+     * a DELAY: rq_io_complete() re-schedules the unit for `iostarttime + rq_xtime`, so the bottom
+     * end -- and every byte the host will see -- lands xtime instructions after the command was
+     * accepted, and a host that polls sees it not yet there.  That is the observable a synchronous
+     * implementation cannot produce, and it is measured in band.
+     *
+     * FIVE THINGS HERE ARE COUNTER-INTUITIVE AND ALL FIVE ARE GRADED:
+     *   1. `tbc = min(bc, RQ_MAXFR)`, and a READ issues `ceil(tbc / 512)` BLOCKS but stores exactly
+     *      `tbc` BYTES.  *** THE TAIL OF THE LAST BLOCK MUST NOT REACH HOST MEMORY. ***  With a byte
+     *      count that is not a multiple of 512 the difference is up to 510 bytes of real disk data
+     *      sitting in rqxb that the host must never see.
+     *   2. OP_ACC lands in the SAME arm as OP_RD and OP_CMP: it READS the blocks and then does
+     *      nothing with them.  It is a seek, implemented as a discarded read.
+     *   3. A WRITE whose buffer fetch fails COMPLETELY -- `abc == 0` -- issues no disk write, takes
+     *      no callback, and *** LEAVES THE UNIT UNSCHEDULED FOREVER ***.  The command never ends and
+     *      the host waits forever.  That is the shipped C, not a transcription slip;
+     *      tests/mscprwdiff.js fences it BY NAME rather than reproducing a hang.
+     *   4. The COMPARE mismatch path writes `bc - i` into RW_WBCL, and the COMPARE nxm path writes
+     *      `bc - i` into RW_WBAL as well -- the BYTE COUNT into the BUS ADDRESS field.  Every other
+     *      nxm path writes `ba + n` there.  Reproduced verbatim; see the comment at the call site.
+     *   5. `bl += ceil(tbc / 512)` between chunks, NOT `tbc / 512` -- so a chunk whose byte count is
+     *      not a whole number of blocks advances the block number past the partial block, and the
+     *      next chunk starts on the block AFTER it.
+     *
+     * @this {RQVAX}
+     * @param {Object} u
+     */
+    svc(u)
+    {
+        let pkt = u.cpkt;                                   /* get packet */
+        if (pkt === 0) {
+            throw new Error("rq.js: rq_svc() ran with no current packet, which the C answers with " +
+                "STOP_RQ -- a simulator stop, not a device state.  The unit's event slot was armed " +
+                "by something other than rq_rw().");
+        }
+        let cmd = this.getp(pkt, CMD_OPC, CMD_OPC_V_OPC, CMD_OPC_M_OPC);
+        let ba = this.getp32(pkt, RW_WBAL);                 /* buf addr */
+        let bc = this.getp32(pkt, RW_WBCL);                 /* byte count */
+        let bl = this.getp32(pkt, RW_WBLL);                 /* block addr */
+        let ma = this.getp32(pkt, RW_WMPL);                 /* map addr */
+        let err = 0, t, abc, wby;
+
+        let tbc = this.trimChunk(bc);                       /* trim cnt to max */
+
+        if (!(u.flags & U_ATT)) {                           /* not attached? */
+            this.rwEnd(u, 0, ST.OFL | SB_OFL_NV);           /* offl no vol */
+            return;
+        }
+        if (bc === 0) {                                     /* no xfer? */
+            this.rwEnd(u, 0, ST.SUC);                       /* ok by me... */
+            return;
+        }
+        /* THE WRITE-PROTECT TEST IS MADE TWICE, ONCE IN rq_rw_valid() AND ONCE HERE, AND THE TWO
+           ANSWER IN THE OPPOSITE ORDER: the validity ladder tests UF_WPS (software) first and this
+           one tests RQ_WPH (hardware) first.  A unit that is both gives ST_WPR|SB_WPR_SW when the
+           command is accepted and ST_WPR|SB_WPR_HW if it becomes protected between acceptance and
+           service.  Transcribed in the C's order, not tidied into one predicate. */
+        if ((cmd === OP.ERS) || (cmd === OP.WR)) {          /* write op? */
+            if (this.wph(u)) {
+                this.rwEnd(u, 0, ST.WPR | SB_WPR_HW);
+                return;
+            }
+            if (u.uf & UF_WPS) {
+                this.rwEnd(u, 0, ST.WPR | SB_WPR_SW);
+                return;
+            }
+        }
+
+        if (!u.ioComplete) {                                /* Top End (I/O Initiation) */
+            if (cmd === OP.ERS) {                           /* erase? */
+                wby = (tbc + (RQ_NUMBY - 1)) & ~(RQ_NUMBY - 1);
+                u.rqxb.fill(0, 0, wby);                     /* clr buf */
+                this.diskTrace(u, "sim_disk_wrsect-ERS", bl, wby);
+                err = this.diskWrite(u, bl, (wby / RQ_NUMBY) | 0);
+                this.ioDone(u, err);
+            } else if (cmd === OP.WR) {                     /* write? */
+                t = this.readW(ba, tbc, ma, u.rqxb);        /* fetch buffer */
+                if ((abc = tbc - t)) {                      /* any xfer? */
+                    wby = (abc + (RQ_NUMBY - 1)) & ~(RQ_NUMBY - 1);
+                    /* `for (i = (abc >> 1); i < wwc; i++) buf[i] = 0;` -- a WORD loop, so an odd
+                       `abc` would also clear the byte below it.  Written in bytes here from the
+                       same word index, which is the same set of bytes. */
+                    u.rqxb.fill(0, (abc >> 1) * 2, wby);
+                    this.diskTrace(u, "sim_disk_wrsect-WR", bl, wby);
+                    err = this.diskWrite(u, bl, (wby / RQ_NUMBY) | 0);
+                    this.ioDone(u, err);
+                }
+                /* else: NO callback, NO re-schedule.  See note 3 in this method's header. */
+            } else {                                        /* OP_RD, OP_CMP and OP_ACC */
+                err = this.diskRead(u, bl, this.blocksFor(tbc));
+                this.ioDone(u, err);
+            }
+            return;                                         /* done for now until callback */
+        }
+
+        /* Bottom End (After I/O processing) */
+        u.ioComplete = 0;
+        err = u.ioStatus;
+        if (cmd === OP.ERS) {                               /* erase? */
+            /* nothing -- the C's empty block, kept so the three-way shape matches */
+        } else if (cmd === OP.WR) {                         /* write? */
+            /* *** THE BUFFER IS FETCHED A SECOND TIME. ***  The top end already read it and wrote
+               it to the disk; this read exists only to discover a host bus error, and it re-reads
+               host memory that the guest may have changed in between.  Reproduced because it is
+               observable: a WRITE performs TWO Map_ReadW passes over the same buffer. */
+            t = this.readW(ba, tbc, ma, u.rqxb);            /* fetch buffer */
+            abc = tbc - t;                                  /* any xfer? */
+            if (t) {                                        /* nxm? */
+                this.putp32(pkt, RW_WBCL, (bc - abc) >>> 0);        /* adj bc */
+                this.putp32(pkt, RW_WBAL, (ba + abc) >>> 0);        /* adj ba */
+                if (this.hbe(u)) this.rwEnd(u, EF_LOG, ST.HST | SB_HST_NXM);
+                return;
+            }
+        } else {
+            this.diskTrace(u, "sim_disk_rdsect", bl, tbc);
+            if ((cmd === OP.RD) && !err) {                  /* read? */
+                if ((t = this.writeW(ba, tbc, ma, u.rqxb))) {        /* store, nxm? */
+                    this.putp32(pkt, RW_WBCL, (bc - (tbc - t)) >>> 0);
+                    this.putp32(pkt, RW_WBAL, (ba + (tbc - t)) >>> 0);
+                    if (this.hbe(u)) this.rwEnd(u, EF_LOG, ST.HST | SB_HST_NXM);
+                    return;
+                }
+            } else if ((cmd === OP.CMP) && !err) {          /* compare? */
+                for (let i = 0; i < tbc; i++) {             /* loop */
+                    if (this.readB((ba + i) >>> 0, 1, ma, this.cmpBuf)) {   /* fetch, nxm? */
+                        this.putp32(pkt, RW_WBCL, (bc - i) >>> 0);  /* adj bc */
+                        /* *** `PUTP32 (pkt, RW_WBAL, bc - i);` IS WHAT THE C SAYS. ***  The BYTE
+                           COUNT goes into the working BUS ADDRESS, where every other nxm path in
+                           this function puts an address.  It is almost certainly a vendor typo for
+                           `ba + i`, and it is reproduced exactly: the host reads RW_WBAL back
+                           through the error-log packet's HBE_BADL/HBE_BADH, so "fixing" it would
+                           make this tree disagree with the simulator about the reported address. */
+                        this.putp32(pkt, RW_WBAL, this.cmpNxmAddr(bc, i, ba));
+                        if (this.hbe(u)) this.rwEnd(u, EF_LOG, ST.HST | SB_HST_NXM);
+                        return;
+                    }
+                    /* `(((uint16*)rqxb)[i >> 1] >> ((i & 1) ? 8 : 0)) & 0xFF` -- the i'th BYTE of a
+                       little-endian word array, i.e. rqxb[i].  rqxb is a byte array here and the
+                       differential compares it against the oracle's own DMA output, so the byte
+                       order is graded rather than assumed. */
+                    if (this.cmpBuf[0] !== u.rqxb[i]) {     /* cmp err? */
+                        this.putp32(pkt, RW_WBCL, (bc - i) >>> 0);  /* adj bc */
+                        this.rwEnd(u, 0, ST.CMP);           /* done */
+                        return;                             /* exit */
+                    }
+                }
+            }
+        }
+        if (err !== 0) {                                    /* error? */
+            this.dte(u, ST.DRV);
+            return;
+        }
+        ba = (ba + tbc) >>> 0;                              /* incr bus addr */
+        bc = (bc - tbc) >>> 0;                              /* decr byte cnt */
+        bl = (bl + this.blocksFor(tbc)) >>> 0;              /* incr blk # */
+        this.putp32(pkt, RW_WBAL, ba);                      /* update pkt */
+        this.putp32(pkt, RW_WBCL, bc);
+        this.putp32(pkt, RW_WBLL, bl);
+        if (bc) this.activateUnit(u, 0);                    /* more? resched */
+        else this.rwEnd(u, 0, ST.SUC);                      /* done! */
+    }
+
+    /**
+     * ioDone(u, status)
+     *
+     * rq_io_complete() (pdp11_rq.c:2352-2362), the disk callback.  Under NOASYNCH it runs INLINE
+     * from inside sim_disk_rdsect_a()/sim_disk_wrsect_a(), i.e. still inside rq_svc()'s top end and
+     * before it returns -- so `io_complete` is already 1 by the time the top end's `return` runs,
+     * and the ONLY thing standing between the two halves is the event queue.
+     *
+     * @this {RQVAX}
+     * @param {Object} u
+     * @param {number} status
+     */
+    ioDone(u, status)
+    {
+        u.ioStatus = status;
+        u.ioComplete = 1;
+        this.activateUnitNotBefore(u, u.ioStart + this.xtime);
+    }
+
+    /**
+     * rwEnd(u, flg, sts)
+     *
+     * rq_rw_end() (pdp11_rq.c:2592-2620).  Four things, and the first is the one a re-derivation
+     * gets wrong:
+     *   1. `PUTP32 (pkt, RW_BCL, bc - wbc)` -- the ORIGINAL byte count minus what is LEFT, i.e.
+     *      BYTES PROCESSED, written over the host's own request.  On a successful transfer that is
+     *      the whole count; on a short one it is how far the controller got.
+     *   2. All EIGHT working words are cleared, so a host reading the response back cannot tell how
+     *      the transfer was chunked.
+     *   3. The response length is RW_LNT_D (32) for every one of the five commands.
+     *   4. If the unit has DEFERRED commands, the QUEUE THREAD is re-armed at qtime -- which is how
+     *      a second command posted to a busy drive eventually runs, and is the only thing that ever
+     *      drains a unit queue apart from the poll.
+     *
+     * @this {RQVAX}
+     * @param {Object} u
+     * @param {number} flg
+     * @param {number} sts
+     * @returns {boolean}
+     */
+    rwEnd(u, flg, sts)
+    {
+        let pkt = u.cpkt;                                   /* packet */
+        let cmd = this.getp(pkt, CMD_OPC, CMD_OPC_V_OPC, CMD_OPC_M_OPC);
+        let bc = this.getp32(pkt, RW_BCL);                  /* init bc */
+        let wbc = this.getp32(pkt, RW_WBCL);                /* work bc */
+
+        u.cpkt = 0;                                         /* done */
+        this.putp32(pkt, RW_BCL, (bc - wbc) >>> 0);         /* bytes processed */
+        this.spd(pkt, RW_WBAL, 0);                          /* clear temps */
+        this.spd(pkt, RW_WBAH, 0);
+        this.spd(pkt, RW_WBCL, 0);
+        this.spd(pkt, RW_WBCH, 0);
+        this.spd(pkt, RW_WBLL, 0);
+        this.spd(pkt, RW_WBLH, 0);
+        this.spd(pkt, RW_WMPL, 0);
+        this.spd(pkt, RW_WMPH, 0);
+        this.putr(pkt, cmd | OP.END, flg, sts, RW_LNT_D, UQ_TYP_SEQ);   /* fill pkt */
+        if (!this.putPkt(pkt, true)) return false;          /* send pkt */
+        if (u.pktq) this.activateQueue(this.qtime);         /* more to do? */
+        return true;
+    }
+
+    /**
+     * hbe(u)
+     *
+     * rq_hbe() (pdp11_rq.c:2686-2712), the HOST BUS ERROR log packet.
+     *
+     * *** ITS "LOGGING DISABLED" ARM RETURNS OK, NOT ERR. ***  `if ((cp->cflgs & CF_THS) == 0)
+     * return OK;` -- so with error logging off, which is the state after every reset, no packet is
+     * built and rq_svc() still ends the command with EF_LOG set.  The END packet is therefore
+     * IDENTICAL with logging on and off, and the only difference a host can see is a second,
+     * DATAGRAM packet arriving on the response ring.  A model that skipped EF_LOG when logging was
+     * off would pass every case that never turns logging on, which is every case that does not
+     * deliberately turn it on.
+     *
+     * The log packet reports the WORKING bus address the caller has just adjusted, so it names the
+     * byte that faulted -- except after a COMPARE, where rq_svc() put a byte count there instead
+     * (see svc()).  That is carried through rather than corrected.
+     *
+     * @this {RQVAX}
+     * @param {Object} u
+     * @returns {boolean} the C's OK/ERR -- false ends the queue thread
+     */
+    hbe(u)
+    {
+        if ((this.cflgs & CF_THS) === 0) return true;       /* logging? */
+        let pkt = this.deqf();                              /* get log pkt */
+        if (pkt === null) return false;
+        let tpkt = u.cpkt;                                  /* rw pkt */
+        this.spd(pkt, ELP_REFL, this.pd(tpkt, CMD_REFL));   /* copy cmd ref */
+        this.spd(pkt, ELP_REFH, this.pd(tpkt, CMD_REFH));
+        this.spd(pkt, ELP_UN, this.pd(tpkt, CMD_UN));       /* copy unit */
+        this.spd(pkt, ELP_SEQ, 0);                          /* clr seq # */
+        this.spd(pkt, HBE_CIDA, 0);                         /* ctrl ID */
+        this.spd(pkt, HBE_CIDB, 0);
+        this.spd(pkt, HBE_CIDC, 0);
+        this.spd(pkt, HBE_CIDD, (RQVAX.RQ_CLASS << HBE_CIDD_V_CLS) |
+                                (RQVAX.CTLR_TAB[this.ctype].model << HBE_CIDD_V_MOD));
+        this.spd(pkt, HBE_VER, (RQVAX.RQ_HVER << HBE_VER_V_HVER) |
+                               (RQVAX.RQ_SVER << HBE_VER_V_SVER));
+        this.spd(pkt, HBE_RSV, 0);
+        this.spd(pkt, HBE_BADL, this.pd(tpkt, RW_WBAL));    /* bad addr */
+        this.spd(pkt, HBE_BADH, this.pd(tpkt, RW_WBAH));
+        this.putr(pkt, FM_BAD, LF_SNR, ST.HST | SB_HST_NXM, HBE_LNT, UQ_TYP_DAT);
+        return this.putPkt(pkt, true);
+    }
+
+    /**
+     * dte(u, err)
+     *
+     * rq_dte(), the DISK TRANSFER ERROR log, plus the sim_disk_perror/sim_disk_clearerr/SCPE_IOERR
+     * arm around it.  ALL of it hangs off `err != 0`, and `err` is whatever sim_disk_rdsect() /
+     * sim_disk_wrsect() returned.  On a RAW container -- which is what a user-supplied file opens
+     * as -- those return SCPE_IOERR only when pread(2)/pwrite(2) itself fails: reading at or past
+     * the end of the file is NOT an error, it returns zeros and SCPE_OK (sim_disk.c:4416).
+     *
+     * There is therefore NO WAY to make the oracle take this arm from a do-file, and a differential
+     * that faked it here would be grading this tree against itself.  Thrown by name;
+     * tests/mscprwdiff.js asserts on every graded case that the image provider never failed a
+     * transfer, so a case that reached it fails the run rather than comparing an invented answer.
+     *
+     * @this {RQVAX}
+     * @param {Object} u
+     * @param {number} err
+     */
+    dte(u, err)
+    {
+        throw new RQUnimplemented("rq.js: a disk transfer returned an I/O error (status " + err +
+            "), which posts an rq_dte() error-log packet carrying the drive's CYLINDER/SURFACE/" +
+            "SECTOR geometry and then stops the simulator with SCPE_IOERR.  On a RAW container a " +
+            "read past the end of the file is NOT an error -- it returns zeros and SCPE_OK -- so " +
+            "no do-file can make the oracle take this arm, and nothing here may be graded against " +
+            "an answer this tree invented for it");
+    }
+
+    /* --------------------------------------------------------------------------------------- *
+     * THE MSCP-LEVEL MAP, AND THE THREE THIN WRAPPERS OVER cqbic.js's DMA                       *
+     * --------------------------------------------------------------------------------------- */
+
+    /**
+     * mapBa(ba, ma)
+     *
+     * rq_map_ba() (pdp11_rq.c:2366-2378), the VM_VAX arm.
+     *
+     *      idx = (VA_GETVPN (ba) << 2);
+     *      rg  = ReadL (ma + idx);
+     *      if (rg & PTE_V) return ((rg & RQ_M_PFN) << VA_N_OFF) | (ba & VA_M_OFF);
+     *      return 0;
+     *
+     * *** `ReadL` IS A PHYSICAL LONGWORD READ OF MAIN MEMORY (vax_mmu.h:307), NOT A MAP REGISTER
+     * AND NOT A VIRTUAL ADDRESS. ***  The MSCP map is an ordinary table in host memory whose address
+     * the host puts in the command packet; the CQBIC scatter-gather map is a different table reached
+     * through MBR.  Nothing here touches the CQBIC map -- what this function RETURNS is a Qbus
+     * address that the caller then puts through it.
+     *
+     * *** VA_M_VPN IS TWENTY-TWO BITS, SO BIT 31 -- THE FLAG THAT SELECTED THIS PATH -- IS MASKED
+     * OUT OF THE INDEX. ***  The entry index is therefore just the Qbus PAGE NUMBER and the table
+     * sits at `ma` with no bias.  Assuming a 23-bit VPN instead puts the read 0x1000000 bytes
+     * higher, off the end of a 16MB machine's memory, where ReadL() becomes ReadReg() and MACHINE
+     * CHECKS -- from inside a device service, which abandons the transfer with the unit still
+     * holding its packet.  Measured on the oracle; see the RQ_MAPXFER comment at the top of this
+     * file for the evidence.
+     *
+     * `ma + idx` is uint32 in the C and wraps, and `>>> 0` reproduces that.  Zero is the FAILURE
+     * return and it is indistinguishable from a valid translation to physical zero -- the C's own
+     * choice, and the reason a mapped transfer whose entry is invalid reports a residual rather
+     * than a bus error.
+     *
+     * @this {RQVAX}
+     * @param {number} ba
+     * @param {number} ma
+     * @returns {number} a Qbus address, or 0 for "no valid entry"
+     */
+    mapBa(ba, ma)
+    {
+        let idx = (((ba >>> VA_V_VPN) & VA_M_VPN) << 2);    /* map register index */
+        let rg = this.readLongPhys((ma + idx) >>> 0);       /* map register */
+        if (rg & PTE_V) {                                   /* valid? */
+            return ((((rg & RQ_M_PFN) << VA_N_OFF) >>> 0) | (ba & VA_M_OFF)) >>> 0;
+        }
+        return 0;
+    }
+
+    /**
+     * readLongPhys(pa)
+     *
+     * vax_mmu.h's ReadL(), restricted to the arm rq_map_ba() can legitimately take.  The C falls
+     * through to ReadIO()/ReadReg() for a non-memory address, which on this machine can machine
+     * check inside a DMA -- a state with no owner in this item and no way to reach it from a graded
+     * case, because a graded case puts the MSCP map table in RAM.  Named rather than silently
+     * returning zero, which would look exactly like an invalid map entry.
+     *
+     * @this {RQVAX}
+     * @param {number} pa
+     * @returns {number}
+     */
+    readLongPhys(pa)
+    {
+        pa = pa >>> 0;
+        if (!this.cqbic.isMem(pa)) {
+            throw new RQUnimplemented("rq.js: rq_map_ba() read an MSCP map entry at physical 0x" +
+                pa.toString(16).toUpperCase() + ", which is not memory.  ReadL() would fall through " +
+                "to ReadIO()/ReadReg() and can machine check inside a DMA; no graded case puts the " +
+                "MSCP map table outside RAM and this tree does not invent an answer for one");
+        }
+        return this.cqbic.bus.getLong(pa & ~3) | 0;         /* M[pa >> 2] */
+    }
+
+    /**
+     * readB(ba, bc, ma, buf) / readW(...) / writeW(...)
+     *
+     * rq_readb() / rq_readw() / rq_writew() (pdp11_rq.c:2380-2452).  THIN WRAPPERS, and the whole
+     * point of them is what they do NOT contain: there is no address translation here.  The
+     * unmapped path is one call into cqbic.js; the mapped path is a loop that translates through
+     * the MSCP map and then calls the SAME cqbic.js function per 512-byte page.
+     *
+     * *** THE RETURN IS A RESIDUAL -- BYTES NOT TRANSFERRED, ZERO ON FULL SUCCESS *** -- cqbic.js's
+     * convention and the C's, preserved rather than re-invented.
+     *
+     * THE MAPPED LOOP'S THREE TRAPS, all reproduced:
+     *   - `lbc = 0x200 - (ba & VA_M_OFF)` is the bytes left in the CURRENT 512-byte page of the BUS
+     *     address, so the first sub-transfer is short whenever the buffer does not start on a page
+     *     boundary and every one after it is a whole page.
+     *   - the loop advances `tbc` by `lbc - t` but returns `bc - tbc`, so a partial sub-transfer
+     *     contributes what it moved before the residual is computed.
+     *   - the WORD variants advance the device buffer by `lbc >> 1` UINT16s, i.e. `(lbc >> 1) * 2`
+     *     BYTES, while `ba` and `tbc` advance by the full `lbc`.  With an odd `lbc` -- reachable
+     *     only through OP_ACC, the one command exempt from the odd-address check -- the two run
+     *     apart by a byte.  Written the C's way rather than the sensible way.
+     *
+     * `pageBuf` stages one page for the mapped loop because cqbic.js's entry points fill a buffer
+     * from index 0 and the C advances a pointer instead.  A `subarray()` per page would be an
+     * allocation per 512 bytes of every mapped transfer, which is what standing rule 14 is about.
+     *
+     * @this {RQVAX}
+     * @param {number} ba
+     * @param {number} bc
+     * @param {number} ma
+     * @param {Uint8Array} buf
+     * @returns {number} residual byte count
+     */
+    readB(ba, bc, ma, buf)
+    {
+        if (ba & RQ_MAPXFER) {                              /* mapped xfer? */
+            let tbc = 0, off = 0;
+            while (tbc < bc) {
+                let pba = this.mapBa(ba >>> 0, ma);         /* get physical ba */
+                if (!pba) return bc - tbc;
+                let lbc = this.pageSplit(ba);               /* bc for this tx */
+                if (lbc > (bc - tbc)) lbc = bc - tbc;
+                let t = this.cqbic.mapReadB(pba, lbc, this.pageBuf);
+                for (let k = 0; k < lbc - t; k++) buf[off + k] = this.pageBuf[k];
+                tbc += (lbc - t);                           /* bytes xfer'd so far */
+                if (t) return bc - tbc;                     /* incomplete xfer? */
+                ba = (ba + lbc) >>> 0;
+                off += lbc;
+            }
+            return 0;
+        }
+        return this.cqbic.mapReadB(ba, bc, buf);            /* unmapped xfer */
+    }
+
+    readW(ba, bc, ma, buf)
+    {
+        if (ba & RQ_MAPXFER) {                              /* mapped xfer? */
+            let tbc = 0, off = 0;
+            while (tbc < bc) {
+                let pba = this.mapBa(ba >>> 0, ma);
+                if (!pba) return bc - tbc;
+                let lbc = this.pageSplit(ba);
+                if (lbc > (bc - tbc)) lbc = bc - tbc;
+                let t = this.cqbic.mapReadW(pba, lbc, this.pageBuf);
+                for (let k = 0; k < lbc - t; k++) buf[off + k] = this.pageBuf[k];
+                tbc += (lbc - t);
+                if (t) return bc - tbc;
+                ba = (ba + lbc) >>> 0;
+                off += (lbc >> 1) * 2;                      /* buf += (lbc >> 1) uint16s */
+            }
+            return 0;
+        }
+        return this.cqbic.mapReadW(ba, bc, buf);
+    }
+
+    writeW(ba, bc, ma, buf)
+    {
+        if (ba & RQ_MAPXFER) {                              /* mapped xfer? */
+            let tbc = 0, off = 0;
+            while (tbc < bc) {
+                let pba = this.mapBa(ba >>> 0, ma);
+                if (!pba) return bc - tbc;
+                let lbc = this.pageSplit(ba);
+                if (lbc > (bc - tbc)) lbc = bc - tbc;
+                for (let k = 0; k < lbc; k++) this.pageBuf[k] = buf[off + k];
+                let t = this.cqbic.mapWriteW(pba, lbc, this.pageBuf);
+                tbc += (lbc - t);
+                if (t) return bc - tbc;
+                ba = (ba + lbc) >>> 0;
+                off += (lbc >> 1) * 2;
+            }
+            return 0;
+        }
+        return this.cqbic.mapWriteW(ba, bc, buf);
+    }
+
+    /* --------------------------------------------------------------------------------------- *
+     * sim_disk, reduced to the arm a user-supplied file actually takes                          *
+     * --------------------------------------------------------------------------------------- */
+
+    /**
+     * diskRead(u, lbn, nsect)
+     *
+     * sim_disk_rdsect() (sim_disk.c:687-748) over sim_os_disk_rdsect() (sim_disk.c:4399-4430) --
+     * the RAW arm, which is the one a plain file takes (sim_disk's AUTO detection tries a raw open
+     * first and a user's container opens fine).  TWO behaviours, both measured rather than assumed
+     * and both graded against the oracle:
+     *
+     *   1. A SINGLE-SECTOR read at or past the unit's CAPACITY never touches the file at all: it
+     *      zeroes the buffer and returns success.  The C's comment calls it "bad block management
+     *      efforts".  A multi-sector read at the same LBN does NOT take that shortcut.
+     *   2. Everything else is one pread(2), and *** A SHORT READ IS NOT AN ERROR ***: the bytes
+     *      past the end of the file are ZERO-FILLED and the status is SCPE_OK.  This is exactly the
+     *      case a real OpenVMS volume presents -- /home/baron/vax1/data/d0.dsk is 2,936,985 blocks
+     *      while the volume declares 2,940,951 sectors, so with autosize's clamp raising `capac` to
+     *      the drive's own size the last 3,966 blocks of the unit are past the end of the container
+     *      and read as zeros.  tests/mscprwdiff.js grades a transfer that straddles that edge.
+     *
+     * `lbn * RQ_NUMBY` is computed in FLOATING POINT, deliberately: the offset of the last block of
+     * a 1.5 GB volume is 1,503,735,808, and `(lbn * 512) | 0` -- the natural JS idiom -- turns
+     * offsets past 2^31 negative.  That is a --selfcheck mutation.
+     *
+     * @this {RQVAX}
+     * @param {Object} u
+     * @param {number} lbn
+     * @param {number} nsect
+     * @returns {number} the C's t_stat: 0 == SCPE_OK
+     */
+    diskRead(u, lbn, nsect)
+    {
+        let want = nsect * RQ_NUMBY;
+        if ((nsect === 1) && (lbn >= (u.capac >>> 0))) {    /* beyond the end of the disk */
+            u.rqxb.fill(0, 0, RQ_NUMBY);                    /* zero buffer, return success */
+            return 0;
+        }
+        let n = u.image.read(this.imageOffset(lbn), want, u.rqxb);
+        if (!(n >= 0 && n <= want)) {
+            throw new Error("rq.js: the image provider's read() returned " + n + " for a " + want +
+                "-byte request; the contract is the number of bytes DELIVERED, 0..length");
+        }
+        u.rqxb.fill(0, n, want);                            /* read zeros at/past EOF */
+        return 0;
+    }
+
+    /**
+     * diskWrite(u, lbn, nsect)
+     *
+     * sim_disk_wrsect() over sim_os_disk_wrsect() -- one pwrite(2).  pwrite past the end of a
+     * regular file EXTENDS it, which is a real and legitimate outcome (autosize's clamp routinely
+     * leaves a unit larger than its container), but it changes the user's file underneath the next
+     * run.  tests/mscprwdiff.js fences it: no graded write may reach past the container's end, and
+     * the provider reports what it stored so a short write is caught here rather than becoming a
+     * silent difference in the image.
+     *
+     * @this {RQVAX}
+     * @param {Object} u
+     * @param {number} lbn
+     * @param {number} nsect
+     * @returns {number} the C's t_stat: 0 == SCPE_OK
+     */
+    diskWrite(u, lbn, nsect)
+    {
+        let want = nsect * RQ_NUMBY;
+        if (typeof u.image.write !== "function") {
+            throw new Error("rq.js: a WRITE reached an image provider with no write().  attach() " +
+                "forces such a container READ ONLY and rq_rw_valid()/rq_svc() refuse writes to a " +
+                "write-protected unit, so this is a defect in one of those three, not a bad image");
+        }
+        let n = u.image.write(this.imageOffset(lbn), want, u.rqxb);
+        if (n !== want) {
+            throw new RQUnimplemented("rq.js: a WRITE of " + want + " bytes at LBN " + lbn +
+                " stored only " + n + ".  pwrite(2) EXTENDS a regular file past its end, so the " +
+                "oracle would grow the user's container here while this provider would not -- the " +
+                "two engines would diverge in the image rather than in memory.  No graded case may " +
+                "write past the end of its container");
+        }
+        return 0;
+    }
+
+    /**
+     * imageOffset(lbn)
+     *
+     * The byte offset of a block in the container.  A METHOD rather than an expression so that
+     * --selfcheck can PERTURB it (standing rule 11) -- the 32-bit-overflow defect it exists to
+     * catch is invisible on any container small enough to fit in 2 GB, which is every synthetic
+     * one this tree generates and none of the real volumes it is meant to boot.
+     *
+     * @this {RQVAX}
+     * @param {number} lbn
+     * @returns {number}
+     */
+    imageOffset(lbn) { return lbn * RQ_NUMBY; }
+
+    /**
+     * trimChunk(bc) / blocksFor(bc) / pageSplit(ba)
+     *
+     * The three arithmetic decisions rq_svc() and rq_readw()/rq_writew() rest on, published as
+     * METHODS on the shipped path so --selfcheck can PERTURB them without substituting its own copy
+     * of the function under test (HANDOFF.md standing rule 11 -- a substituted copy is idempotent
+     * when the original is already broken, prints CAUGHT, and certifies nothing).  Every call site
+     * above goes through these and has no other source for its value.
+     *
+     *   trimChunk  `tbc = (bc > RQ_MAXFR) ? RQ_MAXFR : bc` -- the chunk boundary, and the only
+     *              reason rq_svc() ever runs more than twice for one command.
+     *   blocksFor  `(bc + RQ_NUMBY - 1) / RQ_NUMBY` -- CEILING, in two different roles that a
+     *              re-derivation is likely to split: the number of BLOCKS a read issues, and the
+     *              amount the block number advances between chunks.  They are the same expression
+     *              in the C and they are the same method here.
+     *   pageSplit  `0x200 - (ba & VA_M_OFF)` -- the bytes left in the current 512-byte page of the
+     *              BUS address.  VA_M_OFF is 0x1FF; 0xFF or 0x3FF both look plausible and both
+     *              produce a transfer that is right for an aligned buffer and wrong for any other.
+     *
+     * @this {RQVAX}
+     */
+    trimChunk(bc) { return (bc > RQ_MAXFR) ? RQ_MAXFR : bc; }
+
+    blocksFor(bc) { return Math.floor((bc + (RQ_NUMBY - 1)) / RQ_NUMBY); }
+
+    pageSplit(ba) { return 0x200 - (ba & VA_M_OFF); }
+
+    /**
+     * cmpNxmAddr(bc, i, ba)
+     *
+     * `PUTP32 (pkt, RW_WBAL, bc - i)` from rq_svc()'s COMPARE nxm path -- THE BYTE COUNT WRITTEN
+     * INTO THE WORKING BUS ADDRESS, where the READ and WRITE nxm paths four lines away both write
+     * `ba + n`.  It is almost certainly a vendor typo and it is reproduced verbatim, because the
+     * host reads that word back out of rq_hbe()'s error-log packet at HBE_BADL/HBE_BADH and
+     * "fixing" it would make this tree disagree with the simulator about the address it reports.
+     *
+     * A METHOD rather than an expression for exactly one reason: --selfcheck's mutation for it is
+     * the CORRECTION -- `ba + i` -- and the correction has to be applied at the shipped call site,
+     * not layered on afterwards, because rq_rw_end() zeroes the working words before anything can
+     * read them (standing rule 11).
+     *
+     * @this {RQVAX}
+     */
+    cmpNxmAddr(bc, i, ba) { return (bc - i) >>> 0; }
+
+    /**
+     * diskTrace(u, txt, lbn, len)
+     *
+     * sim_disk_data_trace() (sim_disk.c) reduced to what `set rq debug=REQ` alone produces.  Its
+     * `detail` argument is `DBG_DAT & dctrl`, which is ZERO unless the host also enabled DBG_DAT,
+     * so `data` reaches sim_data_trace() as NULL and only the ONE header line is printed:
+     *
+     *      <unit name> <txt> lbn: %08X len: %08X
+     *
+     * *** THIS IS A DBG_REQ LINE AND IT IS IN THE SAME STREAM AS `cmd=` AND `rsp=`. ***  It is also
+     * the single most informative thing in that stream for this item: it names the LBN and the
+     * LENGTH of every disk operation, in order, so the chunking of a transfer larger than RQ_MAXFR
+     * and the `ceil(bc/512)` blocks a partial-block read issues are compared as TEXT against the
+     * simulator rather than inferred from the bytes that arrived.
+     *
+     * @this {RQVAX}
+     * @param {Object} u
+     * @param {string} txt
+     * @param {number} lbn
+     * @param {number} len
+     */
+    diskTrace(u, txt, lbn, len)
+    {
+        this.traceReq(this.unitName(u) + " " + txt + " lbn: " + h8(lbn) + " len: " + h8(len));
+    }
+
+    /**
+     * unitName(u)
+     *
+     * sim_uname() for a drive: the DEVICE's name followed by the unit's INDEX -- not its plug, and
+     * not the MSCP logical unit.  The four controllers are RQ, RQB, RQC and RQD (pdp11_rq.c's
+     * device declarations), and only the first is enabled on a microvax3900.
+     *
+     * @this {RQVAX}
+     * @param {Object} u
+     * @returns {string}
+     */
+    unitName(u) { return RQ_DEV_NAMES[this.cnum] + this.units.indexOf(u); }
 
     /**
      * putr(pkt, cmd, flg, sts, lnt, typ)
@@ -2824,8 +4008,15 @@ export {
     RSP_LNT, RSP_OPF, RSP_STS, RSP_OPF_V_OPC, RSP_OPF_V_FLG,
     SCC_LNT, SCC_MSV, SCC_CFL, SCC_TMO, SCC_VER, SCC_CIDA, SCC_CIDB, SCC_CIDC, SCC_CIDD,
     SCC_MBCL, SCC_MBCH, SCC_VER_V_SVER, SCC_VER_V_HVER, SCC_CIDD_V_MOD, SCC_CIDD_V_CLS,
-    RW_BCL, RW_BCH, RW_BAL, RW_BAH, RW_LBNL, RW_LBNH,
-    CF_RPL, CF_ATN, RQ_CLASS, RQ_HVER, RQ_SVER, RQ_DHTMO, RQ_DCTMO,
+    RW_BCL, RW_BCH, RW_BAL, RW_BAH, RW_MAPL, RW_MAPH, RW_LBNL, RW_LBNH,
+    RW_WBCL, RW_WBCH, RW_WBAL, RW_WBAH, RW_WBLL, RW_WBLH, RW_WMPL, RW_WMPH, RW_LNT_D,
+    SB_WPR_SW, SB_HST_OA, SB_HST_OC, SB_HST_NXM, I_BCNT, I_LBN, EF_LOG,
+    ELP_REFL, ELP_REFH, ELP_UN, ELP_SEQ,
+    HBE_LNT, HBE_CIDA, HBE_CIDB, HBE_CIDC, HBE_CIDD, HBE_VER, HBE_RSV, HBE_BADL, HBE_BADH,
+    LF_SNR, FM_BAD, FM_SDE,
+    RQ_MAXFR, RQ_MAPXFER, RQ_M_PFN, VA_N_OFF, VA_M_OFF, VA_V_VPN, VA_N_VPN, VA_M_VPN, PTE_V,
+    RQ_DEV_NAMES, RQ_TICK_EVENTS_MAX,
+    CF_RPL, CF_ATN, CF_THS, RQ_CLASS, RQ_HVER, RQ_SVER, RQ_DHTMO, RQ_DCTMO,
     RQ_NUMDR, RQ_NPKTS, RQ_M_NPKTS, RQ_PKT_SIZE_W, RQ_PKT_SIZE,
     RQ_ITIME, RQ_ITIME4, RQ_QTIME, RQ_XTIME
 };

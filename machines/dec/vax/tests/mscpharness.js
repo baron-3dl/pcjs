@@ -269,6 +269,50 @@ export class Asm {
     }
 
     /**
+     * awaitUnbounded(addr, resultAddr, regs)
+     *
+     * *** A BOUNDED WAIT ON A RESPONSE THE CONTROLLER MUST SEND IS A FLAKE GENERATOR, AND THIS IS
+     * THE REPLACEMENT. ***
+     *
+     *      MOVL @#addr, Rprev ; CLRL Rcnt
+     * top: MOVL @#addr, Rcur ; CMPL Rcur, Rprev ; BNEQ out ; INCL Rcnt ; BRB top
+     * out: MOVL Rcnt, @#result ; MOVL Rcur, @#result+4
+     *
+     * FIVE instructions per iteration and NO BUDGET: the host cannot proceed until the value it is
+     * watching has actually changed.  That makes the OBSERVATION POINT deterministic -- every
+     * register, packet word, ring slot and page compared afterwards is sampled with the command
+     * provably finished on whichever engine is running -- which a bounded wait cannot promise when
+     * the thing being waited for takes a non-reproducible time (rq_io_complete()'s re-schedule
+     * shares its queue with a wall-clock timer; see tests/mscprwdiff.js's assertSchedule).
+     *
+     * Measured, on the sibling that had the bound: a budget large enough for the common case still
+     * expired about one run in five, and an expired budget lets the host walk on and HALT with the
+     * transfer still in flight -- at which point vax_cpu.c's drain stops at the first UNIT_IDLE
+     * queue entry and the two engines are compared at DIFFERENT POINTS IN ONE COMMAND'S LIFE.  The
+     * failure reads as a controller defect (PBSY, CPKT, the free queue, half the packet array) and
+     * it is a measurement artefact.
+     *
+     * THE COST IS PAID SOMEWHERE HONEST.  A controller that never answers now burns the case's
+     * whole step budget and is reported BY NAME as a machine that never reached its own HALT,
+     * rather than quietly producing a comparison of two different moments.  Use this wherever the
+     * controller is REQUIRED to answer; use awaitL() below where it may legitimately not.
+     */
+    awaitUnbounded(addr, resultAddr, regs) {
+        let {prev, cur, cnt} = regs;
+        this.movAbsReg(4, addr, prev);                              // 7
+        this.clrl(cnt);                                             // 2
+        let top = this.len;
+        this.movAbsReg(4, addr, cur);                               // 7
+        this.emit(OPC.CMPL, 0x50 | cur, 0x50 | prev);               // 3
+        this.emit(OPC.BNEQ, 4);                                     // 2 -- skip INCL(2) + BRB(2)
+        this.emit(OPC.INCL, 0x50 | cnt);                            // 2
+        this.emit(OPC.BRB, (top - (this.len + 2)) & 0xFF);          // 2
+        this.movRegAbs(cnt, resultAddr);
+        this.movRegAbs(cur, (resultAddr + 4) >>> 0);
+        return this;
+    }
+
+    /**
      * awaitL(addr, resultAddr, limit, regs)
      *
      * A BOUNDED longword busy-wait that writes its own answer to memory:
@@ -586,21 +630,142 @@ export function qbusPagesFor(g)
  * The descriptor is opened once and left open; the caller closes it.  `read()` is deliberately
  * REAL rather than a stub even though nothing in pcjsvax-f52 calls it -- a stub would satisfy
  * rq.js's contract check while being useless to pcjsvax-346, which is the failure mode the check
- * exists to prevent.
+ * exists to prevent.  pcjsvax-346 calls it on every transfer, so the check paid.
+ *
+ * *** THE OPEN MODE IS sim_disk_attach_ex2()'s, NOT A CONVENIENCE. ***  The C opens the container
+ * "rb+" and, if that fails, reopens it "rb", sets UNIT_RO and prints "Unit is read only"
+ * (sim_disk.c:2894-2905).  This does the same: "r+" first, "r" on failure, and a provider opened
+ * read-only carries NO `write` member at all -- which is how rq.js's attach() learns to force the
+ * unit read-only.  Passing `{readOnly: true}` asks for the second arm directly, which is what a
+ * caller does for a file it must not modify.
  *
  * @param {string} p
+ * @param {Object} [opts] {readOnly}
  * @returns {Object}
  */
-export function fileImageProvider(p)
+export function fileImageProvider(p, opts = {})
 {
-    let fd = fs.openSync(p, "r");
-    return {
+    let fd = null, writable = false;
+    if (!opts.readOnly) {
+        try { fd = fs.openSync(p, "r+"); writable = true; } catch (e) { fd = null; }
+    }
+    if (fd === null) fd = fs.openSync(p, "r");
+    let prov = {
         byteLength: fs.statSync(p).size,
+        path: p,
+        writable,
+        /* What sim_disk's get_filesystem_size() reports for this container, or undefined when it
+           recognises nothing.  See ods2VolumeBytes(). */
+        filesystemBytes: ods2VolumeBytes(fd),
         read(offset, length, dst) {
             return fs.readSync(fd, dst, 0, length, offset);
-        },
-        close() { fs.closeSync(fd); }
+        }
     };
+    /* pwrite(2), which is exactly what sim_os_disk_wrsect() issues.  Present ONLY when the
+       container opened writable, because its ABSENCE is the signal rq.js's attach() reads. */
+    if (writable) {
+        prov.write = function(offset, length, src) {
+            return fs.writeSync(fd, src, 0, length, offset);
+        };
+        /**
+         * restoreFrom(src)
+         *
+         * Rewrite this container's whole contents from `src` THROUGH THE ALREADY-OPEN DESCRIPTOR.
+         *
+         * *** THE POINT IS WHAT IT DOES NOT DO: CLOSE AND RE-OPEN. ***  A differential that runs
+         * many passes over the same containers (one per --selfcheck mutation) has to put each
+         * writable container back before every pass, and the obvious way -- close the provider,
+         * copyFileSync, re-open -- churns descriptors and re-resolves paths dozens of times per
+         * run.  That churn is what an intermittent ENOENT on a scratch container lives in.  One
+         * open, one close, and the restore is pwrite + ftruncate in between.
+         */
+        prov.restoreFrom = function(src) {
+            let sfd = fs.openSync(src, "r");
+            let off = 0;
+            try {
+                let buf = Buffer.allocUnsafe(1 << 20), n;
+                while ((n = fs.readSync(sfd, buf, 0, buf.length, off)) > 0) {
+                    fs.writeSync(fd, buf, 0, n, off);
+                    off += n;
+                }
+            } finally { fs.closeSync(sfd); }
+            fs.ftruncateSync(fd, off);
+            prov.byteLength = off;
+            prov.filesystemBytes = ods2VolumeBytes(fd);
+            return off;
+        };
+    }
+    /* Closing twice would close a descriptor number Node has since handed to something else, so
+       the second close is a no-op rather than a second close of "whatever fd 7 is now". */
+    let closed = false;
+    prov.close = function() { if (!closed) { closed = true; fs.closeSync(fd); } };
+    return prov;
+}
+
+/**
+ * ods2VolumeBytes(fd)
+ *
+ * get_ods2_filesystem_size() (sim_disk.c:1257-1340), reduced to the one number it returns:
+ * `Scb.scb_l_volsize * 512`, the size the VOLUME declares for itself.
+ *
+ * *** THIS IS A FILE SYSTEM PARSER AND IT LIVES HERE RATHER THAN IN rq.js ON PURPOSE. ***  A disk
+ * controller does not parse volumes; sim_disk does, before the controller ever sees the unit, and
+ * hands the result to autosize.  rq.js takes it through the image provider's `filesystemBytes` and
+ * does the arithmetic; this is the Node half that produces it, exactly as fileImageProvider() is
+ * the Node half of `read`.
+ *
+ * The walk is the C's: HOME BLOCK at LBN 1 -> the BITMAP.SYS file header at
+ * `ibmaplbn + ibmapsize + 1` -> its first retrieval pointer -> the STORAGE CONTROL BLOCK.  The
+ * validity tests are the C's too, minus the two ODS checksums: what they are here for is to REFUSE
+ * a container that is not an ODS-2 volume, and a pattern-filled scratch file fails the structure
+ * level, the cluster factor and the bitmap fields long before a checksum would matter.  Returning
+ * undefined is the "unrecognised" answer and it selects autosize's OTHER arm, so a false positive
+ * would change a unit's size -- which is why every field is checked and the final answer is
+ * sanity-bounded rather than trusted.
+ *
+ * @param {number} fd an open descriptor
+ * @returns {number|undefined} the volume's size in BYTES, or undefined if this is not ODS-2
+ */
+export function ods2VolumeBytes(fd)
+{
+    try {
+        let size = fs.fstatSync(fd).size;
+        let rd = (lbn) => {
+            if ((lbn + 1) * 512 > size || lbn < 0) return null;
+            let b = Buffer.alloc(512);
+            return fs.readSync(fd, b, 0, 512, lbn * 512) === 512 ? b : null;
+        };
+        let H = rd(1);
+        if (!H) return undefined;
+        let strucver = H[12], struclev = H[13], cluster = H.readUInt16LE(14);
+        let ibmapvbn = H.readUInt16LE(22), ibmaplbn = H.readUInt32LE(24);
+        let maxfiles = H.readUInt32LE(28), ibmapsize = H.readUInt16LE(32);
+        let resfiles = H.readUInt16LE(34);
+        if (H.readUInt32LE(0) === 0 || H.readUInt32LE(4) === 0 || H.readUInt32LE(8) === 0) return undefined;
+        if ((struclev !== 2 && struclev !== 5) || strucver === 0 || cluster === 0) return undefined;
+        if (ibmapvbn === 0 || ibmaplbn === 0 || ibmapsize === 0) return undefined;
+        if (resfiles < 5 || resfiles >= maxfiles) return undefined;
+        let hdr = rd(ibmaplbn + ibmapsize + 1);
+        if (!hdr) return undefined;
+        let o = hdr[1] * 2;                             /* fh2_b_mpoffset, in WORDS */
+        if (o < 4 || o > 500) return undefined;
+        let w0 = hdr.readUInt16LE(o), fmt = (w0 >>> 14) & 3;
+        if (fmt === 0) { o += 2; w0 = hdr.readUInt16LE(o); fmt = (w0 >>> 14) & 3; }  /* placement */
+        let scbLbn;
+        if (fmt === 1) scbLbn = (((w0 >>> 8) & 0x3F) << 16) + hdr.readUInt16LE(o + 2);
+        else if (fmt === 2) scbLbn = (hdr.readUInt16LE(o + 4) << 16) + hdr.readUInt16LE(o + 2);
+        else if (fmt === 3) scbLbn = hdr.readUInt32LE(o + 4);
+        else return undefined;
+        let S = rd(scbLbn);
+        if (!S) return undefined;
+        if (S[0] !== strucver || S[1] !== struclev || S.readUInt16LE(2) !== cluster) return undefined;
+        let volsize = S.readUInt32LE(4);
+        /* A volume smaller than one cluster, or wildly larger than the container, is a misparse. */
+        if (volsize === 0 || volsize * 512 > size * 4) return undefined;
+        return volsize * 512;
+    } catch (e) {
+        return undefined;
+    }
 }
 
 /**
