@@ -19,8 +19,14 @@
  *                                               the C function each one is dispatched to
  *                                               (pdp11_rq.c, `t_bool rq_mscp`)
  *   DRV_TAB      the 34 drive types             (pdp11_rq.c's drv_tab[] and its RQ_DRV macro)
+ *   SB           the status SUB-codes           (pdp11_mscp.h:170-184)     -- pcjsvax-3c3
+ *   I            the invalid-command sub-codes  (pdp11_mscp.h:188-194)     -- pcjsvax-3c3
+ *   PE           the PORT errors                (pdp11_uqssp.h:112-124)    -- pcjsvax-3c3
+ *   RW_VALID_LADDER                             the ORDERED list of statuses rq_rw_valid() can
+ *                                               return, one entry per `return` in the C, sliced out
+ *                                               of the function body itself     -- pcjsvax-3c3
  *
- * This file extracts all four FROM THE C and compares them to what rq.js publishes.  It is not a
+ * This file extracts all eight FROM THE C and compares them to what rq.js publishes.  It is not a
  * one-off: tests/mscpringdiff.js and tests/mscpunitdiff.js run it as PHASE S on every invocation and
  * FAIL the run on any difference, so a vendor tree that grows an opcode or a drive type makes the
  * differential go red rather than making the dispatch quietly fall through to the illegal-opcode
@@ -32,6 +38,23 @@
  * wrong command.  It carries the HANDLER NAME and not merely the opcode, because pcjsvax-f52 splits
  * rq_mscp()'s unit-bearing arms into three classes -- implemented here, needs an in-flight transfer,
  * IS a transfer -- and a class assignment nothing checks is a hand-curated list again.
+ *
+ * THE LAST FOUR ARE pcjsvax-3c3's, and the LAST ONE IS THE POINT OF THAT ITEM.  rq_rw_valid() is an
+ * ELEVEN-RUNG LADDER that returns the FIRST matching status, so a command that is both odd-count and
+ * off the end of the disk answers with the EARLIER rung -- the ORDER is observable and is the answer.
+ * A differential that wrote that order down would be re-typing the thing it exists to check (the
+ * project's CIS opcode count went 7 -> 11 -> 17 -> 23 and every hand-derived value along the way was
+ * wrong), so rwValidLadder() below SLICES rq_rw_valid()'s body out of pdp11_rq.c, strips its
+ * comments, walks its `return` statements IN SOURCE ORDER and EVALUATES each returned expression
+ * against the ST / SB / I tables extracted above.  tests/mscperrdiff.js takes its coverage floor --
+ * one graded case per rung -- from the LENGTH of that derived list.
+ *
+ * *** THE COMMENTED-OUT "reasonable lbn" CHECK IS PART OF THE MEASUREMENT. ***  pdp11_rq.c:2330 is
+ * a `//` line reading `if (lbn & 0xF0000000) return (ST_CMD | I_LBN);` and it is
+ * -- INACTIVE.  An extraction that did not strip comments would derive a TWELVE-rung refusal ladder
+ * and a differential built on it would demand a case for a branch that cannot be reached; one that
+ * stripped comments but said nothing would not notice a vendor tree that RESTORED the line.  Both
+ * are covered: comments are stripped, and the commented-out form is asserted to still be commented.
  *
  * The fourth is pcjsvax-f52's: drv_tab[] has THIRTY-FOUR entries of FOURTEEN fields each, built by
  * a token-pasting macro out of ~480 #defines.  Hand-transcribing that is precisely what standing
@@ -124,6 +147,160 @@ export function defines(text, prefix)
         out[m[1]] = v;
     }
     return out;
+}
+
+/* ------------------------------------------------------------------------------------------- *
+ * The SHIFTED constant sets -- pcjsvax-3c3                                                      *
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * shifted(text, prefix, syms)
+ *
+ * Every `#define <prefix>_<NAME> (<n> << <SYM>)` in the header, where <SYM> is one of the shift
+ * symbols in `syms` (ST_V_SUB and ST_V_INV, whose VALUES come from the extracted ST table rather
+ * than from anything written here).  This is a SECOND extraction shape and not a widening of
+ * defines(), because the two must not be confused: defines() REFUSES a non-literal on purpose, and
+ * quietly accepting one form in the function that rejects the rest is how a set loses an entry.
+ *
+ * *** THE SHIFT AMOUNT IS NOT A CONSTANT OF THIS FILE. ***  ST_V_SUB is 5 and ST_V_INV is 8 in this
+ * vendor tree; both are #defines in the same header, both come out of `st` above, and a tree that
+ * moved either one moves EVERY sub-code with it -- which is exactly the failure a hand-transcribed
+ * table would survive silently, because the NAMES would still all be there.
+ *
+ * @param {string} text
+ * @param {string} prefix
+ * @param {Object} syms  {SYMBOL: value}
+ * @returns {Object}
+ */
+export function shifted(text, prefix, syms)
+{
+    let out = {};
+    let re = new RegExp(`^#define[ \\t]+${prefix}_([A-Z0-9_]+)[ \\t]+(.+?)[ \\t]*(?:/\\*|//|$)`, "gm"), m;
+    while ((m = re.exec(text)) !== null) {
+        let raw = m[2].trim();
+        let s = /^\(\s*(\d+)\s*<<\s*([A-Z0-9_]+)\s*\)$/.exec(raw);
+        if (!s) {
+            let lit = cint(raw);
+            if (lit !== null) { out[m[1]] = lit; continue; }
+            throw new Error(`mscpscope: ${prefix}_${m[1]} is defined as "${raw}", which is neither a ` +
+                `plain integer nor an (n << SHIFT) form.  Guessing at it would put a WRONG STATUS ` +
+                `CODE in a table whose whole job is to say which code the controller returns`);
+        }
+        if (!(s[2] in syms)) {
+            throw new Error(`mscpscope: ${prefix}_${m[1]} shifts by ${s[2]}, which is not one of the ` +
+                `shift symbols this extraction knows (${Object.keys(syms).join(", ")}).  The header ` +
+                `has grown a third one and the value it produces is unknown here`);
+        }
+        out[m[1]] = (Number(s[1]) << syms[s[2]]) >>> 0;
+    }
+    return out;
+}
+
+/* ------------------------------------------------------------------------------------------- *
+ * rq_rw_valid()'s ladder -- pcjsvax-3c3                                                         *
+ * ------------------------------------------------------------------------------------------- */
+
+/**
+ * stripComments(text)
+ *
+ * Block comments and line comments removed, newlines PRESERVED so line-oriented walks still line
+ * up.  It is
+ * here for one measured reason: pdp11_rq.c:2330 carries a COMMENTED-OUT rung of the very ladder
+ * rwValidLadder() extracts, and reading it as live derives a twelve-rung refusal ladder from an
+ * eleven-rung function.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripComments(text)
+{
+    return text.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+               .replace(/\/\/[^\n]*/g, "");
+}
+
+/**
+ * evalStatus(expr, tabs)
+ *
+ * ONE returned expression from rq_rw_valid(), evaluated: `0`, `ST_AVL`, `(ST_OFL | SB_OFL_NV)`,
+ * `(ST_CMD | I_BCNT)`.  Every term must resolve in one of the extracted tables; an unknown term
+ * throws rather than being dropped, because a rung whose VALUE this file could not compute is a rung
+ * tests/mscperrdiff.js would then grade against nothing.
+ *
+ * @param {string} expr
+ * @param {Object} tabs {ST, SB, I}
+ * @returns {number}
+ */
+export function evalStatus(expr, tabs)
+{
+    let e = expr.trim().replace(/^\((.*)\)$/, "$1").trim();
+    let acc = 0;
+    for (let t of e.split("|")) {
+        let name = t.trim();
+        let lit = cint(name);
+        if (lit !== null) { acc |= lit; continue; }
+        let m = /^(ST|SB|I)_([A-Z0-9_]+)$/.exec(name);
+        if (!m || !(m[2] in tabs[m[1]])) {
+            throw new Error(`mscpscope: rq_rw_valid() returns "${expr}" and the term "${name}" is ` +
+                `not an ST_ / SB_ / I_ code this extraction found in pdp11_mscp.h`);
+        }
+        acc |= tabs[m[1]][m[2]];
+    }
+    return acc >>> 0;
+}
+
+/**
+ * rwValidLadder(text, tabs)
+ *
+ * rq_rw_valid()'s branches, IN SOURCE ORDER, one entry per `return` statement:
+ *   {sts, expr, guard} -- the evaluated status, the C expression it came from, and the source lines
+ *   between the previous return and this one (the CONDITION that selects it, for the report).
+ *
+ * The last entry is the function's `return 0`, i.e. ACCEPT.  So `list.length - 1` is the number of
+ * REFUSALS and `list.length` is the number of branches tests/mscperrdiff.js must cover -- both
+ * derived here rather than written down anywhere.
+ *
+ * @param {string} text  pdp11_rq.c
+ * @param {Object} tabs  {ST, SB, I}
+ * @returns {Array.<Object>}
+ */
+export function rwValidLadder(text, tabs)
+{
+    let m0 = /^uint16 rq_rw_valid \(MSC \*cp, uint16 pkt, UNIT \*uptr, uint16 cmd\)$\n\{/m.exec(text);
+    if (!m0) {
+        throw new Error("mscpscope: could not find rq_rw_valid()'s definition in pdp11_rq.c.  Its " +
+            "ladder is what every rejected transfer's status code comes from and nothing " +
+            "downstream may be graded without it");
+    }
+    let j = text.indexOf("\n}\n", m0.index);
+    if (j < 0) throw new Error("mscpscope: could not find the end of rq_rw_valid()");
+    let raw = text.slice(m0.index, j);
+    let body = stripComments(raw);
+
+    /* *** THE COMMENTED-OUT RUNG, ASSERTED TO STILL BE COMMENTED OUT. ***  If a vendor tree restores
+       it the ladder grows a rung BEFORE the RCT tests and every LBN with a top bit set changes its
+       answer -- so this is a difference that must stop the run, not one the strip quietly absorbs. */
+    let dead = /^\s*\/\/\s*if \(lbn & 0xF0000000\) return \(ST_CMD \| I_LBN\);/m.test(raw);
+
+    let out = [], pending = [];
+    for (let line of body.split("\n")) {
+        let t = line.trim();
+        if (!t) continue;
+        let r = /^return\s+(.+?);$/.exec(t);
+        if (!r) { pending.push(t); continue; }
+        out.push({sts: evalStatus(r[1], tabs), expr: r[1].trim(), guard: pending.join(" ")});
+        pending = [];
+    }
+    if (!out.length) {
+        throw new Error("mscpscope: rq_rw_valid() has no `return` statements this extraction could " +
+            "read -- the slice found the function and then failed to read its ladder, which is " +
+            "indistinguishable from a function that refuses nothing");
+    }
+    if (out[out.length - 1].sts !== 0) {
+        throw new Error(`mscpscope: rq_rw_valid()'s LAST return is "${out[out.length - 1].expr}" and ` +
+            `not 0.  The final rung is the ACCEPT arm and every consumer of this list treats it as ` +
+            `such; a ladder whose last branch refuses would silently make every transfer illegal`);
+    }
+    return {ladder: out, deadRungCommentedOut: dead};
 }
 
 /* ------------------------------------------------------------------------------------------- *
@@ -280,7 +457,7 @@ export function mscpDispatch(text)
 /**
  * extract(simhPath)
  * @param {?string} simhPath
- * @returns {{dir: string, op: Object, st: Object, dispatch: Object, drv: Array.<Object>}}
+ * @returns {Object}
  */
 export function extract(simhPath)
 {
@@ -291,7 +468,23 @@ export function extract(simhPath)
     let rd = (f) => fs.readFileSync(path.join(dir, f), "utf8").replace(/\r/g, "");
     let h = rd("pdp11_mscp.h");
     let c = rd("pdp11_rq.c");
-    return {dir, op: defines(h, "OP"), st: defines(h, "ST"),
+    let uq = rd("pdp11_uqssp.h");
+    let st = defines(h, "ST");
+    /* ST_V_SUB and ST_V_INV are themselves ST_ #defines, so they arrive in `st` and are then used
+       as the SHIFT for the two sub-code sets.  Nothing here writes 5 or 8 down. */
+    let syms = {ST_V_SUB: st["V_SUB"], ST_V_INV: st["V_INV"]};
+    for (let k of Object.keys(syms)) {
+        if (syms[k] === undefined) {
+            throw new Error(`mscpscope: pdp11_mscp.h no longer defines ${k}, which is the shift ` +
+                `every status SUB-code is built from -- the whole SB_/I_ set is unknown without it`);
+        }
+    }
+    let sb = shifted(h, "SB", syms);
+    let inv = shifted(h, "I", syms);
+    let pe = defines(uq, "PE");
+    let lad = rwValidLadder(c, {ST: st, SB: sb, I: inv});
+    return {dir, op: defines(h, "OP"), st, sb, inv, pe,
+            ladder: lad.ladder, deadRungCommentedOut: lad.deadRungCommentedOut,
             dispatch: mscpDispatch(c), drv: drvTable(c)};
 }
 
@@ -322,6 +515,41 @@ export function checkScope(simhPath)
     };
     cmp("OP", e.op, RQVAX.OP);
     cmp("ST", e.st, RQVAX.ST);
+    /* pcjsvax-3c3's three.  Compared BOTH WAYS like the two above: a sub-code rq.js publishes and
+       the C does not is an invented answer, and one the C publishes and rq.js does not is a code the
+       controller can be asked to produce and this tree has no name for. */
+    cmp("SB", e.sb, RQVAX.SB);
+    cmp("I", e.inv, RQVAX.I);
+    cmp("PE", e.pe, RQVAX.PE);
+
+    /* ---- rq_rw_valid()'s LADDER, IN ORDER.  This is the one comparison in this file where the
+       ORDER is the assertion: the C returns the FIRST matching status, so two rungs swapped change
+       what a command that trips both of them answers while leaving the SET of reachable codes
+       identical.  A set comparison would pass that; this does not. ---- */
+    let lshipped = RQVAX.RW_VALID_LADDER;
+    if (!e.deadRungCommentedOut) {
+        failures.push(`PHASE S: pdp11_rq.c's "reasonable lbn" rung -- ` +
+            `\`// if (lbn & 0xF0000000) return (ST_CMD | I_LBN);\` -- is NO LONGER COMMENTED OUT ` +
+            `in this vendor tree.  rq.js deliberately does not implement it (the item that ported ` +
+            `rq_rw_valid() carries the line as a comment for exactly this reason), so every LBN ` +
+            `with a top bit set now answers differently on the two engines`);
+    }
+    if (lshipped.length !== e.ladder.length) {
+        failures.push(`PHASE S: rq_rw_valid() has ${e.ladder.length} \`return\` branch(es) in the C ` +
+            `and rq.js's RW_VALID_LADDER declares ${lshipped.length}.  The differential's coverage ` +
+            `floor is ONE GRADED CASE PER BRANCH and it is taken from the C's count, so a ladder ` +
+            `that grew or lost a rung is a rung nothing would have had to exercise`);
+    }
+    for (let i = 0; i < Math.min(lshipped.length, e.ladder.length); i++) {
+        if ((lshipped[i].sts >>> 0) !== (e.ladder[i].sts >>> 0)) {
+            failures.push(`PHASE S: rq_rw_valid() branch ${i} returns \`${e.ladder[i].expr}\` = ` +
+                `0x${(e.ladder[i].sts >>> 0).toString(16).toUpperCase().padStart(4, "0")} in the C ` +
+                `and rq.js's RW_VALID_LADDER[${i}] ("${lshipped[i].name}") is ` +
+                `0x${(lshipped[i].sts >>> 0).toString(16).toUpperCase().padStart(4, "0")} -- the two ` +
+                `disagree about WHICH STATUS the ${i}th rung of the ladder answers, or about the ` +
+                `ORDER the rungs are in`);
+        }
+    }
 
     /* THE DISPATCH, OPCODE AND HANDLER TOGETHER.  Every `case OP_x:` in rq_mscp() must be
        classified by rq.js, and classified as reaching THE SAME C FUNCTION.  Checking only the
@@ -374,7 +602,11 @@ export function checkScope(simhPath)
 
     return {dir: e.dir, nOp: Object.keys(e.op).length, nSt: Object.keys(e.st).length,
             nSwitch: Object.keys(e.dispatch).length, nDrv: e.drv.length,
-            failures, op: e.op, st: e.st, dispatch: e.dispatch, drv: e.drv};
+            nSb: Object.keys(e.sb).length, nI: Object.keys(e.inv).length,
+            nPe: Object.keys(e.pe).length, nLadder: e.ladder.length,
+            failures, op: e.op, st: e.st, dispatch: e.dispatch, drv: e.drv,
+            sb: e.sb, inv: e.inv, pe: e.pe, ladder: e.ladder,
+            deadRungCommentedOut: e.deadRungCommentedOut};
 }
 
 function main()
@@ -386,9 +618,20 @@ function main()
     console.log(`mscpscope: derived from ${r.dir}`);
     console.log(`  ${r.nOp} OP_ codes, ${r.nSt} ST_ codes, ${r.nSwitch} rq_mscp() dispatch cases, ` +
         `${r.nDrv} drv_tab[] entries`);
+    console.log(`  ${r.nSb} SB_ sub-codes, ${r.nI} I_ invalid-command codes, ${r.nPe} PE_ port ` +
+        `errors, ${r.nLadder} rq_rw_valid() branches (${r.nLadder - 1} refusals + accept)` +
+        (r.deadRungCommentedOut ? "" : "  *** the 'reasonable lbn' rung is LIVE ***"));
     if (process.argv.includes("--print")) {
         console.log(`  OP: ${Object.keys(r.op).map((k) => `${k}=${r.op[k]}`).join(" ")}`);
         console.log(`  ST: ${Object.keys(r.st).map((k) => `${k}=${r.st[k]}`).join(" ")}`);
+        console.log(`  SB: ${Object.keys(r.sb).map((k) => `${k}=${r.sb[k]}`).join(" ")}`);
+        console.log(`  I:  ${Object.keys(r.inv).map((k) => `${k}=${r.inv[k]}`).join(" ")}`);
+        console.log(`  PE: ${Object.keys(r.pe).map((k) => `${k}=${r.pe[k]}`).join(" ")}`);
+        for (let i = 0; i < r.ladder.length; i++) {
+            console.log(`  ladder[${String(i).padStart(2)}] = ${r.ladder[i].expr.padEnd(22)} ` +
+                `0x${(r.ladder[i].sts >>> 0).toString(16).toUpperCase().padStart(4, "0")}   ` +
+                `<- ${r.ladder[i].guard.slice(0, 90)}`);
+        }
         console.log(`  dispatch: ${Object.keys(r.dispatch).map((k) => `${k}->${r.dispatch[k]}`).join(" ")}`);
         for (let d of r.drv) {
             console.log(`  drv ${d.name.padEnd(6)} ${DRV_FIELDS.map(([f]) => `${f}=${d[f]}`).join(" ")}`);
@@ -399,7 +642,8 @@ function main()
         for (let f of r.failures) console.error(`  ${f}`);
         process.exit(1);
     }
-    console.log("\nOK -- rq.js's opcode, status, dispatch and drive-table scope match the C exactly");
+    console.log("\nOK -- rq.js's opcode, status, sub-code, invalid-command, port-error, dispatch, " +
+        "drive-table\n     and rq_rw_valid-ladder scope match the C exactly, IN ORDER");
 }
 
 if (process.argv[1] && process.argv[1].endsWith("mscpscope.js")) main();
