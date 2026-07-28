@@ -929,15 +929,23 @@ function assertExclusions(cases, sim, failures)
 {
     for (let i = 0; i < cases.length; i++) {
         let c = cases[i], s = sim[i];
-        for (let pr of c.presets) { void pr; }
-        /* SET CONTROLLER CHARACTERISTICS and nothing else -- see the file header. */
+        /* SET CONTROLLER CHARACTERISTICS AND NOTHING ELSE -- read off the words the case actually
+           PLANTS, not off sccWords()'s return value.  Asking sccWords() what opcode it builds would
+           be a fence that cannot fail, which is worse than no fence: it would certify a scope claim
+           the case list could quietly outgrow (HANDOFF.md standing rules 6 and 12). */
         for (let cm of c.cmds) {
-            let w = sccWords();
-            if (w[CMD_OPC] !== OP.SCC) {
-                failures.push(`exclusion: case ${c.idx} "${c.name}" sends MSCP opcode ${w[CMD_OPC]}; ` +
-                    `only OP_SCC is in scope here`);
+            let at = c.phys(c.g.cmdBuf(cm.pkt) + CMD_OPC * 2);
+            let planted = c.presets.filter((pr) => pr.addr === at);
+            if (planted.length !== 1) {
+                failures.push(`exclusion: case ${c.idx} "${c.name}" plants ${planted.length} opcode ` +
+                    `word(s) for command packet ${cm.pkt} -- the fence below cannot see it`);
+                continue;
             }
-            void cm;
+            if ((planted[0].word & 0xFF) !== OP.SCC) {
+                failures.push(`exclusion: case ${c.idx} "${c.name}" plants MSCP opcode ` +
+                    `0x${hex(planted[0].word & 0xFF, 2)} in command packet ${cm.pkt}; only OP_SCC ` +
+                    `(0x${hex(OP.SCC, 2)}) is in scope here`);
+            }
         }
         if ((c.s1dat & SA_S1H_VEC) !== (c.vec & SA_S1H_VEC)) {
             failures.push(`exclusion: case ${c.idx} "${c.name}" has a spec vector of ` +
