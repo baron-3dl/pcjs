@@ -59,7 +59,9 @@
  *   - A WRITE WHOSE BUFFER FETCH FAILS COMPLETELY.  rq_svc()'s top end issues no disk write, takes
  *     no callback and leaves the unit unscheduled FOREVER -- the real simulator hangs the command.
  *     assertExclusions() FAILS the run if a case unmaps the FIRST page of a write's buffer.
- *   - CONTROLLER INTERRUPT DELIVERY.  pcjsvax-aef; every case supplies SA_S1H_VEC == 0.
+ *   - CONTROLLER INTERRUPT DELIVERY.  LANDED in pcjsvax-aef and graded by tests/mscpintdiff.js --
+ *     a SCOPE boundary here, not a gap; every case still supplies SA_S1H_VEC == 0.  See
+ *     assertExclusions() for why letting one in would corrupt this file's own measurement.
  *   - MEDIA REMOVAL and NOAUTOSIZE, as in tests/mscpunitdiff.js.
  *
  *      node machines/dec/vax/tests/mscprwdiff.js [options]
@@ -1806,7 +1808,11 @@ function assertExclusions(cases, sim, js, failures)
         let c = cases[i];
         if (c.s1dat & SA_S1H_VEC) {
             failures.push(`exclusion: case ${c.idx} "${c.name}" supplies an S1 word with a non-zero ` +
-                `SA_S1H_VEC; interrupt DELIVERY is pcjsvax-aef's work`);
+                `SA_S1H_VEC.  Interrupt delivery LANDED in pcjsvax-aef and is graded by ` +
+                `tests/mscpintdiff.js; this fence is now a SCOPE boundary, not a gap -- every wait ` +
+                `in this file is an IN-BAND loop whose ITERATION COUNT is graded, an SCB dispatch ` +
+                `inside one would fold interrupt delivery into a measurement of the controller's ` +
+                `event schedule, and no SCB handler is installed for the RQ vector here at all.`);
         }
         if (c.s1dat & SA_S1H_IE) {
             failures.push(`exclusion: case ${c.idx} "${c.name}" supplies an S1 word with SA_S1H_IE set`);

@@ -119,21 +119,18 @@
  *   memory/CRD-error levels below), and resolve its vector -- a constant for a FIXED-vector device,
  *   or a function(cpu) called AT ACKNOWLEDGE TIME for a DYNAMIC one (the SSC timers, whose vector
  *   is whatever the ROM last programmed into TIVEC0/1).  Both shapes have to work: a fixed-vector-
- *   only seam fails the SSC-timer item the moment it lands.  QB_VEC_MASK is applied to the result
- *   exactly as SIMH's get_vector() applies it to every hardware vector regardless of device.
- *   `int_vec_set[]` (the OR'd into `vec`, then folded into the mask, on that same line) is NOT
- *   modelled here, and that is a real gap for a FUTURE device, not a nonexistent one: vaxmod_defs.h
- *   defines VEC_SET 0x201, and pdp11_io_lib.c's build_vector_tab() populates int_vec_set[l][bit] =
- *   0x201 for every DEV_QBUS/DEV_UBUS autoconfigured device -- RQ, RL, TS, TQ, XQ, DZ, LP, VH, CR,
- *   TD, DUP -- whose delivered vector is therefore `(vec | 0x201) & 0x3FD`, not `vec & QB_VEC_MASK`.
- *   It IS zero for every device this item's downstream items actually install (TTI, TTO, CSI, CSO,
- *   CLK, TMR0, TMR1) -- confirmed by hwintdiff.js's fixed-vector cases delivering 0xF8/0xFC/0xF0/
- *   0xF4/0xC0 unmodified -- so the generic QB_VEC_MASK-only mask above is correct for all three
- *   downstream items as scoped today.  Whoever lands the first autoconfigured Qbus disk/serial/net
- *   device will need to extend addInterruptSource()'s installed table with a per-bit int_vec_set
- *   value and fold it into deviceVector()'s masking the way get_vector() does -- do that then, not
- *   here.  The memory-error and CRD-error interrupt levels (IPL 0x1D / 0x1A), which are CPU state
- *   rather than device state, ARE implemented and are graded, and are untouched by this.
+ *   only seam fails the SSC-timer item the moment it lands.  get_vector()'s masking is applied to
+ *   the result exactly as SIMH applies it to every hardware vector regardless of device -- INCLUDING
+ *   `int_vec_set[]`, the fourth argument to addInterruptSource(), which pcjsvax-aef added when the
+ *   first autoconfigured Qbus device (rq.js's RQDX3) landed.  vaxmod_defs.h defines VEC_SET 0x201
+ *   and pdp11_io_lib.c's build_vector_tab() stamps it into int_vec_set[l][bit] for every
+ *   DEV_QBUS/DEV_UBUS autoconfigured device -- RQ, RL, TS, TQ, XQ, DZ, LP, VH, CR, TD, DUP -- whose
+ *   delivered vector is therefore `(vec | 0x201) & 0x3FD`, not `vec & QB_VEC_MASK`.  It is ZERO for
+ *   the four devices this tree installs that are NOT autoconfigured (TTI, TTO, CSI, CSO, CLK, TMR0,
+ *   TMR1), confirmed by hwintdiff.js's fixed-vector cases delivering 0xF8/0xFC/0xF0/0xF4/0xC0
+ *   unmodified, and those callers pass no fourth argument at all.  The memory-error and CRD-error
+ *   interrupt levels (IPL 0x1D / 0x1A), which are CPU state rather than device state, ARE
+ *   implemented and are graded, and are untouched by this.
  * - The CIS/octaword emulation traps (SCB_EMULATE / SCB_EMULFPD).
  */
 
@@ -218,6 +215,13 @@ const VEC_QBUS = 1;
    TMR_VEC_MASK (0x3FC) at the point the ROM writes it can still be truncated again here: the two
    masks are different widths and the SECOND one is the one that reaches PSL/the SCB dispatch. */
 const QB_VEC_MASK = 0x1FC;
+
+/* vaxmod_defs.h:447.  The bits pdp11_io_lib.c's build_vector_tab() stamps into int_vec_set[][] for
+   every AUTOCONFIGURED Qbus device.  Two separate jobs in one constant: 0x200 selects the SECOND
+   page of the SCB, where Qbus device vectors live, and 0x001 is VEC_QBUS, which intexc() below
+   reads to force PSL<IPL> to 0x17.  Exported so a Qbus device model passes it to
+   addInterruptSource() rather than transcribing 0x201 -- rq.js is the first caller. */
+const VEC_SET = 0x201;
 
 /* intexc()'s `ei` argument, vax_defs.h:407-409. */
 const IE = {SVE: -1, EXC: 0, INT: 1};
@@ -425,6 +429,16 @@ class VAXExc {
          */
         this.intVec = [];
         for (let i = 0; i < IPL_HLVL; i++) this.intVec.push([]);
+        /*
+         * intVecSet[lvl - IPL_HMIN][bit] -- SIMH's int_vec_set[][] (vax_io.c:116), the bits
+         * pdp11_io_lib.c's build_vector_tab() stamps into EVERY autoconfigured Qbus device's slot
+         * (VEC_SET, vaxmod_defs.h:447).  It is 0 for a device that is not autoconfigured on the
+         * Qbus -- the console, the interval timer, the SSC T0/T1 timers -- and VEC_SET for one that
+         * is, which is why deviceVector() below cannot simply mask.  Same lifetime rule as
+         * intVec[]: installed when a device attaches, NOT cleared by reset().
+         */
+        this.intVecSet = [];
+        for (let i = 0; i < IPL_HLVL; i++) this.intVecSet.push([]);
         this.iprDevice = null;
         /*
          * SSC bus-timeout register (vax_sysdev.c:246, `int32 ssc_bto = 0`).  Set by busTimeout()
@@ -588,15 +602,29 @@ class VAXExc {
      * `vec` is EITHER a constant SCB offset (a FIXED-vector device: the console, the interval
      * timer) OR a function(cpu) returning one when deviceVector() ACKNOWLEDGES it (a DYNAMIC-vector
      * device: the SSC timers T0/T1, whose vector is whatever value the ROM last wrote into
-     * TIVEC0/1).  deviceVector() below applies QB_VEC_MASK to the result either way, exactly as
-     * SIMH's get_vector() does, so a caller does not need to pre-mask a dynamic vector itself.
+     * TIVEC0/1).  deviceVector() below applies the masking get_vector() applies either way, so a
+     * caller does not need to pre-mask a dynamic vector itself.
+     *
+     * `vecSet` is int_vec_set[l][bit] (vax_io.c:116) -- see deviceVector().  It defaults to 0, which
+     * is the correct value for every device that is NOT autoconfigured on the Qbus (the console, the
+     * interval timer, the SSC timers) and reduces the fold below to the plain `vec & QB_VEC_MASK`
+     * this seam did before pcjsvax-aef.  An AUTOCONFIGURED Qbus device -- RQ, RL, TS, TQ, XQ, DZ,
+     * LP, VH, CR, TD, DUP -- passes VEC_SET, because pdp11_io_lib.c's build_vector_tab() stamps
+     * VEC_SET into that device's slot for it.  MEASURED, not inferred: with the RQDX3's S1 vector
+     * field programmed to 0x7F, `show rq` reports `vector=3FC*` and a real SIMH dispatch lands on
+     * SCB offset 0x3FC, not on the 0x1FC that `examine rq devvec` reports (pcjsvax-aef's probe).
      *
      * @this {VAXExc}
      * @param {number} lvl hardware IPL, IPL_HMIN..IPL_HMAX
      * @param {number} bit request bit within that level's word, 0..31
      * @param {number|function(Object):number} vec
+     * @param {number} [vecSet] int_vec_set[][] for this bit; 0 (the default) for a non-Qbus device
      */
-    addInterruptSource(lvl, bit, vec) { this.intVec[lvl - IPL_HMIN][bit] = vec; }
+    addInterruptSource(lvl, bit, vec, vecSet = 0)
+    {
+        this.intVec[lvl - IPL_HMIN][bit] = vec;
+        this.intVecSet[lvl - IPL_HMIN][bit] = vecSet | 0;
+    }
 
     /**
      * raiseInterrupt(lvl, bit) / clearInterrupt(lvl, bit)
@@ -720,6 +748,25 @@ class VAXExc {
      * at cpustate.js and stepInstruction() above) treats as "nothing to dispatch" -- matching SIMH's
      * `vec = int_vec[l][i]` reading a zero-initialized table entry.
      *
+     * *** THE LAST TWO LINES ARE NOT A MASK.  ***  vax_io.c:452-453 is `vec |= int_vec_set[l][i];
+     * vec &= (int_vec_set[l][i] | QB_VEC_MASK);` -- an OR and then a mask WIDENED BY WHAT WAS OR'D
+     * IN, so for an autoconfigured Qbus device the bits VEC_SET (0x201) contributes SURVIVE.  Both
+     * of them are load-bearing and neither is reachable by masking alone: 0x200 moves the dispatch
+     * into the SECOND page of the SCB (where every Qbus device vector belongs), and 0x001 is
+     * VEC_QBUS, which intexc() reads to force the new PSL<IPL> to 0x17 regardless of the level the
+     * request was raised at.  A KA655 RQDX3 raised at BR4 therefore runs its handler at IPL 0x17.
+     * (pcjsvax-aef; before it, this returned `vec & QB_VEC_MASK` and every RQ vector would have
+     * dispatched one SCB page low and at the wrong IPL.)
+     *
+     * QB_VEC_MASK itself is, for THIS device, a no-op over the whole legal range and that is a
+     * MEASURED statement rather than an argument: SA_S1H_VEC is 0x007F and rq_quesvc computes
+     * `dibp->vec = (s1dat & SA_S1H_VEC) << 2`, so the largest vector a host can program is 0x1FC;
+     * `deposit rq devvec 2A8` is refused by SCP ("Read only argument"), so nothing can reach a
+     * larger one either.  tests/mscpintdiff.js programs 0x7F -- the largest legal value -- and
+     * grades the delivered SCB offset, which is how "the mask is a no-op here" is told apart from
+     * "the mask is not applied".  The mask is still applied, and it is still the thing that would
+     * truncate a device whose vector CAN exceed it (the SSC timers, tests/hwintdiff.js).
+     *
      * @this {VAXExc}
      * @param {Object} cpu
      * @param {number} lvl
@@ -736,7 +783,9 @@ class VAXExc {
                 let v = table[i];
                 if (v === undefined) return 0;
                 let vec = (typeof v === "function") ? (v(cpu) | 0) : (v | 0);
-                return vec & QB_VEC_MASK;
+                let vs = this.intVecSet[l][i] | 0;          /* int_vec_set[l][i] */
+                vec = vec | vs;
+                return vec & (vs | QB_VEC_MASK);
             }
         }
         return 0;
@@ -1715,7 +1764,7 @@ export {
     CC_N, CC_Z, CC_V, CC_C, CC_MASK,
     KERN, EXEC, SUPV, USER,
     SISR_MASK, SISR_2, AST_MAX,
-    IPL_HLTPIN, IPL_MEMERR, IPL_CRDERR, IPL_HMAX, IPL_HMIN, IPL_HLVL, IPL_SMAX, QB_VEC_MASK,
+    IPL_HLTPIN, IPL_MEMERR, IPL_CRDERR, IPL_HMAX, IPL_HMIN, IPL_HLVL, IPL_SMAX, QB_VEC_MASK, VEC_SET,
     TIR_TRAP, TIR_V_TRAP, TIR_M_TRAP, TRAP_INTOV, TRAP_DIVZRO,
     CVAX_SID, CVAX_UREV, BR_MASK, ccIIZZ_L,
     SSCBTO_BTO, SSCBTO_RWT, MCHK_READ, MCHK_WRITE

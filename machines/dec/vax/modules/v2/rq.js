@@ -161,17 +161,20 @@
  *     get_filesystem_size() parsing an ODS-2/ODS-1/RT-11/Ultrix volume out of the container.  A
  *     file-system parser is not a disk controller; attach() throws by name if a unit has it set and
  *     no graded case sets it.
- *   INTERRUPT DELIVERY.  rq_init_int() raises a controller interrupt when the host's S1 data has
- *     BOTH SA_S1H_IE and a non-zero SA_S1H_VEC; rq_ring_int() raises one on SA_S1H_VEC ALONE --
- *     THE TWO CONDITIONS DIFFER, and pcjsvax-aef exists because of it.  This file records the
- *     request in `irq` (as the C's `cp->irq`) and wires it to nothing; `irq` is not in SIMH's
- *     rq_reg[] so it is not examinable either.  mscpinitdiff.js FAILS the run if any graded case
- *     supplies an s1dat with IE and VEC both set; mscpringdiff.js is stricter and FAILS if VEC is
- *     non-zero at all, because rq_ring_int() does not test IE.  Vector computation
- *     (`dibp->vec = (s1dat & SA_S1H_VEC) << 2`) IS reproduced, in `vec`, because it is pure state.
- *     What IS implemented and graded is rq_ring_int()'s OTHER half: the one-word flag it DMAs to
- *     `comm + ring->ioff`, and the fact that it IGNORES a failure of that write (the C casts the
- *     Map_WriteW result to void and says so in a comment).
+ *   (INTERRUPT DELIVERY WAS HERE AND IS NOT AN EXCLUSION ANY MORE -- pcjsvax-aef LANDED IT.
+ *     rq_init_int() raises a controller interrupt when the host's S1 data has BOTH SA_S1H_IE and a
+ *     non-zero SA_S1H_VEC; rq_ring_int() raises one on SA_S1H_VEC ALONE -- THE TWO CONDITIONS
+ *     DIFFER, and no single test can see that, which is why the pair is graded together.  setInt()/
+ *     clrInt()/inta() below are rq_setint()/rq_clrint()/rq_inta(), wired to exc.js's
+ *     raiseInterrupt()/clearInterrupt()/addInterruptSource() seam, and tests/mscpintdiff.js grades
+ *     the delivery THROUGH REAL CPU EXECUTION: an SCB handler that records its own invocation into
+ *     memory, compared against real SIMH's for count, ORDER and PC/PSL/IPL at each.  `irq` is still
+ *     not in SIMH's rq_reg[] and still not examinable; what IS examinable is `dibp->vec`
+ *     (`examine rq devvec`) and, indirectly, the whole `show rq` vector line.
+ *     THE OTHER FIVE MSCP DIFFERENTIALS STILL FENCE INTERRUPTS OUT, and that fence is now a SCOPE
+ *     boundary rather than a gap: each of them grades an IN-BAND POLLING ITERATION COUNT, and an
+ *     SCB dispatch executing inside those loops would fold interrupt delivery into measurements
+ *     whose subject is the controller's event schedule.  Their exclusion messages say so.)
  *   rq_tmrsvc(), THE HOST-ACCESS TIMER.  `sim_activate_after (units + RQ_TIMER, 1000000)` is a
  *     WALL-CLOCK schedule (one second), not an instruction count, and nothing in this tree maps
  *     wall-clock to instructions.  It is not implemented.  `hat`/`htmo` are still modelled as state
@@ -218,6 +221,7 @@
  */
 
 import { VAX } from "./defines.js";
+import { VEC_SET } from "./exc.js";
 
 /* ------------------------------------------------------------------------------------------- *
  * pdp11_uqssp.h -- the UQSSP port registers.  Transcribed one line per #define, in the header's *
@@ -969,6 +973,20 @@ const RQ_OFFSET     = 0x1468;
 const RQ_BASE       = (VAX.PHYSMEM.IOPAGE_BASE + RQ_OFFSET) >>> 0;
 const IOLN_RQ       = 4;                        // pdp11_rq.c:1212, IOLN_RQ == 004
 
+/* WHERE THE CONTROLLER'S INTERRUPT REQUEST LIVES.  vaxmod_defs.h:346 `INT_V_RQ 0` and :407
+   `IPL_RQ (0x14 - IPL_HMIN)`; the DIB's `IVCL (RQ)` is `(IPL_RQ * 32) + INT_V_RQ` == 0, so the
+   RQDX3 is request bit 0 of the LOWEST hardware level.  exc.js's raiseInterrupt()/clearInterrupt()
+   take the ACTUAL IPL, not vaxmod_defs.h's IPL_HMIN-relative index, hence 0x14 here.
+   Corroborated by the oracle itself: `show rq` prints ", BR4" (pdp11_io_lib.c's show_vec computes
+   the BR level as `dibp->vloc / 32 + 4`).
+
+   *** BR4 IS NOT THE IPL THE HANDLER RUNS AT. ***  VEC_SET's low bit is VEC_QBUS, and intexc()
+   forces PSL<IPL> to 0x17 for any vector carrying it -- so this device requests at 0x14 and its
+   handler runs at 0x17.  MEASURED on real SIMH: every recorded dispatch shows PSL 0x00170004.
+   See exc.js's deviceVector() and tests/mscpintdiff.js. */
+const IPL_RQ        = 0x14;
+const INT_V_RQ      = 0;
+
 /** Thrown by name rather than answered: see the SCOPE EXCLUSIONS section of the file header. */
 class RQUnimplemented extends Error {}
 
@@ -1170,6 +1188,37 @@ export default class RQVAX {
             output survives `reset -p all` too.  Its consumer truncates it. */
         this.reqLog = [];
 
+        /**
+         * THE OTHER THREE CONTROLLER CONTEXTS, as rq_clrint()/rq_inta() see them.  Both of those
+         * functions walk `rq_ctxmap[0..RQ_NUMCT-1]` rather than looking only at `cp`, because
+         * SET_INT(RQ)/CLR_INT(RQ) toggle ONE master request bit shared by all four RQ controllers:
+         * a controller that clears its own `irq` may NOT clear the master bit while a sibling still
+         * has one outstanding.  RQB/RQC/RQD are DEV_DIS on this oracle (pdp11_rq.c:1483/1556/1629)
+         * so this tree constructs exactly one, and `peers` is `[this]` in every configuration it
+         * builds -- but the WALK is written, not elided, because eliding it would make the code say
+         * something the C does not (standing rule 12), and a builder that ever constructs a second
+         * controller wires the two instances' `peers` to the same array and gets the C's behaviour
+         * with no further change.
+         */
+        this.peers = [this];
+
+        /**
+         * THE INTERRUPT SEAM, installed the way vax_io.c's DIB tables are: once, when the device
+         * attaches, into `int_vec[]`/`int_ack[]`/`int_vec_set[]`.  `int_ack[IPL_RQ][INT_V_RQ]` is
+         * `&rq_inta` in the C -- a MASTER acknowledge shared by all four controllers, which is why
+         * inta() below walks `peers` instead of answering for `this`.
+         *
+         * `cqbic.exc` rather than a fourth constructor argument: the CQBIC already owns the CPU's
+         * VAXExc (see cqbic.js's constructor), a Qbus device cannot exist without a CQBIC to DMA
+         * through, and adding an argument would silently leave every existing caller uninstalled.
+         * A CQBIC built without one (nothing in this tree does) leaves `exc` null and the device
+         * records `irq` and delivers nothing -- the pre-pcjsvax-aef behaviour, not a crash.
+         */
+        this.exc = (cqbic && cqbic.exc) || null;
+        if (this.exc) {
+            this.exc.addInterruptSource(IPL_RQ, INT_V_RQ, () => this.inta(), VEC_SET);
+        }
+
         this.powerUp();
     }
 
@@ -1265,7 +1314,7 @@ export default class RQVAX {
         this.rspq = 0;                                      /* no q'd rsp pkts */
         this.pbsy = 0;                                      /* all pkts free */
         this.pip = 0;                                       /* not polling */
-        this.irq = 0;                                       /* rq_clrint */
+        this.clrInt();                                      /* rq_clrint */
         /* `uptr->flags = uptr->flags & ~(UNIT_ONL | UNIT_ATP); uptr->uf = 0; uptr->cpkt =
            uptr->pktq = 0;` -- pdp11_rq.c:3350-3357.  NOTE WHAT SURVIVES: the ATTACHMENT, the drive
            TYPE, the CAPACITY autosize computed and the write lock.  `reset -p all` does not detach a
@@ -2105,7 +2154,66 @@ export default class RQVAX {
      */
     initInt()
     {
-        if ((this.s1dat & SA_S1H_IE) && (this.s1dat & SA_S1H_VEC)) this.irq = 1;
+        if ((this.s1dat & SA_S1H_IE) && (this.s1dat & SA_S1H_VEC)) this.setInt();
+    }
+
+    /**
+     * setInt() / clrInt() / inta()
+     *
+     * rq_setint(), rq_clrint() and rq_inta() (pdp11_rq.c:3014-3064).  THE THREE OF THEM ARE ONE
+     * MECHANISM and splitting them apart is where a port goes wrong:
+     *
+     *   setInt   `cp->irq = 1; SET_INT (RQ);`  -- the controller's OWN request flag AND the shared
+     *            master request bit.  Both, always.
+     *   clrInt   `cp->irq = 0;` and then a RE-SCAN of every controller context: the master bit is
+     *            cleared only if NO controller still wants it, and is otherwise re-asserted.  So
+     *            this is not "clear the master bit"; it is "recompute it".
+     *   inta     the int_ack callback.  Finds the FIRST context with `irq` set, calls clrInt() on
+     *            THAT context, and returns THAT context's `dibp->vec`.  A controller with no
+     *            request pending answers 0, which exc.js's caller reads as "the request evaporated"
+     *            exactly as SIMH's `vec = 0` fallthrough does.
+     *
+     * NONE OF THE THREE APPENDS TO `reqLog`.  The C's lines here are `sim_debug (DBG_TRC, ...)`,
+     * and reqLog is the DBG_REQ stream that tests/mscpringdiff.js compares against `set rq
+     * debug=REQ` LINE FOR LINE -- three extra entries would fail every one of its trace
+     * comparisons while describing behaviour the oracle's REQ stream never prints.
+     *
+     * *** THE VECTOR RETURNED HERE IS NOT THE VECTOR THE SCB SEES. ***  `vec` is
+     * `(s1dat & SA_S1H_VEC) << 2`, at most 0x1FC.  exc.js's deviceVector() then ORs in VEC_SET
+     * (0x201) because this is an autoconfigured Qbus device, so the delivered SCB offset is
+     * `0x200 | vec` and PSL<IPL> is forced to 0x17.  MEASURED: with the S1 vector field at 0x7F,
+     * `examine rq devvec` reports 01FC and the dispatch lands on SCB 0x3FC.
+     *
+     * @this {RQVAX}
+     */
+    setInt()
+    {
+        this.irq = 1;                                       /* set ctrl int */
+        if (this.exc) this.exc.raiseInterrupt(IPL_RQ, INT_V_RQ);    /* set master int */
+    }
+
+    clrInt()
+    {
+        this.irq = 0;                                       /* clr ctrl int */
+        if (!this.exc) return;
+        for (let ncp of this.peers) {                       /* loop thru ctrls */
+            if (ncp.irq) {                                  /* other interrupt? */
+                this.exc.raiseInterrupt(IPL_RQ, INT_V_RQ);  /* yes, set master */
+                return;
+            }
+        }
+        this.exc.clearInterrupt(IPL_RQ, INT_V_RQ);          /* no, clr master */
+    }
+
+    inta()
+    {
+        for (let ncp of this.peers) {                       /* loop thru ctrl */
+            if (ncp.irq) {                                  /* ctrl int set? */
+                ncp.clrInt();                               /* clear int req */
+                return ncp.vec | 0;                         /* return vector */
+            }
+        }
+        return 0;
     }
 
     /**
@@ -4090,7 +4198,7 @@ export default class RQVAX {
         this.flagBuf[0] = 1;
         this.flagBuf[1] = 0;
         this.cqbic.mapWriteW(iadr, 2, this.flagBuf);        /* write flag -- RESULT IGNORED */
-        if (this.s1dat & SA_S1H_VEC) this.irq = 1;          /* if enb, intr */
+        if (this.s1dat & SA_S1H_VEC) this.setInt();         /* if enb, intr */
     }
 
     /**

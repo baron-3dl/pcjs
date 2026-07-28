@@ -71,11 +71,14 @@
  *     RQUnimplemented by name (pcjsvax-346).  Either way NO case here sends one:
  *     `assertExclusions()` FAILS the run if a case does, and PHASE S FAILS the run if the C's
  *     dispatch grows a case rq.js does not classify or moves one to a different handler.
- *   - CONTROLLER INTERRUPT DELIVERY.  pcjsvax-aef.  rq_ring_int() raises an interrupt on
- *     SA_S1H_VEC ALONE -- it does NOT test SA_S1H_IE, unlike rq_init_int() -- so every graded case
- *     here supplies VEC == 0 and `assertExclusions()` FAILS the run if one does not.  What IS
- *     graded is rq_ring_int()'s FLAG WORD: the one-word 1 it DMAs to comm-4 / comm-2, including the
- *     fact that a failure of that write is IGNORED.
+ *   - CONTROLLER INTERRUPT DELIVERY.  rq_ring_int() raises an interrupt on SA_S1H_VEC ALONE -- it
+ *     does NOT test SA_S1H_IE, unlike rq_init_int().  That asymmetry LANDED in pcjsvax-aef and is
+ *     graded by tests/mscpintdiff.js, so this is a SCOPE boundary rather than a gap: every graded
+ *     case here still supplies VEC == 0 and `assertExclusions()` still FAILS the run if one does
+ *     not, because this file grades awaitL()'s ITERATION COUNTS and an SCB dispatch inside those
+ *     loops would change them (and no SCB handler is installed for the RQ vector here).  What IS
+ *     graded here is rq_ring_int()'s FLAG WORD: the one-word 1 it DMAs to comm-4 / comm-2,
+ *     including the fact that a failure of that write is IGNORED.
  *   - rq_plf(), the last-failure packet.  Reachable only by a host that sets SA_S4H_LF in its
  *     step-4 GO word after a fatal; no case does, and the fence is the same one mscpinitdiff uses.
  * *   - rq_getpkt()'s `cp->hat = 0`.  It disables the host-access timer while a command is in
@@ -1204,8 +1207,12 @@ function assertExclusions(cases, sim, failures)
         if (c.s1dat & SA_S1H_VEC) {
             failures.push(`exclusion: case ${c.idx} "${c.name}" supplies an S1 word 0x${hex(c.s1dat, 4)} ` +
                 `with a non-zero SA_S1H_VEC.  rq_ring_int() raises an interrupt on VEC ALONE -- it ` +
-                `does NOT test SA_S1H_IE -- and interrupt DELIVERY is pcjsvax-aef's work, which ` +
-                `rq.js records in \`irq\` and wires nowhere.`);
+                `does NOT test SA_S1H_IE -- and that asymmetry is graded by tests/mscpintdiff.js ` +
+                `(pcjsvax-aef), which LANDED delivery.  This fence is now a SCOPE boundary, not a ` +
+                `gap: this file grades awaitL()'s ITERATION COUNTS, and an SCB dispatch executing ` +
+                `inside those loops would fold interrupt delivery into a measurement whose subject ` +
+                `is the controller's event schedule -- and no SCB handler is installed for the RQ ` +
+                `vector here, so one would dispatch to a zero SCB slot and HALT at PC 1.`);
         }
         if (c.s1dat & SA_S1H_IE) {
             failures.push(`exclusion: case ${c.idx} "${c.name}" supplies an S1 word with SA_S1H_IE set`);

@@ -72,11 +72,15 @@
  *   - Disk I/O and the twelve unit-bearing MSCP commands.  pcjsvax-f52.  rq.js throws
  *     RQUnimplemented by name rather than inventing an answer.
  *   - Controller INTERRUPT delivery.  rq_init_int() fires only when the host's s1dat has BOTH
- *     SA_S1H_IE and a non-zero SA_S1H_VEC; rq.js records the request and wires it nowhere.
- *     `assertExclusions()` FAILS the run if any graded case supplies such an s1dat, so the unwired
- *     path is unreachable rather than untested.  The VECTOR COMPUTATION is reproduced and is graded
- *     indirectly (s1dat is compared, and vec is a pure function of it) -- SIMH's rq_reg[] does not
- *     publish the DIB vector under the RQ device, so it cannot be compared directly.
+ *     SA_S1H_IE and a non-zero SA_S1H_VEC.  Delivery LANDED in pcjsvax-aef and is graded by
+ *     tests/mscpintdiff.js, so this is a SCOPE boundary rather than a gap: `assertExclusions()`
+ *     still FAILS the run if a graded case supplies BOTH bits, because what this file grades is the
+ *     POLLING ITERATION COUNT at which each handshake answer becomes visible and an SCB dispatch
+ *     inside those loops would change it (and no SCB handler is installed for the RQ vector here).
+ *     The VECTOR COMPUTATION is still exercised HERE and not only there: the randomized cases
+ *     program a non-zero SA_S1H_VEC with SA_S1H_IE clear, which sets `dibp->vec` without raising
+ *     anything.  It is graded indirectly (s1dat is compared, and vec is a pure function of it);
+ *     `examine rq devvec` is what tests/mscpintdiff.js reads directly.
  *   - rq_tmrsvc(), the once-per-second host-access timer.  It is a WALL-CLOCK schedule, not an
  *     instruction count.  `assertExclusions()` FAILS the run if the oracle ever reports HAT != HTMO
  *     at the end of a case, which is what firing would look like.
@@ -810,8 +814,15 @@ function assertExclusions(cases, sim, failures)
             if (act.step === 1 && (v & SA_S1H_VL) && !(v & SA_S1H_WR) &&
                 (v & SA_S1H_IE) && (v & SA_S1H_VEC)) {
                 failures.push(`exclusion: case ${c.idx} "${c.name}" writes an S1 word 0x${hex(v, 4)} with ` +
-                    `BOTH SA_S1H_IE and a non-zero SA_S1H_VEC, which requests a controller INTERRUPT -- ` +
-                    `a path rq.js records and wires nowhere.  Interrupts are pcjsvax-6a5's later work.`);
+                    `BOTH SA_S1H_IE and a non-zero SA_S1H_VEC, which requests a controller INTERRUPT. ` +
+                    `Delivery LANDED in pcjsvax-aef and is graded by tests/mscpintdiff.js; this fence ` +
+                    `is now a SCOPE boundary, not a gap.  What this file grades is the POLLING ` +
+                    `ITERATION COUNT at which each handshake answer becomes visible, and an SCB ` +
+                    `dispatch executing inside those poll loops would fold interrupt delivery into ` +
+                    `that measurement -- and no SCB handler is installed for the RQ vector here, so ` +
+                    `one would dispatch to a zero SCB slot and HALT at PC 1.  NOTE the fence tests ` +
+                    `IE *and* VEC: this file's random cases DO program a non-zero VEC with IE clear, ` +
+                    `which is what keeps \`dibp->vec\` graded here without any interrupt being raised.`);
             }
             if (act.step === 4 && (v & SA_S4H_LF)) {
                 failures.push(`exclusion: case ${c.idx} "${c.name}" writes a step-4 word 0x${hex(v, 4)} with ` +
