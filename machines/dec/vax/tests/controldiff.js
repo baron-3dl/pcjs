@@ -62,6 +62,11 @@ import MemoryVAX from "../modules/v2/memory.js";
 import { VAX } from "../modules/v2/defines.js";
 import { VAXDecoder, VAXFault } from "../modules/v2/decode.js";
 import { OPCODES } from "../modules/v2/drom.js";
+/* For the scope assertion below: the set this file GRADES is checked against the set control.js
+   actually IMPLEMENTS, rather than trusted to have been kept in step by hand (pcjsvax-486). */
+import { CONTROL_OPCODES } from "../modules/v2/control.js";
+/* ACBF's arithmetic -- the REAL model, not a stub.  See the Cpu constructor below. */
+import { VAXFloat } from "../modules/v2/fpa.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
@@ -195,7 +200,24 @@ class Cpu {
         this.regs = new Int32Array(16);
         this.psl = 0;
         this.decoder = new VAXDecoder(this);
+        /*
+         * ACBF (pcjsvax-486) is the one opcode in control.js's scope whose ARITHMETIC lives in
+         * fpa.js, reached through cpu.fpu exactly as the real machine reaches it.  Attaching the
+         * real VAXFloat here rather than a stub is the whole point: a stub would grade this file's
+         * loop/branch logic against a second model of F_floating, which is the drift standing rule
+         * 7 is about.
+         */
+        this.fpu = new VAXFloat(this);
     }
+
+    /*
+     * `cc` as a PSL-backed accessor, matching CPUStateVAX:567-568.  fpa.js reads and writes
+     * `cpu.cc` while control.js goes through getCC()/setCC() on the PSL; on the real CPU those are
+     * the SAME storage, and this harness has to present the same contract or ACBF's condition codes
+     * would be written somewhere the comparison never looks.
+     */
+    get cc() { return this.psl & 0xF; }
+    set cc(v) { this.psl = (this.psl & ~0xF) | (v & 0xF); }
 
     getISTR(lnt)
     {
@@ -631,7 +653,81 @@ for (let gs of [true, false]) {
     };
 }
 
+/* ---- ACBF: limit.rf, add.rf, index.mf, disp.bw (pcjsvax-486) ---- */
+
+/**
+ * f2vax(x) -- the VAX F_floating bit pattern for a JS number, DERIVED rather than tabulated
+ * (HANDOFF.md standing rule 5).
+ *
+ * IEEE-754 single is `1.f x 2^(E-127)` and VAX F is `0.1f x 2^(e-128)`, so equating the two gives
+ * `e = E + 2`: add 2 to the exponent FIELD, i.e. `+ (2 << 23)` on the raw word.  VAX then stores
+ * the sign/exponent half in the LOW-addressed word, so the two 16-bit halves are swapped relative
+ * to IEEE -- the same WORDSWAP fpa.js applies.  Checked against a value the ROM itself uses:
+ * 1.0 is IEEE 0x3F800000 -> 0x40800000 -> 0x00004080, and 0x4080 is (129 << 7), exponent field 129
+ * = bias 128 + 1, fraction 0.  Zero is the one special case: VAX true zero is all bits clear, and
+ * the formula above would produce a non-zero exponent for it.
+ *
+ * @param {number} x an exactly-representable small value
+ * @returns {number} the F_floating longword
+ */
+function f2vax(x)
+{
+    if (x === 0) return 0;
+    let dv = new DataView(new ArrayBuffer(4));
+    dv.setFloat32(0, x);
+    let v = (dv.getUint32(0) + (2 << 23)) >>> 0;
+    return ((((v & 0xFFFF) << 16) | (v >>> 16)) >>> 0) | 0;      // VAX word order
+}
+
+/*
+ * Deliberately ALWAYS the deterministic boundary-value path (encValue's forceValue, i.e. register
+ * mode), never the randomized one the integer ACBs also use.  A random 32-bit pattern read as
+ * F_floating is a RESERVED OPERAND once every 512 draws (sign set, exponent zero), which faults
+ * before the loop condition is ever evaluated -- so a randomized generator here would spend cases
+ * proving the fault path that decodediff/fpadiff already own, and would reach the branch boundary
+ * this file exists to grade only by luck.  The values below are small integers, exactly
+ * representable, so the SAME lim/add/idx shaping the ACBB/ACBW/ACBL builder uses carries over
+ * unchanged and lands (idx+add) at, just above, and just below the limit.
+ */
+BUILDERS["ACBF"] = (ctx) => {
+    let add = ctx.rng.pick([1, -1, 2, -2]);                       // sign-known step, both directions
+    let lim = ctx.rng.pick([-2, -1, 0, 1, 2, 5]);
+    let idx = (lim - add + ctx.rng.pick([-1, 0, 1])) | 0;         // (idx+add) at/around the limit
+    let limBytes = encValue(ctx, 4, f2vax(lim));
+    let addBytes = encValue(ctx, 4, f2vax(add));
+    let m = encModify(ctx, 4, f2vax(idx));
+    let c = finishCase("ACBF", ctx, [...limBytes, ...addBytes, ...m.bytes,
+                                     ctx.rng.int(256), ctx.rng.int(256)]);
+    if (m.dest.kind === "mem") c.checks.push({addr: m.dest.addr, size: 4, label: "modify-dest"});
+    else c.checks.push({reg: m.dest.rn, label: "modify-dest"});
+    return c;
+};
+
 const IN_SCOPE = Object.keys(BUILDERS);
+
+/*
+ * SCOPE ASSERTION (pcjsvax-486, HANDOFF.md standing rule 7 -- scope lives in code, not comments).
+ *
+ * This file's coverage is a hand-written BUILDERS table, and control.js's implemented set is its
+ * own CONTROL_OPCODES map; nothing previously required the two to agree.  They silently disagreed
+ * the moment ACBF was implemented: control.js grew an opcode and this file went on reporting
+ * "49 opcodes in scope" and PASSING, grading a set that no longer matched the module.  An opcode
+ * that is implemented but ungraded is exactly the gap rule 7 was earned by, so it is now a load-
+ * time failure rather than something a reader has to notice.
+ */
+{
+    /* CONTROL_OPCODES is keyed by opcode NUMBER and BUILDERS by MNEMONIC, so the two are brought
+       into the same namespace through the decode ROM's own name table rather than by a second
+       hand-written mapping. */
+    let implemented = Object.keys(CONTROL_OPCODES).map((n) => OPCODES[+n]).sort();
+    let graded = IN_SCOPE.slice().sort();
+    let ungraded = implemented.filter((n) => graded.indexOf(n) < 0);
+    let orphaned = graded.filter((n) => implemented.indexOf(n) < 0);
+    if (ungraded.length || orphaned.length) {
+        throw new Error(`controldiff.js: scope drift vs control.js -- implemented but NOT graded: ` +
+            `[${ungraded.join(", ")}]; graded but NOT implemented: [${orphaned.join(", ")}]`);
+    }
+}
 
 /* ------------------------------------------------------------------------------------------- *
  * SIMH command stream                                                                           *
@@ -1207,6 +1303,22 @@ const MUTATIONS = [
               "    cpu.writeData((tsp - 12) | 0, cpu.regs[12], 4);             // push (old) AP",
         to:   "    cpu.writeData((tsp - 8) | 0, cpu.regs[12], 4);              // push (old) FP\n" +
               "    cpu.writeData((tsp - 12) | 0, cpu.regs[13], 4);             // push (old) AP"
+    },
+    {
+        name: "acbf-drops-the-equality-term",
+        why: "ACBF branches when the result EQUALS the limit as well as when it is past it " +
+             "(vax_cpu.c:2992's `temp & CC_Z`); dropping that term silently ends the loop one " +
+             "iteration early, which is exactly the shape of the ROM self-test 51 failure " +
+             "pcjsvax-486 fixed",
+        from: "        if ((t & CC_Z) || ((opnd[1] & FPSIGN) ? !(t & CC_N) : (t & CC_N))) {",
+        to:   "        if (((opnd[1] & FPSIGN) ? !(t & CC_N) : (t & CC_N))) {"
+    },
+    {
+        name: "acbf-addend-sign-test-inverted",
+        why: "ACBF's loop direction is chosen by the ADDEND's sign, not the result's; inverting it " +
+             "makes a counting-down loop use the counting-up comparison and vice versa",
+        from: "        if ((t & CC_Z) || ((opnd[1] & FPSIGN) ? !(t & CC_N) : (t & CC_N))) {",
+        to:   "        if ((t & CC_Z) || ((opnd[1] & FPSIGN) ? (t & CC_N) : !(t & CC_N))) {"
     },
     {
         name: "sobgtr-off-by-one",

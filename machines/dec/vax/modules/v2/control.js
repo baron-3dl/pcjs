@@ -51,11 +51,20 @@
  * - WRITE_Q / quadword stores.  Every opcode in this file's scope is byte/word/longword-oriented;
  *   none needs a quadword destination.  Do not add one here -- see the README's note on
  *   WRITE_Q's cross-page probe needing the MMU's Test() (pcjsvax-061).
- * - ACBF/ACBD/ACBG/ACBH (floating-point ACB) and PUSHAO.  ACB-on-floating needs a floating ADD,
+ * - ACBD/ACBG/ACBH (floating-point ACB) and PUSHAO.  ACB-on-floating needs a floating ADD,
  *   which is pcjsvax-710's (floating point) scope, not this item's.  PUSHAO is EXTAC-group
  *   (octaword): SIMH's own decode ROM (vax_sys.c, via ODC()) reports ZERO specifiers for it --
  *   it is dispatched to OS software emulation, not executed by the CPU at all, exactly like packed
  *   decimal.  decode.js's checkInstructionGroup() comment documents this same exclusion.
+ *
+ *   ACBF IS NOW IMPLEMENTED HERE (pcjsvax-486) and is no longer in that list.  It was excluded by
+ *   THIS file for needing a floating add, and simultaneously excluded by fpa.js for never being
+ *   executed by EHKAA -- so it belonged to neither module and no gate noticed, which is HANDOFF.md
+ *   standing rule 7 in its exact documented shape.  The KA655 console ROM's self-test 51 DOES
+ *   execute it (2004E448), got a reserved-instruction fault, and printed `?51`; diagnosed by
+ *   pcjsvax-12b.  Only the arithmetic crosses to fpa.js -- see ACBF's own comment below.  The
+ *   remaining three, ACBD/ACBG/ACBH, are MEASURED not to be executed by that ROM either, so they
+ *   stay out by evidence rather than by assumption.
  * - BICPSW/BISPSW/MOVPSL.  These manipulate the PSW directly; they are not branch, jump, call, or
  *   stack instructions.  They live in cpu.js (verified: they are in its IMPLEMENTED table and are
  *   graded by intdiff.js).  An earlier version of this note assigned them to pcjsvax-e49; that was
@@ -65,6 +74,10 @@
 
 import { OPCODES } from "./drom.js";
 import { OP_MEM, VAXFAULT } from "./decode.js";
+/* ACBF's arithmetic only (pcjsvax-486) -- the F_floating model itself stays in fpa.js and is
+   reached through cpu.fpu, never re-implemented here.  fpa.js imports only decode.js, so this
+   does not create a cycle. */
+import { FPSIGN, CC_N, CC_Z } from "./fpa.js";
 
 /*
  * Condition codes.  PSL<3:0>, vax_defs.h:236-240.
@@ -517,6 +530,32 @@ const BODIES = {
         ccIIZP_L(cpu, r);
         vAddL(cpu, r, op1, op2);
         if ((op1 & LSIGN) ? (r >= op0) : (r <= op0)) branch(cpu, SXTW(decoder.brdisp));
+    },
+    /*
+     * ACBF -- pcjsvax-486.  The loop-control half is this file's (it is ACBL with a floating add
+     * and a floating compare); only the ARITHMETIC crosses to fpa.js, through the same opAddf() and
+     * opCmpfd() that ADDF2 and CMPF use, so there is no second model of F_floating anywhere.
+     *
+     * ORDER IS LOAD-BEARING and is vax_cpu.c:2986-2994's own: add, THEN compare against the limit,
+     * THEN store, THEN set the condition codes, THEN branch.  opCmpfd() faults on a reserved
+     * operand, so comparing before storing is what decides whether the destination is written at
+     * all on that path; swapping the two would be observable.
+     *
+     * The branch condition is the C's, transcribed rather than re-derived: branch when the result
+     * EQUALS the limit, or -- for a negative addend -- when it is above it, or for a positive
+     * addend when it is below it.  Same shape as ACBB/ACBW/ACBL above, with CC_N from a floating
+     * compare standing in for the signed integer compare.  The displacement is a WORD (BRANCHW),
+     * like ACBW/ACBL and unlike SOB/AOB's byte.
+     */
+    ACBF(decoder, cpu) {
+        let opnd = decoder.opnd;
+        let r = cpu.fpu.opAddf([opnd[1], opnd[2]], false);       // index = index + addend
+        let t = cpu.fpu.opCmpfd(r, 0, opnd[0], 0);               // result : limit
+        store(decoder, cpu, 4, r);
+        cpu.fpu.ccIIZPfp(r);
+        if ((t & CC_Z) || ((opnd[1] & FPSIGN) ? !(t & CC_N) : (t & CC_N))) {
+            branch(cpu, SXTW(decoder.brdisp));
+        }
     },
 
     /* ------------------------------------------------------------------------- CASE */

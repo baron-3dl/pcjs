@@ -59,8 +59,22 @@
  * F, D and G only.  Per docs/reference/ehkaa-profile.md §7, every one of the fifteen opcodes the
  * EHKAA hardware core diagnostic never executes is H_floating (ADDH2/3, CVTBH, CVTHB, CVTHL,
  * CVTHW, CVTLH, CVTRHL, CVTWH, DIVH2/3, MULH2/3, SUBH2/3); the fourteen Extended-Accuracy-Group
- * opcodes it DOES execute are G.  Also out of scope, and also for a measured reason: ACBD/F/G/H,
- * EMODD/F/G and POLYD/F/G are never executed either.  `vax_fmod()` and the `mhi`/`mlo` masking
+ * opcodes it DOES execute are G.  Also out of scope, and also for a measured reason: ACBD/G/H,
+ * EMODD/F/G and POLYD/F/G are never executed either.
+ *
+ * ACBF WAS ON THAT LIST AND SHOULD NOT HAVE BEEN -- corrected by pcjsvax-486, and the correction is
+ * HANDOFF.md standing rule 12 in its usual shape: the measurement was right, and the sentence about
+ * it claimed more than the measurement did.  "Never executed" was measured against
+ * docs/reference/ehkaa-profile.md, i.e. against EHKAA ALONE.  The KA655 console ROM's self-test 51
+ * executes ACBF at 2004E448, ~3.2M instructions in, which no EHKAA profile could have seen.
+ * Because control.js excluded it for needing a floating add and this file excluded it for the
+ * sentence above, ACBF belonged to NO module: DISPATCH[0x4F] was undefined, the ROM took a
+ * reserved-instruction fault and printed `?51` (diagnosed by pcjsvax-12b).  The loop-control half
+ * now lives in control.js beside ACBB/ACBW/ACBL and calls opAddf()/opCmpfd() HERE, so this file
+ * remains the only model of F_floating.  ACBD/G/H are measured not to be executed by that ROM
+ * either, so they stay out on evidence rather than on this sentence.
+ *
+ * `vax_fmod()` and the `mhi`/`mlo` masking
  * arguments of `vaxFadd()`/`vaxFmul()` exist only to serve EMOD and POLY; the masks are ported
  * (they cost nothing and keep the routines identical to SIMH's) but no caller here passes a
  * non-zero one, and `op_emod*`/`op_poly*` are not implemented.

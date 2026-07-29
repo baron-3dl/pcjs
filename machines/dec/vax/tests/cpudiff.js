@@ -93,8 +93,32 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Coverage floors.  Every one of these FAILS the run.                                            *
  * ------------------------------------------------------------------------------------------- */
 
-/** EHKAA executes every one of the 242 base-group opcodes (docs/reference/ehkaa-profile.md §7). */
 const MIN_EHKAA_RECORDS   = 320000;
+
+/**
+ * The EXACT number of opcodes the dispatch table claims -- an equality, not a floor, and NOT the
+ * same set as "the base-group opcodes EHKAA executes".
+ *
+ * THIS COMMENT USED TO READ "EHKAA executes every one of the 242 base-group opcodes
+ * (docs/reference/ehkaa-profile.md §7)", which describes a different set than the assertion below
+ * measures; the two merely happened to be the same size.  pcjsvax-486 separated them: ACBF is
+ * claimed by control.js so it counts HERE, but it is IG_EMONL rather than base-group and EHKAA
+ * never executes it -- which is exactly why it stayed unimplemented until the console ROM's
+ * self-test 51 reached it.  243 = the previous 242 + ACBF.
+ *
+ * Standing rule 12 again: the number was right and the sentence about it claimed more than the
+ * number did.  The base group's own completeness is asserted where it belongs, by
+ * tests/base_group_residual.js --check-carveouts, which this value does not affect.
+ */
+const EXPECTED_DISPATCH_CLAIMS = 243;
+
+/**
+ * A FLOOR on how many DISTINCT opcodes EHKAA actually executes (measured: 279).  This is the
+ * claim the old comment above was really making, and it is a genuinely different quantity from
+ * EXPECTED_DISPATCH_CLAIMS -- which is why splitting them was the right fix rather than bumping
+ * one number.  It deliberately does NOT move with ACBF: EHKAA never executes ACBF, so requiring
+ * 243 here would demand coverage the workload cannot provide (docs/reference/ehkaa-profile.md §7).
+ */
 const MIN_DISTINCT_OPCODES = 242;
 /** The emulate trap and the reserved-instruction fault for H_float both really happen in EHKAA. */
 const MIN_EMULATE_TRAPS   = 40;
@@ -1540,8 +1564,8 @@ function mainInner(opts)
     let claimed = Object.values(owners).reduce((a, b) => a + b, 0);
     console.log(`\nDispatch table: ${claimed} opcodes -- ` +
                 Object.entries(owners).map(([k, v]) => `${k}:${v}`).join(" "));
-    if (claimed !== MIN_DISTINCT_OPCODES) {
-        problems.push(`COVERAGE: dispatch table claims ${claimed} opcodes, expected ${MIN_DISTINCT_OPCODES}`);
+    if (claimed !== EXPECTED_DISPATCH_CLAIMS) {
+        problems.push(`COVERAGE: dispatch table claims ${claimed} opcodes, expected ${EXPECTED_DISPATCH_CLAIMS}`);
     }
     /*
      * NONSTORING: simhtrace.js reconstructs SIMH's `r` by reading the destination back, and
