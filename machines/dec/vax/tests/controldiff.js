@@ -774,31 +774,31 @@ function emitCase(lines, cmds, iCase, c)
 }
 
 /**
- * runSimh(simhBin, iniText)
+ * runSimh(simhBin, iniText, scratchDir, tag)
  *
- * Its own scratch directory, per call -- distinct from and NEVER the same as main()'s
- * opts.scratch (which loadMutant() receives but never uses).  HANDOFF.md pcjsvax-bd1: this
- * directory was created and never removed, the actual leak behind the 306 abandoned
- * /tmp/vax-controldiff-* directories found on this disk -- `dir` was returned but every call
- * site discards it (`let {out} = runSimh(...)`), so nothing downstream ever used it for
- * debugging either.  Cleaned up here, unconditionally, same as busdiff.js's runSimh().
+ * Writes into the CALLER's opts.scratch (mirrors decodediff.js's runSimh(), the sibling whose
+ * "kept in" message is accurate), not a private per-call mkdtemp directory.  pcjsvax-70c: the
+ * previous version (introduced by pcjsvax-bd1, which fixed this dir's *leak* but not its
+ * disconnection from opts.scratch) created and removed its own throwaway directory every call,
+ * unconditionally -- so main()'s FAIL message ("SIMH scripts kept in ${opts.scratch}") named a
+ * directory that loadMutant() also never writes into, and nothing else did either: opts.scratch
+ * was retained on FAIL exactly as promised, but empty, every time. `tag` distinguishes the three
+ * call sites (single/faults/nested) so a FAIL retains all three phases' scripts side by side
+ * instead of the last one overwriting the others.
  *
  * @param {string} simhBin
  * @param {string} iniText
+ * @param {string} scratchDir
+ * @param {string} tag
  * @returns {{out: string}}
  */
-function runSimh(simhBin, iniText)
+function runSimh(simhBin, iniText, scratchDir, tag)
 {
-    let dir = fs.mkdtempSync(path.join(os.tmpdir(), "vax-controldiff-"));
-    try {
-        let iniPath = path.join(dir, "run.ini");
-        fs.writeFileSync(iniPath, iniText);
-        let out = execFileSync(simhBin, [iniPath], {maxBuffer: 1 << 30, encoding: "utf8"});
-        fs.writeFileSync(path.join(dir, "run.out"), out);
-        return {out};
-    } finally {
-        fs.rmSync(dir, {recursive: true, force: true});
-    }
+    let iniPath = path.join(scratchDir, `${tag}.ini`);
+    fs.writeFileSync(iniPath, iniText);
+    let out = execFileSync(simhBin, [iniPath], {maxBuffer: 1 << 30, encoding: "utf8"});
+    fs.writeFileSync(path.join(scratchDir, `${tag}.out`), out);
+    return {out};
 }
 
 /**
@@ -960,7 +960,7 @@ function phaseSingle(simh, executeControl, opts)
     let cmds = [];
     for (let i = 0; i < cases.length; i++) emitCase(lines, cmds, i, cases[i]);
     lines.push("quit");
-    let {out} = runSimh(simh, lines.join("\n") + "\n");
+    let {out} = runSimh(simh, lines.join("\n") + "\n", opts.scratch, "single");
     let results = parseSimhOutput(out, cmds);
 
     let bus = new BusVAX({'busWidth': VAX.PAWIDTH, 'id': "bus"}, null, null);
@@ -1083,7 +1083,7 @@ function phaseFaults(simh, executeControl, opts)
     let cmds = [];
     for (let i = 0; i < cases.length; i++) emitCase(lines, cmds, i, cases[i]);
     lines.push("quit");
-    let {out} = runSimh(simh, lines.join("\n") + "\n");
+    let {out} = runSimh(simh, lines.join("\n") + "\n", opts.scratch, "faults");
     let results = parseSimhOutput(out, cmds);
     let perCaseFields = cases.map(() => ({}));
     for (let k = 0; k < cmds.length; k++) {
@@ -1232,7 +1232,7 @@ function phaseNested(simh, executeControl, opts)
         trialCmdRanges.push({start: firstCmdIdx, end: cmds.length});
     }
     lines.push("quit");
-    let {out} = runSimh(simh, lines.join("\n") + "\n");
+    let {out} = runSimh(simh, lines.join("\n") + "\n", opts.scratch, "nested");
     let results = parseSimhOutput(out, cmds);
     let perStepFields = trials.map((t) => t.steps.map(() => ({})));
     for (let k = 0; k < cmds.length; k++) {
