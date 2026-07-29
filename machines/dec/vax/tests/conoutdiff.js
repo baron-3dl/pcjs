@@ -127,6 +127,12 @@
  * stream: the number of ConsoleVAX.txdbWr calls must equal the number of bytes captured, which is
  * two independent measurements of the same event and fails if either one is blind.
  *
+ * And, since pcjsvax-aa5, the census carries ONE hard coverage floor: CqmDecodeFloor requires the
+ * ROM machine to decode CQMAPBASE and CQMBASE and requires the ROM to drive both.  That floor is
+ * the only tripwire in the whole gate over the defect that produced `?80` -- deleting those two
+ * mounts left cqmmapdiff, cqmerrdiff, qdmadiff, romdiff and this file ALL green, MEASURED.  See
+ * CqmDecodeFloor for why it grades the decode rather than the failure string.
+ *
  *      node machines/dec/vax/tests/conoutdiff.js [options]
  *        --simh PATH         patched microvax3900; else $SIMH_CPU_BIN/$SIMH_BIN, else the scratch
  *                             build (the same search romdiff.js uses)
@@ -512,6 +518,84 @@ const Walk = {
 };
 
 /**
+ * MachineBuild.build(romBytes) -- the machine under test, as its own object property for the same
+ * reason Walk.budget is one: so selfcheck() can perturb the SHIPPED construction rather than build
+ * a private copy of it (HANDOFF.md standing rule 11).
+ */
+const MachineBuild = {
+    build(romBytes) { return makeRomMachine(romBytes); }
+};
+
+/**
+ * CqmDecodeFloor -- a hard coverage floor over the decode whose absence produces `?80`.
+ *
+ * WHY THIS EXISTS -- MEASURED 2026-07-29 (pcjsvax-aa5), not reasoned:
+ * deleting the CQMAP and CQM mounts from rommachine.js puts `?80 2 02 FE 04 0001` back into this
+ * machine's console stream -- and cqmmapdiff, cqmerrdiff, qdmadiff, romdiff and THIS FILE all still
+ * exited 0.  cqmmapdiff grades the CQM translation MECHANISM on a machine it builds itself, so it
+ * cannot see whether the ROM's machine mounts that mechanism at all; romdiff's 249,743-instruction
+ * ceiling is ~2.1M instructions short of self-test 80; and PHASE C below grades only the oracle's
+ * reproducible prefix, which ends inside the first four lines -- long before the countdown reaches
+ * 09.  So the regression had no tripwire anywhere (HANDOFF.md standing rule 13).
+ *
+ * WHAT IT DOES NOT DO: it does not look for the string `?80`, and must not.  Detecting the failure
+ * code would grade the symptom, and pcjsvax-aa5's own DO-NOT is "do not detect or suppress test
+ * 80".  This grades the CAUSE instead -- the two devices are decoded, and the ROM drives them.
+ *
+ * WHY A NAMED PAIR RATHER THAN "every device must be driven": PHASE D deliberately refuses to be a
+ * gate, because a device the ROM never drives is a finding about the ROM.  These two are different:
+ * they are MEASURED as driven 57,536 times on every walk that reaches `>>>` (CQMAP readLong 16,476
+ * writeLong 16,524; CQM read 24,672 write 32,864), so zero calls is a defect in the machine, not a
+ * fact about the ROM.  The floor is on the REQUIREMENT, not on the machine's contents, so it does
+ * not scale down with anything (HANDOFF.md standing rule 4).
+ */
+const CqmDecodeFloor = {
+
+    /** class names as they appear in rommachine.js's `devices` roster */
+    REQUIRED: ["CQMAPVAX", "CQMVAX"],
+
+    /**
+     * @param {Object} js as returned by runJS()
+     * @param {string} name
+     * @returns {number} total calls the census recorded against that device class
+     */
+    calls(js, name) {
+        let t = 0;
+        for (let [k, v] of js.tally) if (k.slice(0, k.indexOf(".")) === name) t += v;
+        return t;
+    },
+
+    /**
+     * @param {Object} js as returned by runJS()
+     * @returns {Array.<string>} problems; empty when the floor holds
+     */
+    verify(js) {
+        let problems = [];
+        for (let name of this.REQUIRED) {
+            if (!js.deviceNames.includes(name)) {
+                problems.push(`COVERAGE FLOOR: the ROM machine did not construct ${name} -- the CQBIC ` +
+                    `Qbus map window is UNDECODED, which is MEASURED to reintroduce the ?80 self-test ` +
+                    `failure (pcjsvax-5c1/aa5).  Constructed devices: ${js.deviceNames.join(", ")}`);
+            } else if (this.calls(js, name) === 0) {
+                problems.push(`COVERAGE FLOOR: ${name} is decoded but the ROM never called it in ` +
+                    `${js.steps} instruction(s) -- every walk that reaches >>> drives it tens of ` +
+                    `thousands of times, so zero calls means it is mounted where the ROM does not reach`);
+            }
+        }
+        return problems;
+    },
+
+    /**
+     * @param {Object} js as returned by runJS()
+     * @returns {string} the one-line PHASE D report, whether the floor held or not
+     */
+    report(js) {
+        return this.REQUIRED.map((n) =>
+            `${n}=${js.deviceNames.includes(n) ? this.calls(js, n) + " call(s)" : "NOT DECODED"}`).join("  ");
+    }
+};
+
+/**
  * runJS(romBytes, opts, magicByte)
  *
  * Boots the shared ROM machine exactly as romdiff.js does and executes Walk.budget() instructions,
@@ -543,7 +627,7 @@ const Walk = {
  */
 function runJS(romBytes, opts, magicByte, budgetOverride)
 {
-    let machine = makeRomMachine(romBytes);
+    let machine = MachineBuild.build(romBytes);
     let {cpu, consoleDev} = machine;
     let tally = Census.install(machine);
     cpu.reset();
@@ -1104,6 +1188,7 @@ function runAll(romBytes, opts, magicByte, simh, rawCache, fQuiet = false)
         problems.push(`this machine wrote NOTHING to TXDB in ${js.steps} instruction(s) -- the ROM's ` +
             `output routine never completed a character`);
     }
+    problems.push(...CqmDecodeFloor.verify(js));
 
     sampleHeap();
     if (g_peakHeapMB > PEAK_HEAP_MB_MAX) {
@@ -1185,11 +1270,13 @@ function runAll(romBytes, opts, magicByte, simh, rawCache, fQuiet = false)
 
     say(`\nPHASE D -- device census over the same ${js.steps}-instruction walk`);
     {
-        /* THIS IS A REPORT, NOT A GATE.  A device the ROM never drives is a legitimate finding
-           about the ROM, not a defect in the machine, so nothing here fails the run -- the one
-           census assertion that DOES fail is the txdbWr/byte-count cross-check above.  The device
-           roster comes from what the machine constructed (js.deviceNames), not from the tally, so a
-           device with zero calls is genuinely reportable. */
+        /* THE PER-DEVICE TABLE IS A REPORT, NOT A GATE.  A device the ROM never drives is a
+           legitimate finding about the ROM, not a defect in the machine, so no line of the table
+           fails the run.  TWO census assertions do fail it, and both are narrower than the table:
+           the txdbWr/byte-count cross-check above, and CqmDecodeFloor -- which names exactly two
+           devices that are MEASURED as driven on every walk reaching `>>>`.  The device roster comes
+           from what the machine constructed (js.deviceNames), not from the tally, so a device with
+           zero calls is genuinely reportable. */
         let byDev = new Map(js.deviceNames.map((d) => [d, []]));
         for (let [k, v] of js.tally) {
             let dot = k.indexOf(".");
@@ -1206,6 +1293,9 @@ function runAll(romBytes, opts, magicByte, simh, rawCache, fQuiet = false)
         let untouched = [...byDev.entries()].filter(([, ms]) => !ms.some((m) => m[1] > 0)).map((e) => e[0]);
         say(`  devices the ROM never touched: ${untouched.length ? untouched.join(", ") : "(none -- all " +
             `${byDev.size} constructed devices were driven by the ROM)`}`);
+        /* The one part of PHASE D that IS a gate -- see CqmDecodeFloor for why these two devices and
+           no others.  Printed on every run, held or not, so the floor cannot go quiet. */
+        say(`  CQM DECODE FLOOR (graded): ${CqmDecodeFloor.report(js)}`);
     }
 
     return {problems, js, oA, oB, oShort, searched, searchSteps, fullSteps, repro, oracleRepro,
@@ -1348,6 +1438,28 @@ const MUTATIONS = {
         let orig = Walk.budget;
         Walk.budget = function(opts) { orig.call(this, opts); return 3000000; };
         return () => { Walk.budget = orig; };
+    },
+
+    /* THE REGRESSION THAT HAD NO TRIPWIRE (pcjsvax-aa5).  Hands the ROM the machine it had before
+       pcjsvax-5c1 -- CQMAPBASE and CQMBASE undecoded -- which is MEASURED to put `?80` back into
+       the console stream.  Before CqmDecodeFloor existed this mutation was caught by NOTHING:
+       cqmmapdiff, cqmerrdiff, qdmadiff, romdiff and this file all exited 0 with it applied, because
+       the extra 287 bytes of failure dump land far past the oracle's reproducible prefix and PHASE C
+       never looks at them.  PHASE S does not catch it either -- the truncated stream is stable, so
+       it settles.
+
+       Composed over the shipped MachineBuild.build the same way the budget mutations compose over
+       Walk.budget: the real construction runs and its machine is discarded, so the seam being
+       perturbed is the one the run actually takes (HANDOFF.md standing rule 11).  It cannot be
+       idempotent on an already-broken machine, because selfcheck() requires the UNMUTATED baseline
+       to be clean before any of this is believed. */
+    "cqm-window-undecoded": function() {
+        let orig = MachineBuild.build;
+        MachineBuild.build = function(romBytes) {
+            orig.call(this, romBytes);
+            return makeRomMachine(romBytes, false, true);
+        };
+        return () => { MachineBuild.build = orig; };
     }
 };
 
@@ -1480,4 +1592,5 @@ function main()
 
 main();
 
-export { OracleCapture, Compare, PrefixClaim, Census, Walk, compare, lineFloorBytes, nameAddress };
+export { OracleCapture, Compare, PrefixClaim, Census, Walk, MachineBuild, CqmDecodeFloor,
+         compare, lineFloorBytes, nameAddress };
