@@ -63,7 +63,13 @@
  * --------------------------------------------------------------------
  * MEASURED, and the reason an earlier revision of this file was intermittent: at a FIXED step
  * budget the oracle's output LENGTH varies between runs on the same host.  Two 3,000,000-step
- * captures produced 465 and 178 bytes.  SIMH's interval timer is a wall-clock-CALIBRATED event
+ * captures produced 465 and 178 bytes when this was first written; RE-MEASURED 2026-07-29 the
+ * effect is unchanged -- two 4,000,000-step captures gave 481 and 194 bytes on one run and 481 and
+ * 481 on the next, so the variance is in the RUN and not in any particular budget.  Contrast PHASE
+ * S, which measures the same question on THIS machine and finds a fixed 1,407-byte length with six
+ * bytes of one wall-clock field moving inside it: the two engines are nondeterministic in
+ * different quantities, and that asymmetry is what bounds the graded range.
+ * SIMH's interval timer is a wall-clock-CALIBRATED event
  * (sim_activate against a polled real-time rate), so how many timer interrupts land inside a fixed
  * instruction count depends on how fast the host executed them, and the ROM's self-tests are paced
  * by those interrupts.  Anything downstream of the first timer-paced test is therefore reproducible
@@ -75,6 +81,28 @@
  * until you have it" shape romdiff.js's captureSimhTrace() uses for history records.  The floor is
  * then a property of the OUTPUT, not of any step count, and a slower or faster host changes only
  * how many doublings it takes.
+ *
+ * THE JS BUDGET IS ALSO MEASURED, NOT DECLARED -- PHASE S (pcjsvax-e29)
+ * ----------------------------------------------------------------------
+ * The oracle's budget is searched for; for a long time THIS machine's was a constant justified by
+ * a sentence, and the sentence went stale.  It claimed the JS stream was byte-identical at
+ * 3,000,000 / 6,000,000 / 20,000,000 / 60,000,000 instructions.  cmctl.js and cqipc.js then landed
+ * and carried the ROM further, and by 2026-07-29 the 3,000,000-step default truncated the stream at
+ * byte 395 -- mid-countdown -- while this file went on exiting 0 and naming a first diverging byte.
+ * Three self-test failures this machine emits past there (?51, ?46, ?80) were invisible to it.
+ * That is HANDOFF.md standing rule 13 -- a gate that stops measuring is worse than one that fails --
+ * arriving in romdiff.js's own replacement, and it is why the budget is now an assertion.
+ *
+ * PHASE S walks the machine THREE times: twice at the budget in force and once at
+ * JS_SETTLE_MULTIPLE times it.  The same-budget pair DERIVES which byte offsets are wall-clock
+ * -derived (two walks over identical instructions can differ only there); the cross-budget pair
+ * must then match everywhere else, at the same length.  See JS_SETTLE_MULTIPLE's own comment for
+ * why two walks are not enough and why the derived exemption is widened to whole hex fields.
+ *
+ * PHASE S bounds what this file can SEE.  It does not touch what this file GRADES -- that is still
+ * the oracle's reproducible prefix and nothing beyond it.  PHASE U reports the rest and asserts
+ * nothing about it, which is the honest split: the ROM's later output is real and worth printing,
+ * and a single oracle capture cannot grade it.
  *
  * THE FLOOR IS STRUCTURAL, NOT A BYTE COUNT
  * -------------------------------------------
@@ -103,7 +131,10 @@
  *        --simh PATH         patched microvax3900; else $SIMH_CPU_BIN/$SIMH_BIN, else the scratch
  *                             build (the same search romdiff.js uses)
  *        --rom PATH          default $PCJS_VAX_REPO/open-simh/VAX/ka655x.bin
- *        --js-steps N        instructions to execute on THIS machine (default JS_STEPS_DEFAULT)
+ *        --js-steps N        instructions to execute on THIS machine (default JS_STEPS_DEFAULT).
+ *                             NOT a free knob: PHASE S re-walks at JS_SETTLE_MULTIPLE times
+ *                             whatever is given here and FAILS if the stream is still growing, so
+ *                             a budget too small to settle is rejected rather than obeyed
  *        --oracle-steps N    where the oracle's budget SEARCH starts, not a fixed budget -- the
  *                             search doubles from here (default ORACLE_SEED_STEPS; see the header)
  *        --selfcheck         prove the differential detects deliberate defects
@@ -127,11 +158,66 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * budget or a case count (HANDOFF.md standing rule 4).                                            *
  * ------------------------------------------------------------------------------------------- */
 
-/** Instructions to execute on THIS machine.  MEASURED: this machine's console byte stream stops
-    growing well before this budget and is byte-identical at 3,000,000 / 6,000,000 / 20,000,000 /
-    60,000,000 instructions, so the default is past the point where a longer walk changes the
-    answer, not merely past the point where the first byte appears (which is ~1,200,000).  ~0.6s. */
-const JS_STEPS_DEFAULT = 3000000;
+/** Instructions to execute on THIS machine.
+
+    THE BUDGET IS ASSERTED BY THE RUN, NOT BY THIS COMMENT (pcjsvax-e29).  Whatever value is in
+    force -- this default or a --js-steps override -- PHASE S below re-walks the machine at
+    JS_SETTLE_MULTIPLE times it and FAILS unless the stream has demonstrably stopped growing.  Read
+    that assertion as the authority and the numbers here as the record of one run; a budget
+    justified only by a sentence is exactly what this file used to carry.  (The comparison is not
+    bare byte-identity, and it cannot be -- see JS_SETTLE_MULTIPLE for the measurement that says
+    why, and for the third walk that makes it deterministic.)
+
+    WHAT THE OLD COMMENT CLAIMED, AND WHY IT IS GONE.  It asserted this machine's stream was
+    "byte-identical at 3,000,000 / 6,000,000 / 20,000,000 / 60,000,000 instructions".  That was true
+    when pcjsvax-bfb wrote it; cmctl.js and cqipc.js landed afterwards and carried the ROM further,
+    and by 2026-07-29 it was false -- 3,000,000 steps produce 395 bytes and 6,000,000 produce 1,407.
+    Everything past byte 395 was invisible while this file went on exiting 0 and naming a
+    first-diverging byte, which is HANDOFF.md standing rule 13 happening to romdiff.js's own
+    replacement.  Three self-test failures this machine emits and the oracle does not -- ?51, ?46
+    and ?80 -- lived in that gap, and no assertion here could see them.
+
+    RE-MEASURED 2026-07-29 on 818b7468f, one walk per budget from a fresh machine:
+
+        200,000 / 249,743 / 260,000 / 280,000 ->     0 bytes  (romdiff's ceiling reaches nothing)
+                                    300,000  ->     2 bytes
+                                  1,200,000  ->     5 bytes
+                                  3,000,000  ->   395 bytes  <- the OLD default, mid-countdown
+        6,000,000 / 12,000,000 / 20,000,000  -> 1,407 bytes  <- settled, and reaches ">>>"
+
+    First console byte at instruction #281,966; the 4th complete line at #2,423,939.  ~1.2s at this
+    budget, ~3.6s including the settle walk. */
+const JS_STEPS_DEFAULT = 6000000;
+
+/** PHASE S walks this multiple of whatever budget is in force, on a machine built from scratch.
+    Expressed as a MULTIPLE rather than as a second absolute constant on purpose: a --js-steps
+    override is then held to the same standard instead of escaping it, so "3,000,000 is enough"
+    cannot be re-asserted from the command line any more than it can from a comment.
+
+    WHY IT TAKES THREE WALKS AND NOT TWO, which is the whole subtlety of this check.  The obvious
+    form -- walk at N, walk at 2N, demand the streams be identical -- FAILS ON A CORRECT MACHINE,
+    and measuring that is what this item's own first attempt did.  MEASURED 2026-07-29 over four
+    walks: the stream is 1,407 bytes EVERY time, but exactly six byte offsets vary -- 295-297 and
+    321-323, the low hex digits of r2 and r4 in the ?53 register dump (r4 == r2 + 10).  They vary
+    between two walks at the SAME budget just as much as across budgets, because clk.js's todrRd()
+    outside ROM is a deliberate, graded port of a SYNCHRONOUS host-clock read (see clk.js's header
+    and tests/timerdiff.js).  A bare identity assertion would therefore have been a permanently red
+    check, and "fix" it by widening a tolerance and it stops measuring anything.
+
+    So the exempt set is DERIVED, never declared (HANDOFF.md standing rule 5 -- never hand-enumerate
+    a scope list).  Two walks at the SAME budget execute identical instructions, so every offset
+    that differs between them is wall-clock-derived BY CONSTRUCTION; that measured set is subtracted
+    from the cross-budget comparison, and anything left over is real budget dependence.  The machine
+    cannot know its own budget, so content that moves with the budget and not with the clock means
+    the shorter walk was observing a different machine state -- which is precisely the defect this
+    item exists to catch.  MAX_VOLATILE_OFFSETS then keeps the derived exemption from growing into a
+    blanket.
+
+    The asymmetry with the oracle is worth stating, because it is what earns the right to compare a
+    single JS capture against a two-capture oracle prefix: the oracle varies in LENGTH at a fixed
+    budget (PHASE O/R measured 481 and 194 bytes from two 4,000,000-step processes), while this
+    machine varies only in the VALUE of one wall-clock field at a fixed length. */
+const JS_SETTLE_MULTIPLE = 2;
 
 /** Where the oracle budget SEARCH starts (--oracle-steps overrides it).  DELIBERATELY below the
     point where the ROM emits anything: MEASURED, 249,743 steps -- romdiff.js's exact ceiling --
@@ -164,7 +250,18 @@ const ORACLE_FULL_MULTIPLE = 2;
     reproducible oracle prefix -- through the `40..39..…31..` countdown and into the `?53` dump the
     oracle itself produces -- and the ROM no longer reports `?91`.  Three runs on the same host gave
     104, 115 and 115 matching bytes, differing only because the ORACLE's reproducible prefix differed
-    (104, 295 and 167 bytes); this machine's own stream was byte-identical across all three.
+    (104, 295 and 167 bytes); this machine's own stream was byte-identical across all three OVER THE
+    GRADED REGION.
+
+    THAT LAST CLAUSE IS A CORRECTION, and it is this file's own instance of HANDOFF.md standing rule
+    12.  The sentence used to end "this machine's own stream was byte-identical across all three",
+    unqualified, and that is FALSE and was false when it was written: MEASURED 2026-07-29 by
+    pcjsvax-e29, six bytes of every capture vary run to run -- the r2/r4 hex fields at 290-297 and
+    316-323 in the ?53 dump, which are wall-clock-derived (PHASE S).  Those offsets were inside the
+    395-byte stream the 3,000,000-step budget produced at the time, so the unqualified claim was
+    already wrong; it survived because the GRADED region has never reached byte 290, which is
+    exactly the shape rule 12 describes -- the measurement was right and the sentence about it
+    claimed more than the measurement did.
 
     THE FLOOR IS DELIBERATELY NOT RAISED TO MATCH, and that is a measurement rather than caution: the
     5th complete line (the countdown) ends at byte 106 and the 6th at byte 108, so a floor of 5 or 6
@@ -175,8 +272,16 @@ const ORACLE_FULL_MULTIPLE = 2;
     ROM's reaction to it. */
 const BANNER_MATCH_FLOOR_LINES = 4;
 
-/** ABSOLUTE peak-heap ceiling, in MB (HANDOFF.md standing rule 14).  MEASURED for the shipped
-    configuration: ~13 MB, printed on every run so drift is visible long before it is fatal. */
+/** ABSOLUTE ceiling on how many byte offsets may differ between two walks at the SAME budget --
+    PHASE S's wall-clock exemption.  See the check itself for why it must stay small. */
+const MAX_VOLATILE_OFFSETS = 32;
+
+/** ABSOLUTE peak-heap ceiling, in MB (HANDOFF.md standing rule 14).  RE-MEASURED 2026-07-29 with
+    PHASE S's three walks in place: 21.1 / 21.2 / 21.2 MB over three consecutive runs.  It was
+    17.5 MB with one walk at this budget, and the "~13 MB" this comment used to claim was measured
+    at the old 3,000,000-step budget -- three walks at twice the budget cost about 8 MB more than
+    one walk at the old one, which is well inside the ceiling and is why the ceiling does not move.
+    Printed on every run so drift is visible long before it is fatal. */
 const PEAK_HEAP_MB_MAX = 256;
 
 /** Distinct bus-fault addresses whose detail is retained for the report.  The COUNTS below stay
@@ -406,12 +511,23 @@ const Walk = {
  * drift HANDOFF.md standing rule 7 warns about.  What this function contributes is the ADDRESSES,
  * at step numbers romdiff's history-ring ceiling cannot reach.
  *
+ * `budgetOverride` is how PHASE S walks a LONGER budget without going through Walk.budget().  That
+ * matters for more than convenience: the "js-budget-truncated-mid-stream" mutation perturbs
+ * Walk.budget() to a constant, and a settle walk that re-derived its own budget from the same
+ * perturbed seam would return the SAME number, make both walks identical, and certify a truncation
+ * it was written to catch.  PHASE S therefore multiplies the shipped seam's answer ONCE and passes
+ * the product down here.  The seam is still the shipped one and is still what the mutation
+ * perturbs (HANDOFF.md standing rule 11); what is not allowed is for the mutation to perturb both
+ * sides of the comparison symmetrically, which is rule 16's "the verifier's own read was unsound"
+ * in miniature.
+ *
  * @param {Uint8Array} romBytes
  * @param {Object} opts
  * @param {number} magicByte
+ * @param {number} [budgetOverride]
  * @returns {Object}
  */
-function runJS(romBytes, opts, magicByte)
+function runJS(romBytes, opts, magicByte, budgetOverride)
 {
     let machine = makeRomMachine(romBytes);
     let {cpu, consoleDev} = machine;
@@ -435,7 +551,7 @@ function runJS(romBytes, opts, magicByte)
         return realOnBusFault(addr, access, ...rest);
     };
 
-    let steps = 0, stop = null, budget = Walk.budget(opts);
+    let steps = 0, stop = null, budget = budgetOverride || Walk.budget(opts);
     try {
         while (steps < budget) { cpu.stepCPU(1); steps++; }
     } catch (e) {
@@ -635,6 +751,76 @@ const Compare = {
     }
 };
 
+/**
+ * Diff.offsets(a, b) -- EVERY offset at which two equal-or-unequal-length streams differ, not just
+ * the first.  PHASE S needs the whole set rather than a prefix length, because its question is not
+ * "where do these diverge" but "WHICH bytes move, and are they the same ones that move when only
+ * the wall clock has changed".  A first-difference answer cannot express that.
+ *
+ * Offsets past the shorter stream's end are reported too, so a length change is visible as offsets
+ * rather than being silently outside the comparison.
+ */
+const Diff = {
+    offsets(a, b) {
+        let out = [], n = Math.max(a.length, b.length);
+        for (let i = 0; i < n; i++) {
+            if (i >= a.length || i >= b.length || a[i] !== b[i]) out.push(i);
+        }
+        return out;
+    },
+
+    /**
+     * Diff.expandToFields(bytes, offsets)
+     *
+     * Widens each differing offset to the WHOLE hexadecimal field containing it.
+     *
+     * THIS IS THE DIFFERENCE BETWEEN A DETERMINISTIC CHECK AND A FLAKY ONE, and it was measured
+     * rather than foreseen: PHASE S's first form derived its exempt set as "the offsets that
+     * differed between two same-budget walks", and that set is a SAMPLE, not the field.  The
+     * varying quantity is a host-clock value printed as 8 hex digits -- 7BAB348B vs 7BAB34FC
+     * differs in two digits, 7BAB348B vs 7BAB3569 in three -- so which offsets move depends on how
+     * much real time passed between the two walks being compared.  A cross-budget pair can
+     * therefore move a digit the same-budget pair happened not to, and the check fails at random.
+     * It did, on the very next run: "2 offset(s) that a same-budget repeat does NOT touch".
+     *
+     * HANDOFF.md standing rule 17: a mechanism by which the test can fail is a bug report about the
+     * test, and the remedy is to close it by CONSTRUCTION rather than to sample more walks or widen
+     * a tolerance -- both of those make it rarer and neither makes it impossible.  A field that
+     * demonstrably moves with the wall clock is untrustworthy in EVERY digit, so the exemption is
+     * the field.
+     *
+     * The exemption stays narrow in the way that matters: a field is exempt only where a SAME-BUDGET
+     * repeat already proved it moves with the clock alone.  Budget dependence anywhere else is still
+     * caught byte for byte.  Budget dependence INSIDE such a field is masked -- correctly, because
+     * that field is a live clock reading and is ungradeable by construction, which is the same
+     * reason PHASE C refuses to grade past the oracle's reproducible prefix.
+     */
+    expandToFields(bytes, offsets) {
+        const isHex = (c) => (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66);
+        let set = new Set();
+        for (let i of offsets) {
+            if (i >= bytes.length || !isHex(bytes[i])) { set.add(i); continue; }
+            let a = i, b = i;
+            while (a > 0 && isHex(bytes[a - 1])) a--;
+            while (b + 1 < bytes.length && isHex(bytes[b + 1])) b++;
+            for (let k = a; k <= b; k++) set.add(k);
+        }
+        return [...set].sort((x, y) => x - y);
+    },
+
+    /** "295-297, 321-323" -- contiguous runs, so the report shows FIELDS rather than a byte list. */
+    ranges(offsets) {
+        if (!offsets.length) return "(none)";
+        let out = [], start = offsets[0], prev = offsets[0];
+        for (let v of offsets.slice(1)) {
+            if (v !== prev + 1) { out.push([start, prev]); start = v; }
+            prev = v;
+        }
+        out.push([start, prev]);
+        return out.map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(", ");
+    }
+};
+
 const PrefixClaim = {
     verify(a, b, n) {
         if (n < 0 || n > Math.min(a.length, b.length)) {
@@ -772,6 +958,54 @@ function runAll(romBytes, opts, magicByte, simh, rawCache, fQuiet = false)
     let js = runJS(romBytes, opts, magicByte);
     sampleHeap();
 
+    /* ---- PHASE S: the budget is a MEASUREMENT, not a declaration (pcjsvax-e29) ---- */
+    let jsRepeat = runJS(romBytes, opts, magicByte);
+    sampleHeap();
+    let settleSteps = Walk.budget(opts) * JS_SETTLE_MULTIPLE;
+    let jsSettle = runJS(romBytes, opts, magicByte, settleSteps);
+    sampleHeap();
+
+    /* The SAME-budget pair derives this machine's own volatile offsets by measurement.  Two walks
+       at one budget execute the identical instructions, so anything that differs between them is
+       wall-clock-derived by construction and cannot be budget dependence. */
+    let volatileOffsets = Diff.expandToFields(js.bytes, Diff.offsets(js.bytes, jsRepeat.bytes));
+    let settleDiff = Diff.offsets(js.bytes, jsSettle.bytes);
+    let budgetDependent = settleDiff.filter((i) => !volatileOffsets.includes(i));
+    let settled = (js.bytes.length === jsSettle.bytes.length && !budgetDependent.length);
+
+    if (js.bytes.length !== jsRepeat.bytes.length) {
+        problems.push(`two walks at the SAME budget (${js.steps}) produced ${js.bytes.length} and ` +
+            `${jsRepeat.bytes.length} bytes.  The stream's LENGTH is not reproducible on this machine, ` +
+            `so no offset into it means anything and the volatile-offset set below cannot be derived`);
+    } else if (js.bytes.length !== jsSettle.bytes.length) {
+        problems.push(`the JS budget has NOT been shown to be large enough: ${js.steps} instruction(s) ` +
+            `produce ${js.bytes.length} byte(s) but ${jsSettle.steps} produce ${jsSettle.bytes.length}.  ` +
+            `The stream is STILL GROWING at the budget, so everything past it is invisible to this file ` +
+            `while it goes on exiting 0 -- HANDOFF.md standing rule 13.  Raise --js-steps until this ` +
+            `assertion holds; do NOT lower JS_SETTLE_MULTIPLE`);
+    } else if (budgetDependent.length) {
+        let i = budgetDependent[0];
+        problems.push(`the ${js.steps}-instruction and ${jsSettle.steps}-instruction streams are the same ` +
+            `LENGTH but differ at ${budgetDependent.length} offset(s) that a same-budget repeat does NOT ` +
+            `touch, first at byte ${i} (0x${hex(js.bytes[i], 2)} vs 0x${hex(jsSettle.bytes[i], 2)}).  ` +
+            `That is BUDGET DEPENDENCE, not the wall clock: the machine cannot know its own budget, so ` +
+            `content that changes with it means the shorter walk is observing a different machine state`);
+    }
+
+    /* An ABSOLUTE bound (HANDOFF.md standing rule 4): it does not scale with the budget or with the
+       stream length.  MEASURED 2026-07-29: the raw differing offsets are 295-297 and 321-323, which
+       expand to the two 8-digit fields 290-297 and 316-323 -- r2 and r4 in the ?53 register dump,
+       where r4 == r2 + 10.  Sixteen offsets, two fields, one wall-clock quantity.  If dozens of
+       bytes start moving, something else in this machine became nondeterministic and must be
+       DIAGNOSED rather than exempted -- an exemption derived from measurement still has to be small
+       enough that it cannot quietly become a blanket. */
+    if (volatileOffsets.length > MAX_VOLATILE_OFFSETS) {
+        problems.push(`${volatileOffsets.length} byte offset(s) differ between two walks at the SAME ` +
+            `budget, over the absolute ceiling of ${MAX_VOLATILE_OFFSETS}.  PHASE S exempts same-budget ` +
+            `variation from the settle comparison because it is wall-clock-derived; an exemption this ` +
+            `large would exempt real divergence with it`);
+    }
+
     /* ---- PHASE O ---- */
     let capture = (steps, tag) => {
         let key = `${steps}:${tag}`;
@@ -878,6 +1112,12 @@ function runAll(romBytes, opts, magicByte, simh, rawCache, fQuiet = false)
         }
         if (js.faults.size > listed) say(`     (${js.faults.size - listed} further address(es) not listed)`);
     }
+    say(`  PHASE S same-budget   : ${jsRepeat.steps} instruction(s) -> ${jsRepeat.bytes.length} byte(s), ` +
+        `${volatileOffsets.length} volatile offset(s)` +
+        (volatileOffsets.length ? ` at ${Diff.ranges(volatileOffsets)} (wall-clock-derived)` : ""));
+    say(`  PHASE S settle walk   : ${jsSettle.steps} instruction(s) -> ${jsSettle.bytes.length} byte(s), ` +
+        `${settled ? "SETTLED -- same length, and nothing differs that the wall clock does not already move"
+                   : "NOT SETTLED -- see FAILURES below"}`);
 
     say(`\nPHASE O/R -- the oracle`);
     for (let s of searched) {
@@ -897,6 +1137,36 @@ function runAll(romBytes, opts, magicByte, simh, rawCache, fQuiet = false)
     if (c.kind === "diverged") {
         say(`  this way : "${show(js.bytes, c.n, 48)}"`);
         say(`  oracle   : "${show(oracleRepro, c.n, 48)}"`);
+    }
+
+    /* ---- PHASE U: REPORT ONLY, and the distinction is the point (pcjsvax-e29) ---- */
+    say(`\nPHASE U -- what this machine emits PAST the oracle's reproducible prefix.  NOT GRADED.`);
+    {
+        /* This section asserts NOTHING and must not.  The graded range is bounded by what two
+           independent oracle captures agree on, and widening it to chase bytes the oracle cannot
+           reproduce would manufacture divergences exactly the way a wrapped history ring does --
+           that is pcjsvax-e29's own done-condition 4, and PHASE C stays untouched by this block.
+
+           What was wrong before was not the graded range but the VISIBILITY: at the old 3,000,000
+           budget this machine's stream stopped at byte 395, mid-countdown, and three self-test
+           failures it emits past there were invisible while the run exited 0.  Printing the tail
+           costs nothing and is the difference between "the instrument is silent about this" and
+           "the instrument reports this and does not grade it".  Which of these the ORACLE emits is
+           measured elsewhere, over many runs (pcjsvax-486 / 877 / aa5); this file cannot answer it
+           from one capture and does not try. */
+        let codes = [];
+        let text = Buffer.from(js.bytes).toString("latin1");
+        for (let m of text.matchAll(/\?(\d\d)\b/g)) codes.push({code: m[1], at: m.index});
+        say(`  this machine's COMPLETE stream : ${js.bytes.length} byte(s), of which the first ${repro} ` +
+            `were graded above`);
+        say(`  self-test failure codes in it  : ${codes.length
+            ? codes.map((k) => `?${k.code}@${k.at}`).join(" ")
+            : "(none)"}`);
+        for (let k of codes) {
+            say(`     ?${k.code} at byte ${k.at}${k.at < repro ? " (inside the graded prefix)"
+                                                              : " -- PAST the graded prefix, reported only"}`);
+        }
+        say(`  tail past the graded prefix    : "${show(js.bytes, repro, 160)}"`);
     }
 
     say(`\nPHASE D -- device census over the same ${js.steps}-instruction walk`);
@@ -968,12 +1238,21 @@ const MUTATIONS = {
        that is wrong from its first byte or stops entirely.  `dropped` is a one-shot latch for
        exactly that reason: an earlier revision dropped whenever the length reached 4, which pinned
        the stream at 3 bytes and degenerated into the same "output stops" case the first two
-       mutations already cover. */
+       mutations already cover.
+
+       THE LATCH IS PER-CONSOLE, NOT PER-MUTATION, and that distinction became load-bearing when
+       pcjsvax-e29 made PHASE S walk the machine three times.  A latch held in this closure fires on
+       the FIRST walk only, so the other two walks emit a full-length stream and the mutation is
+       caught by PHASE S's same-budget LENGTH check instead of by the divergence comparison it was
+       written to exercise -- it would still have been reported CAUGHT, while quietly no longer
+       testing the thing its own comment claims (HANDOFF.md standing rule 12).  Latching on the
+       console instance instead means every walk drops its 4th byte, all three streams are the same
+       length, and the non-zero-offset divergence is once again what catches it. */
     "txdb-drops-one-byte-mid-stream": function() {
-        let orig = ConsoleVAX.prototype.txdbWr, dropped = false;
+        let orig = ConsoleVAX.prototype.txdbWr;
         ConsoleVAX.prototype.txdbWr = function(val) {
             orig.call(this, val);
-            if (!dropped && this.output.length === 4) { this.output.pop(); dropped = true; }
+            if (!this.conoutDropped && this.output.length === 4) { this.output.pop(); this.conoutDropped = true; }
         };
         return () => { ConsoleVAX.prototype.txdbWr = orig; };
     },
@@ -1036,6 +1315,24 @@ const MUTATIONS = {
     "js-budget-reverted-to-romdiff-ceiling": function() {
         let orig = Walk.budget;
         Walk.budget = function(opts) { orig.call(this, opts); return 200000; };
+        return () => { Walk.budget = orig; };
+    },
+
+    /* THE DEFECT pcjsvax-e29 EXISTS TO REMOVE, and the one the mutation above structurally could
+       not catch.  A budget silently reverted to 3,000,000 is FAR past romdiff's ceiling, so the
+       stream is 395 bytes rather than zero: the banner is complete, four lines exist, the floor is
+       met, PHASE C still names a first diverging byte and the run still exits 0.  Every assertion
+       this file had before PHASE S is satisfied by it.  What it hides is the 1,012 bytes after
+       byte 395, which is where ?51, ?46 and ?80 live.
+
+       So this mutation is caught by PHASE S and by nothing else, which is what makes it worth
+       having: it is a coverage hole with no other tripwire over it, and it shipped green for as
+       long as it existed (HANDOFF.md standing rule 13).  Composed over the shipped Walk.budget --
+       the original is called and its answer discarded -- rather than substituting a copy, so it
+       still perturbs the path the run actually takes (standing rule 11). */
+    "js-budget-truncated-mid-stream": function() {
+        let orig = Walk.budget;
+        Walk.budget = function(opts) { orig.call(this, opts); return 3000000; };
         return () => { Walk.budget = orig; };
     }
 };
