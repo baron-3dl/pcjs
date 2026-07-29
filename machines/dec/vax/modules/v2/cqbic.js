@@ -110,6 +110,12 @@ const REG_MEAR = 2;
 const REG_SEAR = 3;
 const REG_MBR  = 4;
 
+/* vaxmod_defs.h:196, CQBICSIZE == (5 << 2) -- the five registers above and nothing more.  DERIVED
+   from the highest register number rather than written as 0x14, so that adding a register cannot
+   leave the decoded span behind (HANDOFF.md standing rule 5).  Exported because callers mount this
+   device over exactly this span; tests/cqbicdiff.js takes its address filter from it. */
+const CQBIC_SIZE = (REG_MBR + 1) << 2;
+
 /* vax_io.c:58-88. */
 const CQSCR_POK  = 0x00008000;
 const CQSCR_BHL  = 0x00004000;
@@ -246,18 +252,29 @@ export default class CQBICVAX {
     }
 
     /**
-     * writeReg(rg, val, sval)
+     * writeReg(rg, val, sval, addr)
      *
      * vax_io.c:495-527.  `case 2: case 3:` (MEAR/SEAR) are READ-ONLY latches on real hardware: a
-     * program WRITE to either one is itself a bus error (`cq_merr()` + a synchronous machine check,
-     * vax_io.c:518-520) -- reproduced here by returning false (the caller's bus-fault path).  THIS
-     * IS THE ONLY CASE IN THIS ENTIRE DEVICE FILE THAT GENUINELY FAULTS ON WRITE -- do not confuse
-     * it with "uncased register" (the trailing default below, and the KA655/SSC equivalents in
-     * ka655.js/ssc.js), which is a SILENT NO-OP, not a fault.  Conflating the two -- "no case
-     * matched" and "this specific register is a deliberate bus error" -- into a single `false`
-     * return was exactly the veracity finding this re-dispatch fixes elsewhere in this codebase
-     * (ka655.js's BDR, ssc.js's uncased offsets); it happens to have been RIGHT here by construction
-     * only because MEAR/SEAR really do fault and every other rg reaching this switch is cased.
+     * program WRITE to either one is itself a bus error -- and vax_io.c:519-520 says exactly WHICH
+     * bus error: `cq_merr (pa); MACH_CHECK (MCHK_WRITE);`.  That is the CQBIC latching its own
+     * DSER<MNX>/MEAR and raising the machine check ITSELF, which is regblock.js's `REG_MCHK`
+     * (pcjsvax-622), NOT the register-space fall-through.  Do not confuse this with "uncased
+     * register" (the trailing default below, and the KA655/SSC equivalents in ka655.js/ssc.js),
+     * which is a SILENT NO-OP, not a fault.
+     *
+     * MEASURED DIVERGENCE THIS REPLACES (pcjsvax-69a), oracle vs. this file before the change --
+     * `MOVL #FFFFFFFF,@#20080008`, one instruction, SCB_MCHK pointed at a page of NOPs:
+     *
+     *      oracle:  PC=00102000  BTO=00000000  DSER=80  MEAR=0400
+     *      before:  PC=00102000  BTO=C0000000  DSER=00  MEAR=0000
+     *
+     * i.e. returning plain `false` routed the write through cpustate.js's onBusFault() WITHOUT
+     * `fNoBto`, which is vax_sysdev.c's WriteReg() `default:` branch -- `ssc_bto |= SSCBTO_BTO |
+     * SSCBTO_RWT` -- a branch the C never reaches here, because the regtable entry MATCHED and
+     * cqbic_wr() ran.  All three observable differences (the bus-timeout register the ROM can read
+     * back, and the CQBIC's own two error registers) were wrong in the same direction: the machine
+     * reported "nothing answered at that address" where the real one reports "the Qbus adapter
+     * refused the write".  tests/cqbicdiff.js's PHASE X grades all four fields on both engines.
      *
      * `sval` (pcjsvax-b8a) is the C's OWN `val` at this point -- shifted into its lane by
      * `val = val << sc` and NOT merged with the register's current contents.  Only ONE branch of
@@ -273,12 +290,20 @@ export default class CQBICVAX {
      * @param {number} val the MERGED longword (the C's `nval`)
      * @param {number} [sval] the SHIFTED, unmerged written value (the C's `val`); defaults to `val`,
      *   which is exactly what the C's longword path leaves it as
-     * @returns {boolean} true for a handled write (cased and applied); false ONLY for MEAR/SEAR,
-     *   which must genuinely fault -- never returned for "not cased" (see readReg()'s doc comment;
-     *   the trailing default below returns true, a silent accept, matching cqbic_wr()'s own
-     *   default-less switch).
+     * @param {number} [addr] the absolute physical address of the write -- the C's `pa`, needed
+     *   ONLY by the MEAR/SEAR case, which passes it to cq_merr().  Defaults to this register's own
+     *   aligned address so a caller that has only `rg` still latches a correct MEAR: cq_merr()
+     *   records `(pa >> 9) & 0x1FFF`, the 512-byte PAGE, and the whole 20-byte CQBIC register block
+     *   lies inside one page, so every address that can reach this switch yields the same value.
+     *   Threaded through anyway (cmctl.js's writeReg() sets the precedent) rather than left to that
+     *   coincidence, so widening the block later cannot silently make the latch wrong.
+     * @returns {boolean|Symbol} true for a handled write (cased and applied); regblock.js's
+     *   REG_MCHK ONLY for MEAR/SEAR, which must genuinely fault, with DSER/MEAR already latched
+     *   here and no SSC bus-timeout bits.  Never `false`, and never REG_MCHK for "not cased" (see
+     *   readReg()'s doc comment; the trailing default below returns true, a silent accept, matching
+     *   cqbic_wr()'s own default-less switch).
      */
-    writeReg(rg, val, sval = val)
+    writeReg(rg, val, sval = val, addr = (CQBIC_BASE + (rg << 2)) >>> 0)
     {
         switch (rg) {
         case REG_SCR:
@@ -293,7 +318,13 @@ export default class CQBICVAX {
             return true;
         case REG_MEAR:
         case REG_SEAR:
-            return false;                        // vax_io.c: cq_merr() + MACH_CHECK -- a REAL bus error, not a fallthrough
+            /* vax_io.c:519-520, in order: cq_merr(pa) latches DSER<MNX> (and DSER<LST> if an
+               unresolved error was already there), then MACH_CHECK(MCHK_WRITE).  exc.cqMerr() is
+               the SAME method cpustate.js's onBusFault() calls for the Qbus paths -- one model of
+               the register pair, as the file header requires -- and REG_MCHK is what tells
+               regblock.js to raise the check without the bus-timeout bits. */
+            this.exc.cqMerr(addr >>> 0);
+            return REG_MCHK;
         case REG_MBR:
             this.mbr = (val & CQMBR_MASK) | 0;
             return true;
@@ -335,11 +366,15 @@ export default class CQBICVAX {
      * measurement that overturned it.  The AND-NOT is left as it was -- fixing DSER's register
      * semantics is not pcjsvax-b8a's fence -- but the SME branch beside it reads `sval`, which IS
      * the quantity the C reads.  MEAR/SEAR (read-only, a bus error to write at all) never reach
-     * writeReg() successfully either way, so neither value matters there.
+     * writeReg()'s applying branches either way, so neither value matters there -- but the ADDRESS
+     * does, and all three pass it, because cq_merr() latches the page of `pa` (pcjsvax-69a).
      *
      * @this {CQBICVAX}
      */
-    writeLong(addr, val) { return this.writeReg(((addr >>> 0) - CQBIC_BASE) >>> 2, val | 0); }
+    writeLong(addr, val)
+    {
+        return this.writeReg(((addr >>> 0) - CQBIC_BASE) >>> 2, val | 0, val | 0, addr >>> 0);
+    }
 
     writeWord(addr, val)
     {
@@ -348,7 +383,7 @@ export default class CQBICVAX {
         if (cur === null) return false;
         let sc = (addr & 2) ? 16 : 0;
         let merged = ((val & 0xFFFF) << sc) | (cur & ~(0xFFFF << sc));
-        return this.writeReg(rg, merged | 0, ((val & 0xFFFF) << sc) | 0);
+        return this.writeReg(rg, merged | 0, ((val & 0xFFFF) << sc) | 0, addr >>> 0);
     }
 
     writeByte(addr, val)
@@ -358,7 +393,7 @@ export default class CQBICVAX {
         if (cur === null) return false;
         let sc = (addr & 3) << 3;
         let merged = ((val & 0xFF) << sc) | (cur & ~(0xFF << sc));
-        return this.writeReg(rg, merged | 0, ((val & 0xFF) << sc) | 0);
+        return this.writeReg(rg, merged | 0, ((val & 0xFF) << sc) | 0, addr >>> 0);
     }
 
     /* ------------------------------------------------------------------------------------- *
@@ -904,4 +939,4 @@ export class CQMAPVAX {
 
 export { CQSCR_POK, CQSCR_MASK, CQDSER_MASK, CQDSER_SME, CQMEAR_MASK, CQSEAR_MASK, CQMBR_MASK,
          CQMAP_BASE, CQMAPSIZE, CQMAP_VLD, CQMAP_PAG, QBMAMASK, VA_M_OFF,
-         CQBIC_BASE, REG_SCR, REG_DSER, REG_MEAR, REG_SEAR, REG_MBR };
+         CQBIC_BASE, CQBIC_SIZE, REG_SCR, REG_DSER, REG_MEAR, REG_SEAR, REG_MBR };
