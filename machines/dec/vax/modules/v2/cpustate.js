@@ -542,7 +542,18 @@ export default class CPUStateVAX extends Component {
         let a = addr >>> 0;
         let fWrite = (access & VAX.ACCESS.WRITE) !== 0;
         if (VAX.isQbusAddr(a)) {
-            this.exc.cqMerr(a);
+            /*
+             * `fNoBto` means something narrower in QBUS space than it does below, and pcjsvax-5c1
+             * is what made the distinction real: a DECODED Qbus device raised this check ITSELF
+             * and has ALREADY latched its own error register.  cqbic.js's CQMVAX is the first such
+             * caller -- mapAddr() latches cqSerr() or cqMerr() on every failure path before it
+             * returns false -- so latching cqMerr() a second time here would find DSER already set
+             * and record a LOST ERROR that never happened.  MEASURED: 24,576 of the ROM's 24,578
+             * self-test-80 references take that path, so it is the common case rather than a
+             * corner.  There is no bus-timeout bit to suppress in Qbus space either way -- that is
+             * the branch below -- which is why one flag carries both meanings unambiguously.
+             */
+            if (!fNoBto) this.exc.cqMerr(a);
             if (fWrite) {
                 this.exc.memErr = 1;      // deferred -- no synchronous exception; PC just advances
                 return;

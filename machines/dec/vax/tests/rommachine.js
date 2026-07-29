@@ -31,7 +31,7 @@ import { VAX } from "../modules/v2/defines.js";
 import CPUStateVAX from "../modules/v2/cpustate.js";
 import SSCVAX from "../modules/v2/ssc.js";
 import NVRVAX from "../modules/v2/nvr.js";
-import CQBICVAX from "../modules/v2/cqbic.js";
+import CQBICVAX, { CQMAPVAX, CQMVAX, CQMAP_BASE, CQMAPSIZE } from "../modules/v2/cqbic.js";
 import KA655VAX from "../modules/v2/ka655.js";
 import CMCTLVAX, { CMCTL_BASE, CMCTL_LENGTH } from "../modules/v2/cmctl.js";
 import CQIPCVAX, { DBLVAX, CQIPC_BASE, CQIPC_SIZE, DBL_BASE, DBL_SIZE } from "../modules/v2/cqipc.js";
@@ -96,7 +96,11 @@ function makeRomMachine(romBytes, fOmitCdg = false)
        the live oracle).  Two instances would leave the ROM reading a CACR that never saw the CDG
        traffic. */
     let ka655 = new KA655VAX();
-    let cqbic = new CQBICVAX(cpu.exc);
+    /* `bus` and MEMSIZE are REQUIRED for the map window and the Qbus memory window (pcjsvax-5c1):
+       without them cqbic.js's requireBus() throws on every map access, and memSize 0 makes isMem()
+       false for every address.  This machine passed one argument until pcjsvax-ee7 measured that
+       the ROM's self-test 80 programs all 8,192 map entries and then walks CQMBASE. */
+    let cqbic = new CQBICVAX(cpu.exc, bus, MEMSIZE);
     /* CMCTLVAX (pcjsvax-622) is the memory controller's register file.  It takes MEMSIZE because
        SIMH's cmctl_rd()/cmctl_wr() read `MEMSIZE` in two places -- register 18's KA655X test and
        the signature request's ADDR_IS_MEM() -- and MEMSIZE is `cpu_unit.capac`, i.e. exactly the
@@ -116,8 +120,16 @@ function makeRomMachine(romBytes, fOmitCdg = false)
         {base: VAX.PHYSMEM.REG_BASE >>> 0, length: 0x14, dev: cqbic},
         {base: CMCTL_BASE, length: CMCTL_LENGTH, dev: cmctl},
         {base: (VAX.PHYSMEM.REG_BASE + 0x4000) >>> 0, length: 8, dev: ka655},
-        {base: CQIPC_BASE, length: CQIPC_SIZE, dev: cqipc}
+        {base: CQIPC_BASE, length: CQIPC_SIZE, dev: cqipc},
+        /* CQMAP (pcjsvax-ee7/aa5).  regblock.js's header always listed it as one of the five
+           regtable[] sub-devices; this machine simply never mounted it, so every ROM access to
+           CQMAPBASE faulted.  The ROM's self-test 80 writes all 8,192 entries. */
+        {base: CQMAP_BASE, length: CQMAPSIZE, dev: new CQMAPVAX(cqbic)}
     ]);
+    /* The Qbus MEMORY window at CQMBASE (pcjsvax-5c1), which self-test 80 walks once the map is
+       programmed.  Decoded with regblock.js's dispatcher for the same reason addIoPage() reuses it:
+       anything the device declines falls through to the identical unbacked path it took before. */
+    bus.addCqm([{base: VAX.PHYSMEM.CQM_BASE >>> 0, length: VAX.PHYSMEM.CQM_LENGTH, dev: new CQMVAX(cqbic)}]);
     /* The Qbus I/O page, decoded for the FIRST time in this tree, and for exactly DBL_SIZE bytes.
        Everything else in the range keeps faulting through the identical path it took before -- see
        bus.js's addIoPage() and cqipc.js's SCOPE section. */

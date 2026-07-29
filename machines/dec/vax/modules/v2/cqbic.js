@@ -98,6 +98,9 @@
  */
 
 import { VAX } from "./defines.js";
+/* CQMVAX returns REG_MCHK for a reference it cannot translate -- see that class's header for why
+   it must NOT return null.  regblock.js imports only defines.js, so this is not a cycle. */
+import { REG_MCHK } from "./regblock.js";
 
 const CQBIC_BASE = VAX.PHYSMEM.REG_BASE >>> 0;    // vaxmod_defs.h:195, CQBICBASE == REGBASE
 
@@ -137,6 +140,9 @@ const CQMAPAMASK   = (CQMAPSIZE - 1);
 const CQMAP_BASE   = (VAX.PHYSMEM.REG_BASE + 0x8000) >>> 0;
 const CQMAP_VLD    = (0x80000000 | 0);            // map entry valid
 const CQMAP_PAG    = 0x000FFFFF;                  // map entry memory page
+/* CQMAMASK (vaxmod_defs.h:227) -- the Qbus address within the 4 MB CQM window.  Taken from
+   VAX.PHYSMEM.CQM_LENGTH rather than restated, so the mask and the decoded span cannot drift. */
+const CQMAMASK     = (VAX.PHYSMEM.CQM_LENGTH - 1) >>> 0;
 const QBMAWIDTH    = 22;
 const QBMAMASK     = ((1 << QBMAWIDTH) - 1);      // 0x3FFFFF -- the CQBIC's bus address is 22 bits
 const VA_V_VPN     = 9;
@@ -731,6 +737,120 @@ export default class CQBICVAX {
             this.exc.memErr = 1;
         }
         return true;
+    }
+}
+
+/**
+ * @class CQMVAX
+ *
+ * cqm_rd()/cqm_wr() (vax_io.c:617-664) -- the CPU-side Qbus MEMORY window at CQMBASE, 4 MB of Qbus
+ * address space the CVAX reaches through the SAME scatter-gather map the DMA path walks.
+ * pcjsvax-5c1; the ROM's self-test 80 is its first caller (pcjsvax-aa5).
+ *
+ * ONE TRANSLATION CORE, now THREE CALLERS: this class calls the SAME mapAddr() the DMA routines and
+ * the map-register window use, so a map programmed through CQMAPVAX is the map this window reads.
+ * Nothing here re-derives a translation.
+ *
+ * ERROR REPORTING IS ALREADY DONE BY mapAddr(), and that is why this class returns REG_MCHK rather
+ * than null.  mapAddr() latches cqSerr() or exc.cqMerr() itself on every failure path (see its
+ * body), so letting the access fall through to the generic unbacked-Qbus handler in cpustate.js --
+ * which latches cqMerr() again -- would set the LOST-ERROR bit on what is actually a first error.
+ * REG_MCHK routes to onBusFault() with `fNoBto`, which skips that second latch.  MEASURED over a
+ * 6,000,000-instruction ROM walk: 24,576 of the ROM's 24,578 CQM references take the master-NXM
+ * path, so the double latch would be pervasive rather than a corner case.
+ *
+ * READS AND WRITES ARE NOT SYMMETRIC, exactly as in the C.  A read that cannot be translated
+ * MACH_CHECKs; a write that cannot be translated sets the DEFERRED mem_err and returns NORMALLY, so
+ * the store is discarded and the instruction completes -- the same asymmetry cpustate.js's
+ * onBusFault() already documents for unbacked Qbus space.
+ *
+ * QVSS (ADDR_IS_QVM) is deliberately absent: it is gated on `vc_buf` in the C and no QVSS video
+ * buffer exists in this machine, so that branch is unreachable here rather than unimplemented.
+ */
+export class CQMVAX {
+    /**
+     * @param {CQBICVAX} cqbic
+     */
+    constructor(cqbic)
+    {
+        this.cqbic = cqbic;
+    }
+
+    /**
+     * read(addr, lnt) -- cqm_rd().  Qbus memory is 16 bits wide: the C returns a WORD, right
+     * justified, and lets its caller take the byte it wants.  `(pa & 2)` selects which half of the
+     * backing longword, which is why that shift comes from the QBUS address and not from `ma`.
+     *
+     * @this {CQMVAX}
+     * @param {number} addr
+     * @param {number} lnt 1 or 2
+     * @returns {number|Symbol} the value, or REG_MCHK
+     */
+    read(addr, lnt)
+    {
+        let c = this.cqbic;
+        c.requireBus();
+        let pa = addr >>> 0;
+        let qa = (pa & CQMAMASK) >>> 0;
+        if (!c.mapAddr(qa)) return REG_MCHK;                  /* mapAddr() already latched the error */
+        let w = (c.bus.getLong(c.mapMA & ~3) >>> ((pa & 2) ? 16 : 0)) & 0xFFFF;
+        return (lnt === 1) ? ((w >>> ((pa & 1) ? 8 : 0)) & 0xFF) : w;
+    }
+
+    /**
+     * write(addr, val, lnt) -- cqm_wr().  The C takes its shift from `ma`, NOT from `pa`, on both
+     * the word and the byte path; that is the C's own asymmetry with cqm_rd() and is preserved.
+     * A failed translation is a deferred mem_err and NOT an exception.
+     *
+     * @this {CQMVAX}
+     * @param {number} addr
+     * @param {number} val
+     * @param {number} lnt 1 or 2
+     * @returns {boolean} always true -- a Qbus memory write never faults synchronously
+     */
+    write(addr, val, lnt)
+    {
+        let c = this.cqbic;
+        c.requireBus();
+        let qa = ((addr >>> 0) & CQMAMASK) >>> 0;
+        if (!c.mapAddr(qa)) { c.exc.memErr = 1; return true; }
+        let ma = c.mapMA >>> 0;
+        let sc = (lnt === 1) ? ((ma & 3) << 3) : ((ma & 2) << 3);
+        let mask = (lnt === 1) ? 0xFF : 0xFFFF;
+        let t = c.bus.getLong(ma & ~3);
+        c.bus.setLong(ma & ~3, ((t & ~(mask << sc)) | ((val & mask) << sc)) | 0);
+        return true;
+    }
+
+    /*
+     * regblock.js's sub-device contract.
+     *
+     * A LONGWORD reference IS legal and is TWO Qbus cycles, not one: ReadIO() (vax_io.c:262) does
+     * `(ReadQb(pa + 2) << 16) | ReadQb(pa)`, and WriteIO() the same in reverse.  Splitting it here
+     * rather than reading one backing longword is not pedantry -- the two halves are translated
+     * SEPARATELY, so a longword at offset 0x1FE of a 512-byte Qbus page takes its high half from
+     * the NEXT map entry, which may point at an entirely different physical page or fail to
+     * translate on its own.  An earlier revision of this class returned REG_MCHK for the longword
+     * case on the theory that a 16-bit bus cannot do it; that was wrong, and the ROM's self-test 80
+     * is what showed it.
+     */
+    readByte(addr) { return this.read(addr, 1); }
+    readWord(addr) { return this.read(addr, 2); }
+    readLong(addr)
+    {
+        let lo = this.read(addr, 2);
+        if (lo === REG_MCHK) return REG_MCHK;
+        let hi = this.read((addr + 2) >>> 0, 2);
+        if (hi === REG_MCHK) return REG_MCHK;
+        return (((hi & 0xFFFF) << 16) | (lo & 0xFFFF)) | 0;
+    }
+    writeByte(addr, val) { return this.write(addr, val, 1); }
+    writeWord(addr, val) { return this.write(addr, val, 2); }
+    writeLong(addr, val)
+    {
+        this.write(addr, val & 0xFFFF, 2);
+        this.write((addr + 2) >>> 0, (val >>> 16) & 0xFFFF, 2);
+        return true;                                     /* neither half faults synchronously */
     }
 }
 

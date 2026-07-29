@@ -84,10 +84,23 @@ export function makeRegController(devices)
         return dflt;
     }
 
-    return {
-        getControllerBuffer(addr) { return [null, 0]; },
-        getControllerAccess() {
-            return [
+    /*
+     * BUILT ONCE PER CONTROLLER AND SHARED BY EVERY BLOCK, not rebuilt per block.
+     *
+     * HANDOFF.md standing rule 14, and this file came within one item of repeating the failure that
+     * earned it.  getControllerAccess() used to allocate a fresh six-closure array on every call --
+     * i.e. once per bus block -- which is precisely the shape that took cdgdiff.js to 8.6 GB RSS
+     * and OOM-killed the orchestrator and every sibling agent: "the test built a fresh machine per
+     * case, and each construction registered a span whose controller handed back a newly-allocated
+     * access table PER BLOCK."  It stayed cheap here only because addRegBlock() spans 64 blocks and
+     * addIoPage() exactly one.  pcjsvax-5c1's addCqm() spans 512, and tests/timerdiff.js -- which
+     * builds a machine per case -- was OOM-KILLED (rc=137) on the first gate run after it landed.
+     *
+     * Sharing is safe because none of this is per-block state: each function is invoked as a METHOD
+     * on its own MemoryVAX, so `this` still binds to the right block at call time, and the only
+     * values closed over (`entries`, `find`, `mchk`) belong to the controller, not to a block.
+     */
+    const access = [
                 function readByte(off, addr) {
                     addr = addr >>> 0;
                     let dev = find(addr);
@@ -148,7 +161,10 @@ export function makeRegController(devices)
                     }
                     this.writeNone(off, l, addr);
                 }
-            ];
-        }
+    ];
+
+    return {
+        getControllerBuffer(addr) { return [null, 0]; },
+        getControllerAccess() { return access; }
     };
 }

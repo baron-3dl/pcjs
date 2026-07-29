@@ -181,10 +181,38 @@ function runSimh(bin, script, outPath)
 
 const MEMSIZE = 0x01000000;             // 16MB, the SIMH microvax3900 default
 
+/**
+ * How much RAM each machine actually BACKS, as opposed to MEMSIZE, which is the architectural
+ * size this machine reports.  HANDOFF.md standing rule 14: a differential must bound its own
+ * memory, and this file did not.
+ *
+ * MEASURED: it was OOM-KILLED (rc=137) at 2.19 GB RSS -- and note that capping V8's heap does not
+ * help, because the cost is the per-machine RAM ArrayBuffer, which is EXTERNAL memory that
+ * --max-old-space-size does not govern.  This file builds a fresh machine per case across every
+ * phase, so 16 MB apiece over ~130 machines is ~2 GB, and it survived only as long as the host had
+ * that much to spare.  The highest address any case here touches is R_KSP (0x00110000), so 15/16 of
+ * every allocation was never referenced.
+ *
+ * 2 MB keeps ~8x headroom over R_KSP and cuts the peak by a factor of eight.  It is safe against
+ * the ORACLE, which runs `set cpu 16m`, only because no case reaches above it -- a reference past
+ * our backing store would bus-fault here and succeed there.  That is exactly why the bound below
+ * is ASSERTED rather than assumed: RAM_GUARD fails the run if any case ever deposits higher,
+ * instead of letting a future case diverge silently.
+ */
+const RAM_SIZE = 0x00200000;
+
+function ramGuard(addr, what)
+{
+    if ((addr >>> 0) >= RAM_SIZE) {
+        throw new Error(`timerdiff: ${what} at 0x${(addr >>> 0).toString(16)} is above RAM_SIZE ` +
+            `(0x${RAM_SIZE.toString(16)}).  The oracle runs 16m and would service it; this machine ` +
+            `would bus-fault.  Raise RAM_SIZE (and re-check the memory bound it exists to keep).`);
+    }
+}
 function makeMachine()
 {
     let bus = new BusVAX({busWidth: VAX.PAWIDTH, id: "bus"}, null, null);
-    bus.addMemory(0, MEMSIZE, MemoryVAX.TYPE.RAM);
+    bus.addMemory(0, RAM_SIZE, MemoryVAX.TYPE.RAM);
     let cpu = new CPUStateVAX({id: "cpu"});
     cpu.setBus(bus);
     cpu.reset();
@@ -233,6 +261,12 @@ const R_SCBB    = 0x00100000;
 const R_HANDLER = 0x00102000;           // SCB.INTTIM points here: a page of NOPs
 const R_CODE    = 0x00104000;           // non-ROM test code
 const R_KSP     = 0x00110000;
+
+/* RAM_SIZE's bound is asserted, not assumed -- see its comment.  Placed here because these are the
+   layout constants it governs; a future constant added above RAM_SIZE fails the run at load. */
+for (const [n, a] of [["R_SCBB", R_SCBB], ["R_HANDLER", R_HANDLER], ["R_CODE", R_CODE], ["R_KSP", R_KSP]]) {
+    ramGuard(a, `layout constant ${n}`);
+}
 
 const ROM_TEST_OFF = 0x1000;            // arbitrary, well clear of ROM_BASE/+4 (the magic byte)
 const ROM_BASE_CONST = VAX.PHYSMEM.ROM_BASE >>> 0;

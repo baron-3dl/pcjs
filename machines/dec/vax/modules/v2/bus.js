@@ -461,6 +461,32 @@ export default class BusVAX extends Component {
     }
 
     /**
+     * addCqm(devices)
+     *
+     * pcjsvax-5c1: decodes the CQBIC's Qbus MEMORY window at CQM_BASE (vaxmod_defs.h:228, 4 MB),
+     * which vax_io.c's cqm_rd()/cqm_wr() serve by walking the scatter-gather map.  Reuses
+     * regblock.js's makeRegController() for the same reason addIoPage() does: whatever the device
+     * declines falls through, address by address, to exactly the unbacked behaviour this range had
+     * before -- CPUStateVAX.onBusFault()'s Qbus branch.
+     *
+     * CQM_BASE STAYS IN BusVAX.RESERVED, deliberately, and for the same reason addIoPage()'s doc
+     * comment gives: tests/cqmerrdiff.js derives its probe pool from BusVAX.RESERVED and CQM is one
+     * of its two subjects, so dropping the entry would delete that file's own subject and leave a
+     * green gate measuring less than it used to (HANDOFF.md standing rule 13).  The range is now
+     * partially decoded, exactly as SSC_BASE and the I/O page already are.
+     *
+     * COST: CQM_LENGTH / BLOCK_SIZE = 512 MemoryVAX blocks -- between addRegBlock()'s 64 and
+     * addCdg()'s 8192.  Worth stating: standing rule 14 was earned by a range like this one.
+     *
+     * @this {BusVAX}
+     * @param {Array<{base: number, length: number, dev: Object}>} devices
+     */
+    addCqm(devices)
+    {
+        this.addMemory(VAX.PHYSMEM.CQM_BASE >>> 0, VAX.PHYSMEM.CQM_LENGTH, MemoryVAX.TYPE.CONTROLLER, makeRegController(devices));
+    }
+
+    /**
      * addIoPage(devices)
      *
      * pcjsvax-b8a: decodes VAX.PHYSMEM.IOPAGE_BASE -- the KA655's Qbus I/O page -- for however many

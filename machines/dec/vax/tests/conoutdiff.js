@@ -182,12 +182,26 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
         200,000 / 249,743 / 260,000 / 280,000 ->     0 bytes  (romdiff's ceiling reaches nothing)
                                     300,000  ->     2 bytes
                                   1,200,000  ->     5 bytes
-                                  3,000,000  ->   395 bytes  <- the OLD default, mid-countdown
-        6,000,000 / 12,000,000 / 20,000,000  -> 1,407 bytes  <- settled, and reaches ">>>"
+                                  3,000,000  ->   395 bytes  <- the ORIGINAL default, mid-countdown
+                                  6,000,000  -> 1,407 bytes  <- settled AT THE TIME; see below
 
-    First console byte at instruction #281,966; the 4th complete line at #2,423,939.  ~1.2s at this
-    budget, ~3.6s including the settle walk. */
-const JS_STEPS_DEFAULT = 6000000;
+    RAISED AGAIN 2026-07-29 by pcjsvax-5c1, and PHASE S is what forced it rather than a guess.  That
+    item decoded the CQBIC's Qbus memory window, which removed the ROM's `?80` self-test failure --
+    so the ROM stopped bailing out early, ran its countdown to completion, and the stream moved
+    again.  PHASE S failed the gate the same day with "6,000,000 produce 487 byte(s) but 12,000,000
+    produce 546", which is precisely the job it was written to do: the budget is not allowed to go
+    stale silently a second time.  Re-measured on the same tree:
+
+                                  3,000,000  ->   395 bytes
+                                  6,000,000  ->   487 bytes  <- NO LONGER SETTLED
+                     12,000,000 / 20,000,000 ->   546 bytes  <- settled; runs 40..03 and reaches ">>>"
+
+    (The stream is SHORTER than the old 1,407 bytes because three self-test failure dumps -- ?51,
+    ?46 and ?80 -- are gone.  A smaller number here is progress, which is exactly why this file
+    grades content and structure rather than a byte count; see HANDOFF.md section 3.)
+
+    First console byte at instruction #281,966.  ~2.4s at this budget, ~10s including PHASE S. */
+const JS_STEPS_DEFAULT = 12000000;
 
 /** PHASE S walks this multiple of whatever budget is in force, on a machine built from scratch.
     Expressed as a MULTIPLE rather than as a second absolute constant on purpose: a --js-steps
