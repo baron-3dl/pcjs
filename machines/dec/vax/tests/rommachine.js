@@ -45,7 +45,7 @@ import { SCB } from "../modules/v2/exc.js";
 const MEMSIZE = 0x01000000;
 
 /**
- * makeRomMachine(romBytes, fOmitCdg)
+ * makeRomMachine(romBytes, fOmitCdg, fOmitCqm)
  *
  * RAM at 0 (the KA655's own system memory, which the ROM's power-up self-tests size and probe --
  * without it the very first instructions would fault on RAM before ever reaching the ROM's own
@@ -60,12 +60,19 @@ const MEMSIZE = 0x01000000;
  * the walk to stop at it and name it.  A floor that reached into the walk rule itself would grade
  * nothing.
  *
+ * `fOmitCqm` (pcjsvax-aa5) leaves the CQBIC scatter/gather map at CQMAPBASE and the Qbus memory
+ * window at CQMBASE UNDECODED -- the exact state this machine was in before pcjsvax-5c1, and the
+ * state MEASURED 2026-07-29 to put `?80` back into the ROM's console stream.  It exists for the
+ * same reason `fOmitCdg` does: so a gate can hand the ROM a REAL missing decode and require an
+ * instrument to notice.  conoutdiff.js's `cqm-window-undecoded` mutation is its only caller.
+ *
  * @param {Uint8Array} romBytes
  * @param {boolean} [fOmitCdg]
+ * @param {boolean} [fOmitCqm]
  * @returns {Object} {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, cqipc, dbl, cmctl, ka655, cdg,
- *   devices}
+ *   cqmap, cqm, devices}
  */
-function makeRomMachine(romBytes, fOmitCdg = false)
+function makeRomMachine(romBytes, fOmitCdg = false, fOmitCqm = false)
 {
     let bus = new BusVAX({busWidth: VAX.PAWIDTH, id: "bus"}, null, null);
     bus.addMemory(0, MEMSIZE, MemoryVAX.TYPE.RAM);
@@ -116,20 +123,34 @@ function makeRomMachine(romBytes, fOmitCdg = false)
        side effect on cq_ipc that lives outside cqipc.js. */
     let cqipc = new CQIPCVAX();
     cqbic.setIpc(cqipc);
-    bus.addRegBlock([
+    /* CQMAP (pcjsvax-ee7/aa5) and the Qbus MEMORY window at CQMBASE (pcjsvax-5c1).  regblock.js's
+       header always listed CQMAP as one of the five regtable[] sub-devices; this machine simply
+       never mounted it, so every ROM access to CQMAPBASE faulted and self-test 80 reported `?80`.
+       The ROM programs all 8,192 map entries and then walks CQMBASE.
+
+       Both are held in NAMED LOCALS rather than constructed inline in the mount lists, so that the
+       `devices` roster below can carry them: they were the two devices the ROM drives hardest
+       (57,536 calls over a 12,000,000-instruction walk, MEASURED 2026-07-29) and the ONLY two the
+       roster omitted, which made a census structurally unable to see the decode whose absence
+       produces `?80`. */
+    let cqmap = null, cqm = null;
+    let regBlocks = [
         {base: VAX.PHYSMEM.REG_BASE >>> 0, length: 0x14, dev: cqbic},
         {base: CMCTL_BASE, length: CMCTL_LENGTH, dev: cmctl},
         {base: (VAX.PHYSMEM.REG_BASE + 0x4000) >>> 0, length: 8, dev: ka655},
-        {base: CQIPC_BASE, length: CQIPC_SIZE, dev: cqipc},
-        /* CQMAP (pcjsvax-ee7/aa5).  regblock.js's header always listed it as one of the five
-           regtable[] sub-devices; this machine simply never mounted it, so every ROM access to
-           CQMAPBASE faulted.  The ROM's self-test 80 writes all 8,192 entries. */
-        {base: CQMAP_BASE, length: CQMAPSIZE, dev: new CQMAPVAX(cqbic)}
-    ]);
-    /* The Qbus MEMORY window at CQMBASE (pcjsvax-5c1), which self-test 80 walks once the map is
-       programmed.  Decoded with regblock.js's dispatcher for the same reason addIoPage() reuses it:
-       anything the device declines falls through to the identical unbacked path it took before. */
-    bus.addCqm([{base: VAX.PHYSMEM.CQM_BASE >>> 0, length: VAX.PHYSMEM.CQM_LENGTH, dev: new CQMVAX(cqbic)}]);
+        {base: CQIPC_BASE, length: CQIPC_SIZE, dev: cqipc}
+    ];
+    if (!fOmitCqm) {
+        cqmap = new CQMAPVAX(cqbic);
+        regBlocks.push({base: CQMAP_BASE, length: CQMAPSIZE, dev: cqmap});
+    }
+    bus.addRegBlock(regBlocks);
+    /* Decoded with regblock.js's dispatcher for the same reason addIoPage() reuses it: anything the
+       device declines falls through to the identical unbacked path it took before. */
+    if (!fOmitCqm) {
+        cqm = new CQMVAX(cqbic);
+        bus.addCqm([{base: VAX.PHYSMEM.CQM_BASE >>> 0, length: VAX.PHYSMEM.CQM_LENGTH, dev: cqm}]);
+    }
     /* The Qbus I/O page, decoded for the FIRST time in this tree, and for exactly DBL_SIZE bytes.
        Everything else in the range keeps faulting through the identical path it took before -- see
        bus.js's addIoPage() and cqipc.js's SCOPE section. */
@@ -143,11 +164,20 @@ function makeRomMachine(romBytes, fOmitCdg = false)
     cpu.clk = clk;
     cpu.tmr = ssc;
     /* Derived from the constructions above, in this same function, so it can neither list a device
-       the machine does not have nor omit one it does (see the file header).  `cdg` is present only
-       when it was actually decoded, which is what makes `fOmitCdg` visible to a census. */
-    let devices = [consoleDev, clk, ssc, nvr, cqbic, cqipc, dbl, cmctl, ka655, cdg].filter((d) => d !== null)
+       the machine does not have nor omit one it does (see the file header).  `cdg`, `cqmap` and
+       `cqm` are present only when they were actually decoded, which is what makes `fOmitCdg` and
+       `fOmitCqm` visible to a census.
+
+       That claim was FALSE until pcjsvax-aa5: this roster omitted CQMAPVAX and CQMVAX even when the
+       machine had them, because both were constructed inline inside the mount lists.  A comment
+       claiming more than the code did is HANDOFF.md standing rule 12, and the consequence was
+       measurable -- deleting both mounts reintroduced `?80` and NOT ONE of cqmmapdiff, cqmerrdiff,
+       qdmadiff, romdiff or conoutdiff failed. */
+    let devices = [consoleDev, clk, ssc, nvr, cqbic, cqipc, dbl, cmctl, ka655, cdg, cqmap, cqm]
+        .filter((d) => d !== null)
         .map((d) => ({name: d.constructor.name, dev: d}));
-    return {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, cqipc, dbl, cmctl, ka655, cdg, devices};
+    return {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, cqipc, dbl, cmctl, ka655, cdg, cqmap, cqm,
+            devices};
 }
 
 export { makeRomMachine, MEMSIZE };
