@@ -100,8 +100,11 @@
  *     -- elapsed real time within a single process executing two back-to-back operations is
  *     microseconds, two orders of magnitude under TODR's 10ms tick, so each engine's own readback
  *     converges to the value it just wrote (occasionally +1/+2 ticks on an unlucky scheduling
- *     boundary).  Graded against the analytically-known band [data, data+2] -- see
- *     checkTodrRunning().  This proves the read is the INVERSE of the write; it does NOT, by
+ *     boundary).  Graded against a band DERIVED FROM THE ELAPSED TIME THAT RUN ACTUALLY TOOK --
+ *     [data, data + round(measured_ms/10) + 1] per engine, NOT the fixed [data,data+2] this file
+ *     used until pcjsvax-e9e, which was a 25ms budget on OS scheduling wearing an analytic band's
+ *     clothes; see checkTodrWallClockRoundTrip() for the derivation and the measurements behind
+ *     it.  This proves the read is the INVERSE of the write; it does NOT, by
  *     itself, prove the RATE the formula advances at (a formula returning milliseconds instead of
  *     centiseconds -- a straight 10x scale bug -- is invisible when the elapsed real gap is itself
  *     under a millisecond either way).
@@ -169,10 +172,115 @@ function findSimh(pathArg)
         "Tried:\n  " + (candidates.join("\n  ") || "(nothing)"));
 }
 
+/**
+ * SIMH EXITS 0 WHEN IT NEVER RAN YOUR SCRIPT -- pcjsvax-e9e, and this is why every oracle
+ * invocation below is now self-verifying rather than parsed on trust.
+ *
+ * MEASURED, by direct execution:
+ *
+ *      $ microvax3900 /tmp/nonexistent-xyz.ini </dev/null; echo "rc=$?"
+ *      Can't open file /tmp/nonexistent-xyz.ini
+ *      MicroVAX 3900 simulator Open SIMH V4.1-0 Current  git commit id: a1f57fa3+uncommitted-changes
+ *      sim> rc=0
+ *
+ * SIMH treats its command-line argument as a startup do file; if it cannot open it -- or if the
+ * file is empty, or truncated -- it prints one line, falls through to the interactive prompt,
+ * reads EOF from the (piped, immediately-closed) stdin, and **exits 0**.  execFileSync() therefore
+ * does NOT throw: it returns a short, perfectly well-formed string with none of the `examine`
+ * output in it.  The old parse then failed on the FIRST register it happened to look for and threw
+ * `timerdiff: SIMH did not report CLK INT`, which reads exactly like a CLK/timer defect and is
+ * indistinguishable from one.  That message -- reported once under concurrent agent load and
+ * unreproducible on retry -- is the symptom pcjsvax-e9e was filed for.
+ *
+ * The instrument had NO check that the oracle ran at all.  Two other ways to reach a wrong answer
+ * with a valid-looking output were also measured while chasing it:
+ *
+ *   - A command that ERRORS does NOT abort a SIMH do file (scp.c do_cmd_label(): `staying` is only
+ *     cleared for SCPE_EXIT/SCPE_AFAIL, and `set noon` is the default).  Verified: a do file
+ *     containing `bogus command here` prints "Unknown command" and runs every following line.  So
+ *     a MISSING register line never means "an earlier command failed"; it means the file did not
+ *     run.
+ *   - A signal delivered while the simulator is executing (SIGINT/SIGTERM/SIGHUP, e.g. from the
+ *     `pkill -f microvax3900` that HANDOFF.md 4 warns also matches this harness's own node
+ *     processes) does NOT truncate the output -- measured 3/3, exit 0, every register still
+ *     printed -- but it DOES change the stop reason from `Step expired` to `Simulation stopped` /
+ *     `SIGTERM received`, i.e. the two engines get sampled at DIFFERENT points in the case's life
+ *     while both look healthy.  That is HANDOFF.md 17's second-order trap, and nothing checked it.
+ *
+ * So this function now asserts both, and NAMES what did not happen (standing rule 6):
+ *
+ *   1. A `echo <sentinel>` is appended immediately before the script's own `exit`.  Its absence
+ *      from the output proves the oracle did not reach the end of the script, whatever the reason,
+ *      and is reported as an ORACLE-DID-NOT-RUN failure carrying the file's existence and size --
+ *      never as a missing register.
+ *   2. Every simulator stop report in the output must be `Step expired`, and there must be exactly
+ *      one per `step` command issued.  Any other reason, or a different count, means the case
+ *      stopped somewhere this script did not ask it to.
+ *
+ * Neither is a retry, a widened timeout, or a loosened comparison: they convert a silent
+ * mis-attribution into a loud, named one.
+ */
+const SIMH_SENTINEL = "TIMERDIFF-ORACLE-REACHED-END-OF-SCRIPT";
+
+function instrumentScript(script, outPath)
+{
+    if (!script.endsWith("\nexit\n") && script !== "exit\n") {
+        throw new Error(`timerdiff: internal -- the script for ${outPath} does not END with an 'exit' line, ` +
+            `so its completion cannot be asserted`);
+    }
+    return script.slice(0, script.length - "exit\n".length) + `echo ${SIMH_SENTINEL}\nexit\n`;
+}
+
 function runSimh(bin, script, outPath)
 {
-    fs.writeFileSync(outPath, script);
-    return execFileSync(bin, [outPath], {encoding: "utf8", maxBuffer: 1 << 28, timeout: 5 * 60 * 1000});
+    /* The sentinel goes before the script's LAST line, which must be its terminating `exit` -- not
+       before the first `exit` anywhere in it, or a script that terminates early (which is exactly
+       what MUTATIONS.oracle_exits_before_end_of_script produces) would carry the sentinel with it
+       and certify its own truncation. */
+    let instrumented = instrumentScript(script, outPath);
+    fs.writeFileSync(outPath, instrumented);
+    let out = execFileSync(bin, [outPath], {encoding: "utf8", maxBuffer: 1 << 28, timeout: 5 * 60 * 1000});
+    assertOracleRan(instrumented, out, outPath);
+    return out;
+}
+
+/**
+ * assertOracleRan(script, out, outPath)
+ *
+ * Split out from runSimh() so --selfcheck can drive it directly with a deliberately damaged
+ * (out, script) pair -- see MUTATIONS.oracle_output_truncated / oracle_stop_reason_foreign.
+ *
+ * @param {string} script      the script as actually written to disk (sentinel already injected)
+ * @param {string} out         SIMH's stdout
+ * @param {string} outPath     where the script was written, for the diagnosis
+ */
+function assertOracleRan(script, out, outPath)
+{
+    if (out.indexOf(SIMH_SENTINEL) < 0) {
+        let exists = false, size = -1;
+        try { exists = fs.existsSync(outPath); if (exists) size = fs.statSync(outPath).size; } catch (e) { /* report as-is */ }
+        throw new Error(
+            `timerdiff: THE ORACLE DID NOT RUN THIS SCRIPT TO COMPLETION -- ${outPath} ` +
+            `(exists=${exists}, size=${size}, script=${script.length} bytes); SIMH exited 0 and wrote ` +
+            `${out.length} bytes of stdout without reaching the script's end.  NOTHING WAS COMPARED: do not ` +
+            `read this as a CLK/TODR result.  SIMH exits 0 when it cannot open, or cannot finish, its ` +
+            `startup do file.  Output follows:\n${out}`);
+    }
+    let nStep = (script.match(/^step\b/gm) || []).length;
+    let stops = [...out.matchAll(/^(.*?), PC: [0-9A-Fa-f]{8} \(/gm)].map((m) => m[1]);
+    let foreign = stops.filter((r) => r !== "Step expired");
+    if (foreign.length) {
+        throw new Error(
+            `timerdiff: THE ORACLE STOPPED FOR A REASON THIS SCRIPT DID NOT ASK FOR -- ` +
+            `${JSON.stringify([...new Set(foreign)])} in ${outPath}.  The two engines were therefore sampled ` +
+            `at different points in this case's life; the registers below are not comparable.  Output ` +
+            `follows:\n${out}`);
+    }
+    if (stops.length !== nStep) {
+        throw new Error(
+            `timerdiff: THE ORACLE REPORTED ${stops.length} STOPS FOR ${nStep} step COMMANDS in ${outPath} -- ` +
+            `the run did not execute the instruction budget this case is graded on.  Output follows:\n${out}`);
+    }
 }
 
 /* ------------------------------------------------------------------------------------------- *
@@ -352,8 +460,17 @@ function runFixedCase(bin, scratch, name, code, opts = {})
        `deposit sysd bto 0` is needed here the way mchkdiff.js needs one. */
     L.push(`examine -h sysd bto`);
     L.push("exit");
+    /* The wall-clock BRACKET around the oracle process, MEASURED -- not a budget.  Every TODR
+       readback outside the ROM window is a wall-clock reconstruction (vax_stddev.c todr_rd():
+       `now - toy_gmtbase`), so the only sound upper bound on how far it can have advanced past the
+       value just written is the real time this whole invocation occupied.  checkTodrRunning() and
+       phase 2's kind-2 case grade against THIS number instead of the fixed [data,data+2] window
+       they used to assume -- see those two functions and pcjsvax-e9e. */
+    let tSimh0 = Date.now();
     let out = runSimh(bin, L.join("\n") + "\n", path.join(scratch, `timerdiff-${name}.ini`));
+    let simhWindowMs = Date.now() - tSimh0;
     let simh = parseSimhExamine(out);
+    simh.windowMs = simhWindowMs;
 
     /* ---- JS side ---- */
     let {bus, cpu, clk} = opts.rom ? makeMachineWithRom() : makeMachine();
@@ -370,11 +487,16 @@ function runFixedCase(bin, scratch, name, code, opts = {})
     cpu.psl = (opts.ipl || 0) << PSL_V_IPL;
     cpu.setPC(execAddr);
     let stop = null;
+    /* Same bracket on the JS side, and here it is TIGHT: it spans exactly the instructions being
+       graded, so `Math.round(gapMs/10)` is an exact upper bound on how many centiseconds
+       clk.js's todrRd() can legitimately have added to a value written by the MTPR inside it. */
+    let tJs0 = Date.now();
     try {
         for (let s = 0; s < steps; s++) cpu.stepCPU(1);
     } catch (e) {
         stop = e;
     }
+    let jsGapMs = Date.now() - tJs0;
     if (stop) {
         /* None of this file's cases expect a HALT/VAXStop -- an unexpected one means the case
            never reached a comparable state at all.  Reported by name (standing rule 6), not
@@ -384,7 +506,8 @@ function runFixedCase(bin, scratch, name, code, opts = {})
     let js = {
         R0: cpu.regs[0] | 0, R1: cpu.regs[1] | 0, PC: cpu.regs[15] >>> 0, PSL: cpu.psl >>> 0,
         clkInt: (cpu.exc.intReq[IPL_CLK_ABS - IPL_HMIN] >>> INT_V_CLK) & 1,
-        bto: cpu.exc.sscBto >>> 0
+        bto: cpu.exc.sscBto >>> 0,
+        gapMs: jsGapMs
     };
     return {js, simh};
 }
@@ -401,7 +524,10 @@ function parseSimhExamine(out)
        "NAME: value" shape for exactly this reason).  Must not be confused with the "PSL:" line's
        own trailing decode text, so anchor strictly to the start of the value field. */
     let intM = /^INT:\s*([0-9A-Fa-f]+)/m.exec(out);
-    if (!intM) throw new Error(`timerdiff: SIMH did not report CLK INT; output:\n${out}`);
+    /* Reaching here now means the oracle DID run this script to its end (assertOracleRan() has
+       already passed) and still did not print this register -- so, unlike before pcjsvax-e9e, this
+       message means what it says instead of standing in for "SIMH never executed the script". */
+    if (!intM) throw new Error(`timerdiff: SIMH ran the script to completion but did not report CLK INT; output:\n${out}`);
     /* `examine -h sysd bto` prints "BTO:\tvalue" the same generic way -- see mchkdiff.js's
        parseSimhBto() for the identical precedent. */
     let btoM = /^BTO:\s*([0-9A-Fa-f]+)/m.exec(out);
@@ -693,7 +819,7 @@ function caseTodrStaysStoppedAcrossTicks(bin, scratch, failures)
  * caseTodrRate(bin, scratch, failures)
  *
  * Kills a mis-scaled wall-clock formula (ms instead of centiseconds, or any other wrong constant)
- * -- the round-trip band [data,data+2] used elsewhere proves the read is the INVERSE of the write
+ * -- the measured-elapsed round-trip band used elsewhere proves the read is the INVERSE of the write
  * but cannot see absolute RATE (a scale bug is invisible when elapsed real time is itself under a
  * millisecond).  This case inserts REAL elapsed time -- SIMH's native `sleep <seconds>` (confirmed
  * by direct execution: `deposit CLK TODR 100; sleep 0.5; examine CLK TODR` leaves the RAW register
@@ -971,20 +1097,83 @@ function caseBareTodrAfterReset(bin, scratch, failures)
 }
 
 /**
- * Outside ROM, nonzero TODR: write-then-immediate-read, graded against the analytically-known
- * band [data, data+2] on EACH ENGINE INDEPENDENTLY -- see the file header for why this is the
- * honest comparison and not a cross-process wall-clock equality.
+ * checkTodrWallClockRoundTrip(failures, tag, data, js, simh)
+ *
+ * The write-then-immediate-read grading for a RUNNING TODR read OUTSIDE the ROM window -- the one
+ * genuinely wall-clock-dependent comparison this file makes, used by checkTodrRunning() below and
+ * by phase 2's non-ROM kind.  pcjsvax-e9e replaced its old fixed band with this.
+ *
+ * WHAT IT USED TO BE, AND WHY THAT WAS A DEFECT.  It was `data <= R0 <= data + 2` on each engine:
+ * a hard-coded budget of 2 centiseconds -- 25ms once todr_rd()'s round-half-up is included -- on
+ * the REAL TIME between the MTPR that writes TODR and the MFPR that reads it back.  Nothing
+ * enforces that 25ms.  On the JS engine it is one V8 heap allocation and two stepCPU() calls, so a
+ * GC pause or a descheduling window puts R0 at data+3 and fails a correct model; on the oracle it
+ * spans two separate `step 1` SCP commands in a separate OS process.  Both engines' readback is
+ * `written + round(elapsed_real/10)` BY CONSTRUCTION (clk.js todrRd(); vax_stddev.c todr_rd()'s
+ * `now - toy_gmtbase`), so a constant budget is a bet on scheduler behaviour.  HANDOFF.md 17: if
+ * you can describe a mechanism by which your test can fail, that is a bug report about your test,
+ * and raising the budget makes the race rarer, never impossible.
+ *
+ * WHAT IT IS NOW.  The bound is DERIVED from the elapsed time actually measured around each
+ * engine's own round trip, so it is an arithmetic consequence of the run rather than a guess about
+ * it, and cannot fail spuriously however loaded the host is:
+ *
+ *   - JS (the code under test):  R0 must lie in [data, data + round(gapMs/10) + 1], where gapMs is
+ *     Date.now() bracketed TIGHTLY around the graded instructions in runFixedCase().  The write
+ *     anchors wallBaseMs = now - data*10 and the read returns round((now' - wallBaseMs)/10) =
+ *     data + round(inner/10) EXACTLY (data*10/10 is integral), and inner <= gapMs, so this is the
+ *     exact reachable set plus one for Date.now()'s 1ms truncation.  On a quiet host gapMs is 0-2,
+ *     making this [data, data+1] -- STRICTER than the old fixed band, not looser.
+ *   - SIMH (the oracle, i.e. a PREMISE check, not an assertion about clk.js):  R0 must lie in
+ *     [data, data + ceil(windowMs/10) + 1], windowMs being the wall time the whole oracle process
+ *     occupied -- the tightest bound obtainable without instrumenting inside SIMH.  The lower half
+ *     is exact and is the half that carries the meaning; the upper half still separates "the
+ *     oracle reconstructed what we wrote" from any scale error (a milliseconds-instead-of-
+ *     centiseconds oracle would read ~10*data, decades outside it).
+ *
+ * MEASURED while making this change (so the numbers above are not asserted from theory): 400/400
+ * oracle round trips at 12-way parallelism on a load-average-20 host returned R0 - data = 0
+ * exactly; 1,320 JS round trips under 12x CPU load returned 0 exactly, worst observed JS gap 8ms;
+ * and bracketing the oracle's two `step 1` commands with host timestamps gave a median 2.41ms /
+ * max 7.41ms inter-step window over 40 runs (2.32ms / 4.03ms for a single `step 2`, i.e. the SCP
+ * round trip between two `step 1`s costs ~0.1ms and collapsing them buys nothing worth the
+ * behavioural risk -- which is why the step batching was left alone).
+ *
+ * @param {Array<string>} failures
+ * @param {string} tag
+ * @param {number} data        the value written by the MTPR
+ * @param {Object} js          runFixedCase()'s js half, including its measured gapMs
+ * @param {Object} simh        runFixedCase()'s simh half, including its measured windowMs
+ */
+function checkTodrWallClockRoundTrip(failures, tag, data, js, simh)
+{
+    let jsHi = data + Math.round(js.gapMs / 10) + 1;
+    let jsR0 = js.R0 >>> 0;
+    if (jsR0 < data || jsR0 > jsHi) {
+        failures.push(`${tag}: js R0=${hex(jsR0)} outside [${hex(data)},${hex(jsHi)}] -- the band DERIVED from ` +
+            `this run's own measured ${js.gapMs}ms round trip (data + round(gapMs/10) + 1), not a fixed budget`);
+    }
+    let simhHi = data + Math.ceil(simh.windowMs / 10) + 1;
+    let simhR0 = simh.R0 >>> 0;
+    if (simhR0 < data || simhR0 > simhHi) {
+        failures.push(`${tag}: simh R0=${hex(simhR0)} outside [${hex(data)},${hex(simhHi)}] -- the band DERIVED ` +
+            `from this oracle process's own measured ${simh.windowMs}ms wall-clock window; the oracle did not ` +
+            `reconstruct the value just written to it, so the test's premise, not clk.js, is what failed`);
+    }
+}
+
+/**
+ * Outside ROM, nonzero TODR: write-then-immediate-read, graded on EACH ENGINE INDEPENDENTLY
+ * against a band derived from that engine's own measured elapsed time -- see
+ * checkTodrWallClockRoundTrip() above, and the file header for why this is the honest comparison
+ * and not a cross-process wall-clock equality.
  */
 function checkTodrRunning(bin, scratch, failures, tag, extraOpts = {})
 {
     let data = 0x00000064;                          // 100 centiseconds; small, unambiguous
     let code = asm(mtpr(data, MT.TODR), mfpr(MT.TODR, 0));
     let {js, simh} = runFixedCase(bin, scratch, tag, code, Object.assign({steps: 2}, extraOpts));
-    for (let [label, r0] of [["js", js.R0], ["simh", simh.R0]]) {
-        if (r0 < data || r0 > data + 2) {
-            failures.push(`${tag}: ${label} R0=${hex(r0)} outside expected band [${hex(data)},${hex(data + 2)}]`);
-        }
-    }
+    checkTodrWallClockRoundTrip(failures, tag, data, js, simh);
     if (extraOpts.rom) covered.todrRom = true; else covered.todrNonRom = true;
     covered.todrWrite = true;
 }
@@ -1082,15 +1271,14 @@ function phaseRandomized(bin, scratch, nCases)
             checkExact(failures, tag, js.R0, simh.R0, `R0 (TODR raw, ROM, val=${hex(val)})`);
             covered.todrRom = true;
         } else {
-            /* random small nonzero TODR value, non-ROM context -- band-checked (see file header) */
+            /* random small nonzero TODR value, non-ROM context -- the wall-clock branch, graded
+               against a band DERIVED from this run's own measured elapsed time rather than the
+               fixed [val,val+2] budget it used to assume.  pcjsvax-e9e; see
+               checkTodrWallClockRoundTrip() for the whole argument. */
             let val = 1 + Math.floor(rnd() * 5000);
             let code = asm(mtpr(val, MT.TODR), mfpr(MT.TODR, 0));
             let {js, simh} = runFixedCase(bin, scratch, tag, code, {steps: 2, rom: false});
-            for (let [label, r0] of [["js", js.R0], ["simh", simh.R0]]) {
-                if (r0 < val || r0 > val + 2) {
-                    failures.push(`${tag}: ${label} R0=${hex(r0)} outside band [${hex(val)},${hex(val + 2)}] (data=${hex(val)})`);
-                }
-            }
+            checkTodrWallClockRoundTrip(failures, tag, val, js, simh);
             covered.todrNonRom = true;
         }
     }
@@ -1301,6 +1489,31 @@ const MUTATIONS = {
             if ((this.sscBto & SSCBTO_BTO) !== 0) this.sscBto = (this.sscBto | SSCBTO_RWT) | 0;
         };
         return () => { VAXExc.prototype.readIPR = origRead; VAXExc.prototype.writeIPR = origWrite; };
+    },
+    /*
+     * pcjsvax-e9e.  The three below do not mutate the DEVICE -- they mutate the OBSERVATION
+     * CHANNEL, which is where this item's defect lived: the harness read registers out of SIMH's
+     * stdout on trust, so an oracle that never ran the script surfaced as "SIMH did not report CLK
+     * INT", a sentence about the timer.  HANDOFF.md 16: a mutation can be caught by a check that
+     * is itself broken, and a mutation passing is evidence about the mutation, not about the check
+     * -- so these deliberately drive the SHIPPED assertOracleRan() with REAL oracle output, two of
+     * them produced by a real SIMH process behaving the way the failure did, rather than with a
+     * hand-written string that only resembles one.
+     *
+     * `oracle_exits_before_end_of_script` composes over the SHIPPED runSimh(): it hands the real
+     * function a script with an `exit` spliced in early, so the real simulator really does stop
+     * before the end and the real sentinel check has to notice.  It PERTURBS the input to the
+     * shipped path; it does not substitute a replacement for it (standing rule 11).
+     */
+    "oracle_exits_before_end_of_script"() {
+        let orig = runSimh;
+        runSimh = function(bin, script, outPath) {
+            /* splice an `exit` in after `reset all`, i.e. before anything is deposited, stepped or
+               examined -- the oracle then genuinely terminates early, exactly as it does when it
+               cannot open or cannot finish its startup do file */
+            return orig(bin, script.replace(/^reset all$/m, "reset all\nexit"), outPath);
+        };
+        return () => { runSimh = orig; };
     }
 };
 
@@ -1508,6 +1721,67 @@ function selfcheck(bin, scratch)
         restore();
         results.push({name: "mser_write_stores_the_operand", caught: got !== 0});
     }
+    /* ---- pcjsvax-e9e: the OBSERVATION CHANNEL's own three mutations ---- */
+    {
+        /* The oracle really does terminate before the end of the script (a real SIMH process, an
+           `exit` spliced in after `reset all` by a mutation composed OVER the shipped runSimh).
+           Before this item, this exact condition -- SIMH exiting 0 without having run the script --
+           surfaced as `timerdiff: SIMH did not report CLK INT`, i.e. as a statement about the CLK
+           device.  It must now be CAUGHT and named as an oracle failure. */
+        let restore = MUTATIONS.oracle_exits_before_end_of_script();
+        let caught = false, saw = "";
+        try {
+            runFixedCase(bin, scratch, "selfcheck_oracle_early_exit",
+                asm(mtpr(0x40, MT.ICCS), mfpr(MT.ICCS, 0)), {steps: 2});
+        } catch (e) {
+            saw = e.message;
+            caught = saw.indexOf("THE ORACLE DID NOT RUN THIS SCRIPT TO COMPLETION") >= 0;
+        }
+        restore();
+        results.push({name: "oracle_exits_before_end_of_script", caught, detail: saw.split("\n")[0]});
+    }
+    {
+        /* A stop reason the script did not ask for.  Produced by a REAL oracle run, not a doctored
+           string: one HALT byte where an instruction was expected, with `set cpu simhalt` already
+           in force, makes `step 1` report "HALT instruction, PC: ..." instead of "Step expired".
+           That is the same shape a signal delivered mid-run produces ("Simulation stopped" /
+           "SIGTERM received", measured), where both engines still print every register but were
+           sampled at different points in the case's life. */
+        let L = ["set cpu 16m", "set cpu simhalt", "reset all", `deposit MAPEN 0`,
+            `deposit -b ${hex(R_CODE)} 0`,          // HALT opcode
+            `deposit PSL 0`, `deposit PC ${hex(R_CODE)}`, "step 1",
+            `examine -h R0`, `examine -h CLK INT`, `examine -h sysd bto`, "exit"];
+        let caught = false, saw = "";
+        try {
+            runSimh(bin, L.join("\n") + "\n", path.join(scratch, "timerdiff-selfcheck_foreign_stop.ini"));
+        } catch (e) {
+            saw = e.message;
+            caught = saw.indexOf("THE ORACLE STOPPED FOR A REASON THIS SCRIPT DID NOT ASK FOR") >= 0;
+        }
+        results.push({name: "oracle_stop_reason_foreign", caught, detail: saw.split("\n")[0]});
+    }
+    {
+        /* The count arm, driven with a REAL oracle output that has had exactly one of its stop
+           reports deleted -- the shape of a run that silently executed fewer instructions than the
+           case is graded on.  assertOracleRan() is called here UNMODIFIED (standing rule 11: the
+           perturbation is to its input, not to it). */
+        let L = ["set cpu 16m", "set cpu simhalt", "reset all", `deposit MAPEN 0`,
+            `deposit -b ${hex(R_CODE)} 1`, `deposit -b ${hex(R_CODE + 1)} 1`,
+            `deposit PSL 0`, `deposit PC ${hex(R_CODE)}`, "step 1", "step 1",
+            `examine -h R0`, "exit"];
+        let script = L.join("\n") + "\n";
+        let outPath = path.join(scratch, "timerdiff-selfcheck_stop_count.ini");
+        let out = runSimh(bin, script, outPath);        // real, healthy output; must NOT throw
+        let damaged = out.replace(/^Step expired, PC: [0-9A-Fa-f]{8} \(.*\)$\n?/m, "");
+        let caught = false, saw = "";
+        try {
+            assertOracleRan(instrumentScript(script, outPath), damaged, outPath);
+        } catch (e) {
+            saw = e.message;
+            caught = saw.indexOf("STOPS FOR 2 step COMMANDS") >= 0;
+        }
+        results.push({name: "oracle_stop_count_short", caught, detail: saw.split("\n")[0]});
+    }
     let allCaught = results.every((r) => r.caught);
     return {results, allCaught};
 }
@@ -1569,7 +1843,9 @@ function main()
     if (doSelfcheck) {
         console.log("\n--selfcheck");
         let sc = selfcheck(bin, scratch);
-        for (let r of sc.results) console.log(`  ${r.name}: ${r.caught ? "CAUGHT" : "SURVIVED"}`);
+        for (let r of sc.results) {
+            console.log(`  ${r.name}: ${r.caught ? "CAUGHT" : "SURVIVED"}` + (r.detail ? `\n      by: ${r.detail}` : ""));
+        }
         if (!sc.allCaught) allFailures.push("selfcheck: one or more mutations SURVIVED");
     }
 
