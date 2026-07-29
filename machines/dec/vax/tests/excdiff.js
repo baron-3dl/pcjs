@@ -757,6 +757,35 @@ const IPR_POOL = (function() {
  * the mutation is now caught.  Ordering matters: the entries most likely to distinguish a defect
  * come first, because an undersized run only gets the head of the list.
  */
+/**
+ * startSimhProcess(m)
+ *
+ * Called at every BATCH boundary, because a batch IS a SIMH process: runBatch() spawns a new
+ * simulator, and this function puts the JS machine into the state that new process starts in.
+ *
+ * IT EXISTS BECAUSE OF A MEASURED ASYMMETRY, not as tidiness (pcjsvax-877).  The JS machine is
+ * built ONCE per phase and lives across every batch, while SIMH is rebuilt every BATCH cases.  For
+ * almost every IPR that difference is invisible: each case `reset all`s the simulator and then
+ * DEPOSITS every register and byte it cares about, so the case's starting state is fully
+ * re-established on both sides.  CADR and MSER are the exception -- they are the only IPRs in the
+ * randomized pool whose value survives BOTH.  MEASURED directly against this oracle: MTPR 0xFF to
+ * CADR, then `reset all`, then MFPR CADR still reads 0xFF, because sysd_reset() (vax_sysdev.c:1752)
+ * clears the timers and csi/cso and names neither register, and sysd_powerup() does not clear them
+ * either.  They go to zero only when the PROCESS is new, from the C static initialisers
+ * (vax_sysdev.c:235-236).
+ *
+ * So without this, a random MTPR that set CADR in one batch left the JS side carrying that value
+ * into the next batch while the fresh simulator started from 0 -- which is exactly the failure the
+ * first run of this change produced: `mfpr case 143: R7 js=000000FF simh=00000000`.  That was the
+ * harness's model of the oracle being wrong, not the model of CADR: exc.js is right NOT to clear
+ * them in reset(), and this is where "a fresh SIMH process starts here" belongs.
+ */
+function startSimhProcess(m)
+{
+    m.cpu.exc.cadr = 0;
+    m.cpu.exc.mser = 0;
+}
+
 const MTPR_EDGE = [
     [MT.SIRR, 0], [MT.SIRR, 16], [MT.SIRR, 1], [MT.SIRR, 15], [MT.SIRR, 7],
     [0x0F, 0x12345678], [0x28, 0x12345678], [0x3B, 1], [64, 0], [200, 0],
@@ -767,13 +796,24 @@ const MTPR_EDGE = [
     [MT.MAPEN, 0], [MT.MAPEN, 1], [MT.TBIA, 0], [MT.TBIS, R_CODE], [MT.TBCHK, R_CODE],
     [MT.SCBB, 0x00100003], [MT.PCBB, 0x00106002],
     [MT.P0BR, 0x80000003], [MT.P0LR, 0x00FFFFFF], [MT.SLR, 0x00FFFFFF], [MT.SBR, 0x00400002],
-    [MT.PME, 1], [MT.PME, 0], [MT.SID, 0], [MT.CONPC, 0], [MT.CONPSL, 0]
+    [MT.PME, 1], [MT.PME, 0], [MT.SID, 0], [MT.CONPC, 0], [MT.CONPSL, 0],
+    /* CADR/MSER (pcjsvax-877).  They entered IPR_POOL automatically when exc.js stopped deferring
+       them to the device model -- that pool is DERIVED as "every prn not in IPR_DEVICE" -- so the
+       randomized phase already reaches them.  These four values are the ones that distinguish a
+       correct CADR_RW/CADR_MBO from a store-it-and-hand-it-back stub, and three of them are the
+       exact values the ROM's own self-test 46 uses: 0xFC reads back 0xFC, 0x03 reads back 0x0F,
+       and 0x00 reads back 0x0C rather than 0.  A uniformly-drawn value hits "write 0, expect 0x0C"
+       about once in 256 cases, and that is precisely the case a dropped must-be-one survives.
+       MSER's write ignores its operand entirely, so 0xFF is what catches a stub that stores it. */
+    [MT.CADR, 0xFC], [MT.CADR, 0x03], [MT.CADR, 0x00], [MT.CADR, 0xFFFFFFFF],
+    [MT.MSER, 0xFF], [MT.MSER, 0x00]
 ];
 const MFPR_EDGE = [
     MT.SIRR, MT.TBIA, MT.TBIS, MT.TBCHK,                    // write-only: reserved operand fault
     MT.KSP, MT.IS, MT.ESP, MT.SSP, MT.USP,
     MT.SID, MT.MAPEN, MT.PME, MT.SISR, MT.ASTLVL, MT.IPL, MT.SCBB, MT.PCBB,
     MT.P0BR, MT.P0LR, MT.P1BR, MT.P1LR, MT.SBR, MT.SLR,
+    MT.CADR, MT.MSER,                                       // pcjsvax-877, see MTPR_EDGE above
     0x0F, 0x28, 0x3B, 64, 200
 ];
 
@@ -1254,6 +1294,7 @@ function phaseRandomized(simh, scratch, opts)
     const BATCH = 60;
     for (let start = 0; start < cases.length; start += BATCH) {
         let batch = cases.slice(start, start + BATCH);
+        startSimhProcess(m);
         let sr = runBatch(simh, batch, scratch);
         for (let c of batch) {
             perKind.set(c.kind, (perKind.get(c.kind) || 0) + 1);
@@ -1447,6 +1488,7 @@ function phaseMapped(simh, scratch, opts)
     const BATCH = 25;
     for (let start = 0; start < cases.length; start += BATCH) {
         let batch = cases.slice(start, start + BATCH);
+        startSimhProcess(m);
         let sr = runBatch(simh, batch, scratch, M_PROBES);
         for (let c of batch) {
             variantSeen.set(c.variant, (variantSeen.get(c.variant) || 0) + 1);

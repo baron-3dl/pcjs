@@ -252,13 +252,28 @@ const MT_MAX = 63;                              // vaxmod_defs.h:106, last valid
    real.  IORESET stays listed for WriteIPR's sake only -- ReadIPR (845-919) has no
    `case MT_IORESET` either, so an MFPR of it ALSO hits the BTO default on real SIMH; that read-
    side asymmetry pre-dates this item, is untouched by it, and remains a disclosed, ungraded gap
-   (excdiff's IPR_POOL below excludes IORESET from BOTH directions because one Set drives both). */
+   (excdiff's IPR_POOL below excludes IORESET from BOTH directions because one Set drives both).
+   SECOND MEASURED CORRECTION (pcjsvax-877), the same shape as the first: MT.CADR/MT.MSER were
+   listed here too, and they are NOT device-owned either.  vax_sysdev.c HAS an explicit `case` for
+   both in ReadIPR (892, 896) and WriteIPR (964, 968), backed by two plain int32 globals declared
+   in that same file (235-236) -- i.e. they live with the IPR switch, which is THIS module, not
+   with the SSC or CMCTL device model.  Deferring them left iprdevice.js routing them to clk.js,
+   whose read()/write() default every prn it does not own to 0/no-op, so an MFPR of CADR returned 0
+   and every MTPR was dropped.  The ROM's self-test 46 writes 0xFC to CADR and requires the read to
+   return 0xFC; it got 0 and printed `?46` (diagnosed by pcjsvax-7ae).  Removing them from this list
+   also enrolls them in excdiff's IPR_POOL automatically -- that pool is DERIVED as "every prn not
+   in IPR_DEVICE", so the grading follows from the correction rather than from a hand-added list. */
 const IPR_DEVICE = [MT.ICCS, MT.TODR, MT.CSRS, MT.CSRD, MT.CSTS, MT.CSTD,
-                    MT.RXCS, MT.RXDB, MT.TXCS, MT.TXDB, MT.CADR, MT.MSER, MT.IORESET];
+                    MT.RXCS, MT.RXDB, MT.TXCS, MT.TXDB, MT.IORESET];
 const IPR_DEVICE_SET = new Set(IPR_DEVICE);
 
 /* Hardwired CVAX system identification, vaxmod_defs.h:84-85. */
 const CVAX_SID = (10 << 24), CVAX_UREV = 6;
+
+/* CADR (cache disable) and MSER (memory system error), vaxmod_defs.h:110-117.  CADR_MBO is
+   must-be-one, and it is directly observable: a write of 0 still reads back 0x0C, which is one of
+   the three things the ROM's self-test 46 checks. */
+const CADR_RW = 0xF3, CADR_MBO = 0x0C, MSER_HM = 0x80;
 
 const BR_MASK = 0xFFFFFFFC | 0;
 
@@ -447,6 +462,18 @@ class VAXExc {
          * tracking for the ONE bit this item needs, not the SSC device model IPR_DEVICE defers.
          */
         this.sscBto = 0;
+        /*
+         * CADR / MSER (vax_sysdev.c:235-236, `int32 CADR = 0` / `int32 MSER = 0`) -- pcjsvax-877.
+         * Plain module state next to the IPR switch, exactly as in the C.  Like ssc_bto and unlike
+         * the CQBIC pair below, sysd_powerup() does NOT clear either (it clears ka_cacr, ssc_bto,
+         * ssc_otp and the CMCTL file, and names neither of these), so on the oracle they are set
+         * only by the C static initializer and then persist across `reset all`.  reset() below
+         * therefore does NOT clear them, which is the opposite of the deliberate departure made for
+         * ssc_bto -- there, clearing fits the differential's per-case boundary; here, NOT clearing
+         * is what fits it, because the oracle carries these across a reset within one process.
+         */
+        this.cadr = 0;
+        this.mser = 0;
         /*
          * CQBIC master-error state (cq_dser/cq_mear, vax_io.c:118-119) -- see cqMerr()'s doc
          * comment.  Unlike sscBto, `reset all` DOES clear these (qba_reset(), vax_io.c:749:
@@ -982,14 +1009,17 @@ class VAXExc {
              * `p2 = mchk_va + 4` (vax_sysdev.c:1649) avoids by capturing it before its own call to
              * intexc().
              *
-             * CADR/MSER (state1's low 16 bits) ARE NOT MODELLED: this file already defers them to
-             * the SSC/CMCTL device (IPR_DEVICE, see the file header) as a PRIOR design decision,
-             * not one this item made.  st1 hardcodes that term to 0, which mchkdiff.js's cases
-             * currently never contradict (no case issues an MTPR to CADR/MSER, and every SIMH
-             * process starts from powerup with both zero) -- so the match is UNTESTED, not proven.
-             * pcjsvax-622 (the ROM's cache self-test) writes CADR; the first item that models CADR
-             * storage MUST update this line and mchkdiff.js's expected st1 computation together, or
-             * a machine check taken after that write will silently diverge here.
+             * CADR/MSER (state1's low 16 bits) ARE NOW MODELLED -- pcjsvax-877.  This comment
+             * previously recorded them as deferred to the SSC/CMCTL device and hardcoded the term
+             * to 0, and instructed that "the first item that models CADR storage MUST update this
+             * line and mchkdiff.js's expected st1 computation together, or a machine check taken
+             * after that write will silently diverge here."  877 is that item and this is that
+             * update: the term below is `((cadr & 0xFF) << 8) | (mser & 0xFF)`, matching
+             * vax_sysdev.c:1654-1657 term for term.
+             *
+             * This is not academic.  The ROM leaves CADR = 0x0C (CADR_MBO, after its final MTPR
+             * #0), not 0, so any machine check taken after the ROM's self-test 46 now carries a
+             * non-zero low half -- the exact silent divergence the old note predicted.
              */
             if (this.inIE) throw new VAXStop(VAXStop.REASON.INIE, vec);
             let p1 = fault.p1;
@@ -998,7 +1028,8 @@ class VAXExc {
             let opc = cpu.decoder.opc;
             let hsir = 0;
             for (let i = 0; i < 16; i++) { if ((this.sisr >>> i) & 1) hsir = i; }
-            let st1 = (((opc & 0xFF) << 24) | (hsir << 16)) | 0;      // + CADR/MSER, unmodelled (0) -- see above
+            let st1 = (((opc & 0xFF) << 24) | (hsir << 16) |
+                       ((this.cadr & 0xFF) << 8) | (this.mser & 0xFF)) | 0;   // vax_sysdev.c:1654-1657
             let st2 = (0x00C07000 + (delta & 0xFF)) | 0;
             this.intexc(cpu, SCB.MCHK, 0, IE.SVE);
             this.inIE = 1;
@@ -1557,6 +1588,8 @@ class VAXExc {
     readIPR(prn)
     {
         if (prn === MT.SID) return (CVAX_SID | CVAX_UREV) | 0;
+        if (prn === MT.CADR) return this.cadr & 0xFF;            // vax_sysdev.c:892
+        if (prn === MT.MSER) return this.mser & 0xFF;            // vax_sysdev.c:896
         if (IPR_DEVICE_SET.has(prn) && this.iprDevice) return this.iprDevice.read(prn) | 0;
         this.sscBto = (this.sscBto | SSCBTO_BTO) | 0;           // SSC default: BTO only, reads 0
         return 0;
@@ -1578,6 +1611,10 @@ class VAXExc {
         if (prn === MT.SID || prn === MT.CONPC || prn === MT.CONPSL) {
             throw new VAXFault(VAXFAULT.RESOP);                 // read-only / halt registers
         }
+        /* vax_sysdev.c:964/968.  MSER's write IGNORES `val` entirely -- it keeps only the hit/miss
+           bit it already had, so an MTPR to it is a partial clear, not a store. */
+        if (prn === MT.CADR) { this.cadr = ((val & CADR_RW) | CADR_MBO) | 0; return; }
+        if (prn === MT.MSER) { this.mser = (this.mser & MSER_HM) | 0; return; }
         if (IPR_DEVICE_SET.has(prn) && this.iprDevice) { this.iprDevice.write(prn, val); return; }
         this.sscBto = (this.sscBto | SSCBTO_BTO) | 0;           // SSC default: BTO only, drop write
     }

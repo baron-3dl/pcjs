@@ -125,10 +125,16 @@
  *   - SIMH's REF_P (mchk_ref=1) half of the machine-check "address" parameter.  Every case here
  *     reaches the fault through mmu.readData()/writeData() (an ordinary instruction's data
  *     reference), which is SIMH's REF_V (0) path -- the one a console-ROM probe actually uses.
- *   - CADR/MSER (state1's low 16 bits): SSC/CMCTL device state exc.js defers (IPR_DEVICE), a PRIOR
- *     design decision this item did not make.  No case here writes them, so both sides read 0
- *     there by construction -- UNTESTED, not a modelled match; see exc.js's SCB.MCHK case for the
- *     pcjsvax-622 forward-reference (that item writes CADR).
+ *   - CADR/MSER (state1's low 16 bits) are NO LONGER unmodelled -- pcjsvax-877 models them in
+ *     exc.js (they are plain globals beside SIMH's own IPR switch, vax_sysdev.c:235-236, not
+ *     SSC/CMCTL device state), and exc.js's SCB.MCHK case now builds the low half as
+ *     `((cadr & 0xFF) << 8) | (mser & 0xFF)`, term for term with vax_sysdev.c:1654-1657.
+ *     WHAT IS STILL NOT EXERCISED HERE: no case in this file writes either register, so both
+ *     engines read 0 there and the low half is matched AT ZERO rather than driven.  That is
+ *     agreement, not coverage, and saying so is the point of this list.  The behaviour itself is
+ *     graded by tests/excdiff.js, whose IPR_POOL picked both registers up automatically when they
+ *     left IPR_DEVICE (the pool is derived as "every prn not in IPR_DEVICE"), plus deterministic
+ *     MTPR/MFPR edge cases for the three values the ROM's self-test 46 actually uses.
  *   - Any machine-check trigger other than a bus fault (parity/ECC, etc.) -- none exist yet.
  *   - The Qbus/CQBIC `cq_merr`/DSER/MEAR/deferred-`mem_err` mechanism itself (pcjsvax-d22) --
  *     IOPAGE/CQM writes are excluded from grading for exactly this reason (see above).

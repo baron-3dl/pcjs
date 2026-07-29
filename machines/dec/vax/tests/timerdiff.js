@@ -248,7 +248,8 @@ const covered = {
     ieOn: false, ieOff: false, ackClearsPending: false,
     todrRom: false, todrNonRom: false, todrWrite: false,
     interruptDelivered: false, interruptMasked: false,
-    nicrIcrInert: false
+    nicrIcrInert: false,
+    cadrMbo: false, cadrRw: false, mserIgnoresOperand: false
 };
 const notReached = [];
 
@@ -394,6 +395,46 @@ function caseIccsToggle(bin, scratch, failures, ieVal, tag)
     let {js, simh} = runFixedCase(bin, scratch, tag, code, {steps: 2});
     checkExact(failures, tag, js.R0, simh.R0, "R0 (ICCS readback)");
     if (ieVal & 0x40) covered.ieOn = true; else covered.ieOff = true;
+}
+
+/**
+ * CADR round trip: MTPR #val,CADR ; MFPR CADR,R0 -- pcjsvax-877.
+ *
+ * WHY THIS LIVES HERE AND NOT IN excdiff.js, which is where CADR's randomized MTPR/MFPR coverage
+ * now is.  excdiff runs exactly ONE `step 1` per case on both engines, so a write and a read of the
+ * same register are always different cases -- and its cases are generated kind-by-kind, so every
+ * mtpr case is in an earlier BATCH (a different SIMH process) than every mfpr case.  CADR survives
+ * `reset all` on the oracle but not a new process, so a value written in one batch is gone by the
+ * batch that could read it.  MEASURED: two mutations that break CADR_MBO and MSER's write both
+ * SURVIVED excdiff's --selfcheck for exactly that reason.  That is a property of the harness, not a
+ * tuning problem (standing rule 3), and this file is the one that already does cross-engine
+ * write-then-immediate-read on an IPR -- see this file's header on why round-trip is the only
+ * honest shape for a register whose value is not otherwise observable.
+ *
+ * The three values are the ROM's own, from self-test 46 (2004EF46-2004EF7B): 0xFC reads back 0xFC,
+ * 0x03 reads back 0x0F, and 0x00 reads back 0x0C rather than 0.  The last is the one that proves
+ * CADR_MBO, and it is the case a must-be-one bug survives when values are drawn uniformly.
+ */
+function caseCadrRoundTrip(bin, scratch, failures, val, tag)
+{
+    let code = asm(mtpr(val, MT.CADR), mfpr(MT.CADR, 0));
+    let {js, simh} = runFixedCase(bin, scratch, tag, code, {steps: 2});
+    checkExact(failures, tag, js.R0, simh.R0, "R0 (CADR readback)");
+    if (val === 0) covered.cadrMbo = true; else covered.cadrRw = true;
+}
+
+/**
+ * MSER's write IGNORES its operand entirely (vax_sysdev.c:968, `MSER = MSER & MSER_HM`), so an
+ * MTPR of 0xFF must NOT make the register read back 0xFF.  A model that stores the written value
+ * is the plausible wrong one, which is why this case writes a value it must not see again.
+ */
+function caseMserWriteIgnoresOperand(bin, scratch, failures)
+{
+    let tag = "mser_write_ignores_operand";
+    let code = asm(mtpr(0xFF, MT.MSER), mfpr(MT.MSER, 0));
+    let {js, simh} = runFixedCase(bin, scratch, tag, code, {steps: 2});
+    checkExact(failures, tag, js.R0, simh.R0, "R0 (MSER readback)");
+    covered.mserIgnoresOperand = true;
 }
 
 /** iccs_wr clears a PENDING request outright when IE is cleared (vax_stddev.c:300-301) --
@@ -953,6 +994,12 @@ function phaseFixed(bin, scratch)
     caseIccsToggle(bin, scratch, failures, 0x40, "iccs_ie_on");
     caseIccsToggle(bin, scratch, failures, 0x00, "iccs_ie_off");
     caseAckClearsPending(bin, scratch, failures);
+    /* pcjsvax-877.  The three values are the ROM's own (self-test 46); the write of 0 is the one
+       that proves CADR_MBO, and is the case a must-be-one bug survives. */
+    caseCadrRoundTrip(bin, scratch, failures, 0xFC, "cadr_rw_fc");
+    caseCadrRoundTrip(bin, scratch, failures, 0x03, "cadr_rw_03");
+    caseCadrRoundTrip(bin, scratch, failures, 0x00, "cadr_mbo_from_zero");
+    caseMserWriteIgnoresOperand(bin, scratch, failures);
     caseNicrIcrInert(bin, scratch, failures);
     caseTodrStopped(bin, scratch, failures);
     caseTodrRomContext(bin, scratch, failures);
@@ -1082,6 +1129,33 @@ function proveDeterminism()
  * ------------------------------------------------------------------------------------------- */
 
 const MUTATIONS = {
+    /* pcjsvax-877.  CADR's must-be-one bits are the half a store-it-and-hand-it-back model gets
+       wrong, and caseCadrRoundTrip's write-of-zero is what observes them.  These two mutations were
+       written for excdiff.js first and BOTH SURVIVED there, because that harness runs one `step 1`
+       per case and generates cases kind-by-kind, so a write and a read of the same register are
+       never in the same SIMH process.  Moving them here rather than weakening either check is
+       standing rule 3: a surviving mutation is a coverage hole, and the hole was the observation
+       channel, not the assertion.  Composed over the shipped writeIPR (standing rule 11). */
+    "cadr_drops_must_be_one_bits"() {
+        let orig = VAXExc.prototype.writeIPR;
+        VAXExc.prototype.writeIPR = function(prn, val) {
+            let r = orig.call(this, prn, val);
+            if ((prn >>> 0) === MT.CADR) this.cadr = this.cadr & ~0x0C;
+            return r;
+        };
+        return () => { VAXExc.prototype.writeIPR = orig; };
+    },
+    /* MSER's write IGNORES its operand (vax_sysdev.c:968 keeps only the hit/miss bit), so a model
+       that stores the written value looks reasonable and is wrong. */
+    "mser_write_stores_the_operand"() {
+        let orig = VAXExc.prototype.writeIPR;
+        VAXExc.prototype.writeIPR = function(prn, val) {
+            let r = orig.call(this, prn, val);
+            if ((prn >>> 0) === MT.MSER) this.mser = val & 0xFF;
+            return r;
+        };
+        return () => { VAXExc.prototype.writeIPR = orig; };
+    },
     /* pcjsvax-954's own named gotcha: the ROM special case omitted entirely. */
     "todr_rom_special_case_omitted"(clk) {
         let orig = ClkVAX.prototype.todrRd;
@@ -1377,6 +1451,28 @@ function selfcheck(bin, scratch)
         let bto = cpu.exc.sscBto >>> 0;
         restore();
         results.push({name: "bto_set_with_rwt_also_set", caught: bto === ((SSCBTO_BTO | SSCBTO_RWT) >>> 0)});
+    }
+    {
+        /* pcjsvax-877.  Write 0 to CADR and read it back: the must-be-one bits mean the ONLY
+           correct answer is CADR_MBO (0x0C), and the mutation strips exactly those.  Observed
+           through the shipped readIPR/writeIPR pair, which is the same round trip
+           caseCadrRoundTrip() drives through real MTPR/MFPR instructions against the oracle. */
+        let restore = MUTATIONS.cadr_drops_must_be_one_bits();
+        let {cpu} = makeMachine();
+        cpu.exc.writeIPR(MT.CADR, 0);
+        let got = cpu.exc.readIPR(MT.CADR) >>> 0;
+        restore();
+        results.push({name: "cadr_drops_must_be_one_bits", caught: got !== 0x0C});
+    }
+    {
+        /* The other half: MSER's write must IGNORE its operand, so writing 0xFF must NOT make the
+           register read back 0xFF (vax_sysdev.c:968 keeps only MSER_HM, which is 0 here). */
+        let restore = MUTATIONS.mser_write_stores_the_operand();
+        let {cpu} = makeMachine();
+        cpu.exc.writeIPR(MT.MSER, 0xFF);
+        let got = cpu.exc.readIPR(MT.MSER) >>> 0;
+        restore();
+        results.push({name: "mser_write_stores_the_operand", caught: got !== 0});
     }
     let allCaught = results.every((r) => r.caught);
     return {results, allCaught};
