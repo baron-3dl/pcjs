@@ -1291,7 +1291,17 @@ function phaseRandomized(bin, scratch, nCases)
  * cpustate.js's doc comments on why the two are deliberately NOT compared to each other here).      *
  * ------------------------------------------------------------------------------------------- */
 
-const DETERMINISM_STEPS = 5000;         // 5000 / INSTRS_PER_TICK(200) = 25 ticks, comfortably > 1
+/** DERIVED from INSTRS_PER_TICK rather than typed (HANDOFF.md standing rule 5), because a typed
+    budget stops meaning what its own comment says the moment the time base moves.  It did:
+    pcjsvax-a6f raised INSTRS_PER_TICK from 200 to 10,000 (one instruction is one microsecond and
+    one TODR tick is 10 ms -- see clk.js's USECS_PER_INSTR), at which point the old constant 5000,
+    whose comment read "5000 / INSTRS_PER_TICK(200) = 25 ticks, comfortably > 1", would have fired
+    ZERO ticks.  proveDeterminism()'s zero-tick assertion below would have FAILED the run rather
+    than quietly proving nothing -- which is why this is a repair and not a near-miss -- but a
+    trial budget that must be re-typed whenever the model moves is the same stale-constant shape
+    this item exists to remove. */
+const DETERMINISM_TICKS = 25;
+const DETERMINISM_STEPS = DETERMINISM_TICKS * INSTRS_PER_TICK;
 
 /** Fills R_CODE with NOPs for `steps` iterations and parks PC there -- every multi-step JS-only
     trial in this file (the determinism proof, and two of the selfcheck mutations below) needs

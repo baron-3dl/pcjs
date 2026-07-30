@@ -150,6 +150,10 @@
 import { VAX } from "./defines.js";
 import { NVR_BASE, NVR_LENGTH } from "./nvr.js";
 import { SSCBTO_BTO, SSCBTO_RWT, IPL_HMIN } from "./exc.js";
+/* clk.js is the ICCS/TODR facility -- a DIFFERENT device this file neither owns nor reimplements.
+   What is imported here is its TIME BASE, not any of its state: see TIR_USECS_PER_INSTR and the
+   cross-calibration assertion below for why the two facilities cannot be modelled independently. */
+import { INSTRS_PER_TICK, TICK_USECS, USECS_PER_INSTR } from "./clk.js";
 
 const SSC_BASE = VAX.PHYSMEM.SSC_BASE >>> 0;
 const SSC_LENGTH = VAX.PHYSMEM.SSC_LENGTH;
@@ -269,6 +273,52 @@ const SSCADS_MASK = (0x3FFFFFFC | 0);
  * provided (SSCVAX's existing optional-dependency contract -- omit it and T0/T1 behave exactly as
  * any other device-less register: readable/writable, but never able to raise a request).
  */
+/*
+ * ============================================================================
+ * THE RATE: TIR_USECS_PER_INSTR, AND THE CROSS-CALIBRATION AGAINST clk.js (pcjsvax-a6f)
+ * ============================================================================
+ * The SSC timers "increment at 1Mhz" (vax_sysdev.c:1461-1463), so TIR is a MICROSECOND counter --
+ * tmr_tir_rd() interpolates a running timer from `sim_activate_time_usecs()` and tmr_svc() feeds
+ * tmr_incr() a microsecond delta.  This engine has no wall clock, so the question that decides the
+ * rate is "how many microseconds is one instruction", and SIMH answers it in its own words at
+ * vax_sysdev.c:1476-1480: "Various ROM activities, including testing the Interval Timers, presume
+ * that ROM based code execute instructions at 1 instruction per usec."  tmr_sched()'s ADDR_IS_ROM
+ * branch encodes exactly that -- it hands a MICROSECOND count to `sim_activate()`, whose base unit
+ * is instructions, unconverted.
+ *
+ * So ONE TIR COUNT PER INSTRUCTION is not an approximation of the microsecond rate, it IS the
+ * microsecond rate under this engine's time base, and it is the value tests/tmrdiff.js's
+ * `run_mode_counting_rom_t0` case `checkExact`s against a LIVE oracle running from the ROM window.
+ * That is why this constant is 1 and why it did not change when pcjsvax-a6f fixed the 50x rate
+ * error: the error was never here.
+ *
+ * WHY THIS FILE ASSERTS ANYTHING ABOUT clk.js.  The KA655 ROM's self-test 53 measures the SSC T1
+ * interval register against TODR over 10 TODR ticks and requires 100,000 usec.  Neither facility
+ * can satisfy that alone -- it is a property of the RATIO, and until pcjsvax-a6f nothing in this
+ * tree graded the ratio, so the two were free to drift and had (clk.js counted 200 instructions to
+ * the 10 ms tick where a microsecond-counting TIR needs 10,000, and the ROM measured 2,002 usec
+ * where it demanded 100,000: subtest 09, "too slow", deterministically, on every run).  The
+ * assertion below is the tripwire that gap needed.  It is deliberately a LOAD-TIME throw and not a
+ * test-only check: a silently miscalibrated timer has no observable signal except a self-test
+ * failure buried 2.4M instructions into a ROM boot, which is precisely how it survived this long.
+ *
+ * It is a check of the SHIPPED constants against each other, not of one file's copy of the other's
+ * value -- INSTRS_PER_TICK and TICK_USECS are imported live from clk.js, so changing either there
+ * fails here.  tests/tmrdiff.js's `caseTirTodrCalibration()` grades the same relationship
+ * BEHAVIOURALLY, by running a machine with both devices and counting, which is what catches a
+ * defect in the counting code rather than in the constants.
+ */
+const TIR_USECS_PER_INSTR = 1;
+
+if (TIR_USECS_PER_INSTR * INSTRS_PER_TICK !== TICK_USECS || USECS_PER_INSTR !== TIR_USECS_PER_INSTR) {
+    throw new Error(
+        `ssc.js: SSC T0/T1 and clk.js TODR are out of calibration -- ${TIR_USECS_PER_INSTR} TIR ` +
+        `count(s)/instruction x ${INSTRS_PER_TICK} instruction(s)/TODR tick = ` +
+        `${TIR_USECS_PER_INSTR * INSTRS_PER_TICK} usec/tick, but clk.js's tick is ${TICK_USECS} usec ` +
+        `(clk.js USECS_PER_INSTR=${USECS_PER_INSTR}).  The KA655 ROM's self-test 53 MEASURES this ` +
+        `ratio; see this file's "THE RATE" section and pcjsvax-a6f.`);
+}
+
 /* TMR_CSR bits, vax_sysdev.c:191-198. */
 const TMR_CSR_ERR = 0x80000000 | 0;             // error, W1C
 const TMR_CSR_DON = 0x00000080;                 // done, W1C
@@ -424,13 +474,19 @@ export default class SSCVAX {
      * nothing from the CPU beyond "one instruction retired," and raise their own request through
      * `this.exc`, already bound at construction.
      *
+     * The per-instruction increment is TIR_USECS_PER_INSTR, not a bare literal, because it is the
+     * rate the whole engine's time base is expressed in and because the KA655 ROM measures it (see
+     * "THE RATE" in the file header).  Its value is 1, and always has been -- naming it changes no
+     * behaviour here; what it changes is that the number is now stated once, checked against
+     * clk.js, and perturbable by a --selfcheck mutation.
+     *
      * @this {SSCVAX}
      * @param {Object} cpu
      */
     tick(cpu)
     {
-        if (this.tcsr[0] & TMR_CSR_RUN) this._tmrIncr(0, 1);
-        if (this.tcsr[1] & TMR_CSR_RUN) this._tmrIncr(1, 1);
+        if (this.tcsr[0] & TMR_CSR_RUN) this._tmrIncr(0, TIR_USECS_PER_INSTR);
+        if (this.tcsr[1] & TMR_CSR_RUN) this._tmrIncr(1, TIR_USECS_PER_INSTR);
     }
 
     /**
@@ -441,11 +497,14 @@ export default class SSCVAX {
      * Unsigned overflow detection (`next < cur`) is done on VALUES ALREADY NORMALIZED via `>>> 0`
      * -- see defines.js's rule that a signed int32 relational compare is the hazard, not the mask;
      * both operands here are plain non-negative JS numbers by the time they are compared, so `<`
-     * is safe.  `inc` is always 1 in this file (tick()'s per-instruction call and writeReg()'s SGL
-     * synchronous call) -- vax_sysdev.c's own callers never pass anything else either (tmr_svc()'s
-     * `~tmr_tir[tmr]+1` is a WALL-CLOCK usec delta this file's instruction-driven model has no
-     * equivalent for; see the file header) -- so multi-wrap-in-one-call is not a case this needs to
-     * handle, and does not.
+     * is safe.  `inc` is 1 on both of this file's call sites: tick()'s per-instruction call passes
+     * TIR_USECS_PER_INSTR (whose value is 1 -- see "THE RATE" in the file header) and writeReg()'s
+     * SGL call passes a literal 1, matching tmr_csr_wr()'s own `tmr_incr (tmr, 1)`.  vax_sysdev.c's
+     * own callers never pass anything else either (tmr_svc()'s `~tmr_tir[tmr]+1` is a WALL-CLOCK
+     * usec delta this file's instruction-driven model has no equivalent for; see the file header) --
+     * so multi-wrap-in-one-call is not a case this needs to handle, and does not.  Note the
+     * asymmetry that makes the SGL literal correct rather than an oversight: SGL is defined as ONE
+     * COUNT, i.e. one microsecond, and would stay 1 even if the time base changed.
      *
      * @this {SSCVAX}
      * @param {number} tmr 0 or 1
@@ -858,5 +917,5 @@ export {
     SSC_BASE, SSC_LENGTH,
     REG_T0CSR, REG_T0INT, REG_T0NI, REG_T0VEC, REG_T1CSR, REG_T1INT, REG_T1NI, REG_T1VEC,
     TMR_CSR_ERR, TMR_CSR_DON, TMR_CSR_IE, TMR_CSR_SGL, TMR_CSR_XFR, TMR_CSR_STP, TMR_CSR_RUN,
-    TMR_VEC_MASK, INT_V_TMR0, INT_V_TMR1
+    TMR_VEC_MASK, INT_V_TMR0, INT_V_TMR1, TIR_USECS_PER_INSTR
 };

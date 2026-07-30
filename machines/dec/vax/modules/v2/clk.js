@@ -95,6 +95,11 @@
  * ============================================================================
  * - SSC T0/T1 (the programmable timers at SSC_BASE+0x100+) -- a DIFFERENT facility, owned by the
  *   countdown item per pcjsvax-954's own constraint.  Not one register here overlaps that scope.
+ *   THEY ARE NOT INDEPENDENT, THOUGH, and pcjsvax-a6f is what measured it: the KA655 ROM's
+ *   self-test 53 cross-calibrates ssc.js's microsecond-counting TIR against THIS file's TODR, so
+ *   the RATIO between the two is observable to software even though no register is.  Both are now
+ *   expressed in terms of one time base -- USECS_PER_INSTR below -- and ssc.js asserts the
+ *   calibration against INSTRS_PER_TICK at load time, so the two cannot drift apart silently again.
  * - The console UART (CSRS/CSRD/CSTS/CSTD/RXCS/RXDB/TXCS/TXDB) and CADR/MSER/IORESET -- other
  *   MT_* numbers ReadIPR/WriteIPR dispatch to; read()/write() below pass them straight through to
  *   the SAME VALUE (0 / dropped write) exc.js already produced for ALL of IPR_DEVICE before any
@@ -147,15 +152,67 @@ const ROM_MASK = (~(VAX.PHYSMEM.ROM_SIZE - 1)) >>> 0;
 const ROM_TAG = (ROM_BASE & ROM_MASK) >>> 0;
 
 /**
- * INSTRS_PER_TICK -- the deterministic stand-in for clk_svc's real-time ~10ms/100Hz schedule
- * (vax_stddev.c UNIT clk_unit's CLK_DELAY, sim_rtcn_calb-recalibrated every service).  There is no
- * meaningful "instructions per 10ms" conversion once the model is instruction-count driven (that
- * would just reintroduce a host-speed dependency by another name) -- what DONE CONDITION 2
- * requires is that this number is FIXED, so the same run twice produces the same tick count at the
- * same instruction counts.  Deliberately small enough that a differential's step budgets (hundreds
- * to a few thousand instructions) exercise several ticks without needing a huge run.
+ * TODR_TICKS_PER_SEC -- clk_svc's rate, and the unit todr_reg counts in.
+ *
+ * vax_stddev.c's todr_resync() writes `(base*100) + ...` where `base` is a SECOND count (see the
+ * POWER-ON RESYNC section above, and todrResync() below, which uses this same constant), and
+ * todr_rd() reconstructs a centisecond count from elapsed real time.  So one clk_svc service --
+ * one `todr_reg + 1` -- is one CENTISECOND, i.e. 10 ms, i.e. the 100 Hz this file's header names.
  */
-const INSTRS_PER_TICK = 200;
+const TODR_TICKS_PER_SEC = 100;
+
+/**
+ * USECS_PER_INSTR -- THE TIME BASE OF THIS WHOLE ENGINE, and it is a MEASURED quantity, not a
+ * convenience.
+ *
+ * vax_sysdev.c:1476-1480 states it in its own words: "Various ROM activities, including testing
+ * the Interval Timers, presume that ROM based code execute instructions at 1 instruction per
+ * usec."  tmr_sched() (vax_sysdev.c:1608-1625) then ENCODES that equivalence literally -- for a
+ * short delay requested from ROM it calls `sim_activate(&sysd_unit[tmr], usecs_sched)`, whose base
+ * unit is INSTRUCTIONS, passing a MICROSECOND count unconverted.  One instruction, one microsecond.
+ *
+ * GRADED AGAINST THE LIVE ORACLE, so this is not a reading of a comment: tests/tmrdiff.js's
+ * `run_mode_counting_rom_t0` case runs a T0 interval from the ROM address window on BOTH engines
+ * and `checkExact`s the TIR readback -- real SIMH advances the SSC timer's microsecond-counting
+ * TIR by exactly 1 per instruction retired there, and ssc.js does the same (see its
+ * TIR_USECS_PER_INSTR, which is the same constant seen from the timer side, and the
+ * cross-calibration assertion ssc.js makes against INSTRS_PER_TICK below).
+ *
+ * WHAT THIS REPLACED, AND WHY (pcjsvax-a6f).  INSTRS_PER_TICK was 200, chosen so that "a
+ * differential's step budgets (hundreds to a few thousand instructions) exercise several ticks
+ * without needing a huge run", and its comment asserted that "there is no meaningful 'instructions
+ * per 10ms' conversion once the model is instruction-count driven".  THAT SENTENCE IS FALSE, and
+ * the ROM is what falsifies it: KA655 self-test 53 cross-calibrates the SSC T1 interval register
+ * against TODR, so the ratio between this file's tick and ssc.js's TIR count is a quantity the
+ * ROM MEASURES.  At 200 instructions per tick the implied time base was 50 usec per instruction,
+ * TODR ran 50x fast against a microsecond-counting TIR, and the ROM measured 2,002 microseconds
+ * where 100,000 were required -- failing test 53 with subtest 09 ("too slow") on every run
+ * (MEASURED, this machine, 2026-07-30: `?53 2 09 FF 00 0000  P1=00000002 P2=00000028
+ * P3=80017ECA`, where P3 is the signed magnitude of measured-minus-100,000 usec).
+ */
+const USECS_PER_INSTR = 1;
+
+/** One clk_svc service in microseconds: 1,000,000 / 100 = 10,000 usec = 10 ms. */
+const TICK_USECS = 1000000 / TODR_TICKS_PER_SEC;
+
+/**
+ * INSTRS_PER_TICK -- the deterministic stand-in for clk_svc's real-time ~10ms/100Hz schedule
+ * (vax_stddev.c UNIT clk_unit's CLK_DELAY, sim_rtcn_calb-recalibrated every service), now DERIVED
+ * from the time base above rather than chosen (HANDOFF.md standing rule 5).  10,000 usec per tick
+ * at 1 usec per instruction is 10,000 instructions per tick.
+ *
+ * What has NOT changed is the property DONE CONDITION 2 asks for and which is the reason this is a
+ * fixed instruction count at all rather than a real-time schedule: it is a constant, so the same
+ * run twice produces the same tick count at the same instruction counts, with no host-speed
+ * dependency anywhere.  This engine can therefore be deterministic exactly where real SIMH -- whose
+ * clk_svc is wall-clock calibrated -- cannot be, which is why the ROM's test 53 passes here on
+ * every run and only sometimes on the oracle (HANDOFF.md 5).
+ *
+ * A differential that wants "several ticks" must now budget tens of thousands of instructions;
+ * tests/timerdiff.js derives its own step counts from this constant rather than hard-coding them,
+ * so raising it scales those runs instead of silently emptying them.
+ */
+const INSTRS_PER_TICK = TICK_USECS / USECS_PER_INSTR;
 
 /**
  * TOY_MAX_SECS (vax_stddev.c:487, `#define TOY_MAX_SECS (0x40000000/25)`) -- computed, not
@@ -290,7 +347,7 @@ export default class ClkVAX {
         let ydays = dayOfYear(now);
         let base = ((ydays * 24 + now.getHours()) * 60 + now.getMinutes()) * 60 + now.getSeconds();
         let frac = Math.round(now.getMilliseconds() / 10);
-        this.todrWr(((base * 100) + 0x10000000 + frac) | 0);
+        this.todrWr(((base * TODR_TICKS_PER_SEC) + 0x10000000 + frac) | 0);
     }
 
     /**
@@ -467,5 +524,6 @@ export default class ClkVAX {
 export {
     MT_ICCS, MT_TODR, CSR_IE, CLKCSR_IMP, CLKCSR_RW,
     IPL_CLK_ABS, INT_V_CLK, SCB_INTTIM, ROM_MASK, ROM_TAG, ROM_BASE, INSTRS_PER_TICK, TOY_MAX_SECS,
+    TODR_TICKS_PER_SEC, USECS_PER_INSTR, TICK_USECS,
     dayOfYear
 };

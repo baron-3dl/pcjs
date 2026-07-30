@@ -202,9 +202,21 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
                                   6,000,000  ->   487 bytes  <- NO LONGER SETTLED
                      12,000,000 / 20,000,000 ->   546 bytes  <- settled; runs 40..03 and reaches ">>>"
 
-    (The stream is SHORTER than the old 1,407 bytes because three self-test failure dumps -- ?51,
-    ?46 and ?80 -- are gone.  A smaller number here is progress, which is exactly why this file
-    grades content and structure rather than a byte count; see HANDOFF.md section 3.)
+    RE-MEASURED AGAIN 2026-07-30 by pcjsvax-a6f, and this time the budget did NOT have to move.
+    That item corrected the SSC-timer/TODR calibration, which removed the ROM's `?53` self-test
+    failure and the entire P1..P10 / r0..r8 dump that came with it, so the stream got shorter for
+    the third time running and now ends `Tests completed.` / `>>>` instead of `Normal operation not
+    possible.`.  One walk per budget from a fresh machine, on this tree:
+
+                                  3,000,000  ->   104 bytes
+                                  6,000,000  ->   194 bytes  <- NOT settled
+        12,000,000 / 24,000,000 / 60,000,000 ->   243 bytes  <- settled; 40..03, then "Tests completed."
+
+    So 12,000,000 remains correct, and PHASE S re-asserts it on every run rather than this comment.
+
+    Note the sequence 1,407 -> 546 -> 243: three times in a row a real fix made this number FALL.
+    A smaller number here is progress, which is exactly why this file grades content and structure
+    and why nothing anywhere grades a byte count; see HANDOFF.md section 3.
 
     First console byte at instruction #281,966.  ~2.4s at this budget, ~10s including PHASE S. */
 const JS_STEPS_DEFAULT = 12000000;
@@ -233,10 +245,22 @@ const JS_STEPS_DEFAULT = 12000000;
     item exists to catch.  MAX_VOLATILE_OFFSETS then keeps the derived exemption from growing into a
     blanket.
 
+    THE SIX VOLATILE OFFSETS ARE GONE, AND THE DERIVATION IS WHY THIS PARAGRAPH SURVIVES THEM
+    (pcjsvax-a6f, 2026-07-30).  Those offsets lived in the `?53` dump, and correcting the SSC
+    timer/TODR calibration removed the dump: this machine now emits 243 bytes with ZERO volatile
+    offsets, byte-identical across two same-budget walks -- MEASURED, and separately confirmed by
+    eight independent 12,000,000-instruction runs of the shipped ROM machine producing one identical
+    stream.  Had the exempt set been WRITTEN DOWN as "295-297, 321-323" it would now be a list of
+    six offsets that do not exist, quietly excusing whatever moved into them next; because it is
+    derived from a same-budget pair on every run, it is simply empty today and will re-populate
+    itself the moment a wall-clock-derived field reappears.  That is standing rule 5 paying for
+    itself, and it is the reason this check needs no edit beyond this note.
+
     The asymmetry with the oracle is worth stating, because it is what earns the right to compare a
     single JS capture against a two-capture oracle prefix: the oracle varies in LENGTH at a fixed
-    budget (PHASE O/R measured 481 and 194 bytes from two 4,000,000-step processes), while this
-    machine varies only in the VALUE of one wall-clock field at a fixed length. */
+    budget (PHASE O/R measured 481 and 194 bytes from two 4,000,000-step processes) -- and, at 16 MB
+    under load, in whether it emits the `?53` block at all (HANDOFF.md 5) -- while this machine now
+    does not vary at all. */
 const JS_SETTLE_MULTIPLE = 2;
 
 /** Where the oracle budget SEARCH starts (--oracle-steps overrides it).  DELIBERATELY below the
@@ -289,7 +313,20 @@ const ORACLE_FULL_MULTIPLE = 2;
     reproducible in CONTENT and not in LENGTH -- exactly what the file header says -- so a line floor
     out there is an intermittent test, which is worse than no floor at all.  What holds the
     doorbell's gain instead is tests/dbldiff.js, which grades the register itself rather than the
-    ROM's reaction to it. */
+    ROM's reaction to it.
+
+    AND NOT RAISING IT IS WHAT MADE THE NEXT FIX POSSIBLE TO SHIP (pcjsvax-a6f, 2026-07-30).  The
+    two streams now diverge AT byte 104, and the divergence is the ORACLE'S: after `…32..31..` this
+    machine continues `30..29..` while the oracle emits its own `?53` failure block.  That is the
+    right outcome and not a regression -- the KA655 ROM's self-test 53 cross-calibrates the SSC
+    timer against TODR, real SIMH's timer is wall-clock calibrated, and so the oracle fails that
+    test intermittently (`Tests completed.` on 4 of 6 runs at 16 MB under load, HANDOFF.md 5) while
+    this engine, whose clocks are instruction-driven, now passes it on every run.  The presence,
+    absence and contents of that whole block are ungradeable byte-for-byte against this oracle; the
+    decision to grade "test 53 passes, deterministically" instead is pcjsvax-59f, and the mechanism
+    that keeps THIS file honest about it is the same one it already had -- the graded range stops at
+    the reproducible prefix, and PHASE U reports the rest without grading it.  A floor of 5 lines
+    would now be a check that fails on a correct machine because the reference is nondeterministic. */
 const BANNER_MATCH_FLOOR_LINES = 4;
 
 /** ABSOLUTE ceiling on how many byte offsets may differ between two walks at the SAME budget --
@@ -592,6 +629,67 @@ const CqmDecodeFloor = {
     report(js) {
         return this.REQUIRED.map((n) =>
             `${n}=${js.deviceNames.includes(n) ? this.calls(js, n) + " call(s)" : "NOT DECODED"}`).join("  ");
+    }
+};
+
+/**
+ * TimerHookFloor -- a hard coverage floor over the two PER-INSTRUCTION hooks the ROM's sense of time
+ * is made of.
+ *
+ * WHY IT EXISTS, and it is CqmDecodeFloor's lesson applied a second time rather than a new idea
+ * (pcjsvax-a6f).  cpustate.js drives ClkVAX and SSCVAX from two plain slots -- `cpu.clk` and
+ * `cpu.tmr` (cpustate.js:1016/1020) -- and BOTH DEVICES KEEP WORKING IF THE SLOTS ARE EMPTY: every
+ * register still decodes, reads and writes, so the census below still shows them constructed and
+ * busy.  What stops is TIME.  The KA655 ROM notices immediately (self-test 53 measures the SSC
+ * timer against TODR and fails), and NOTHING ELSE IN THIS TREE CAN: tmrdiff.js and timerdiff.js
+ * each build their own machine, so neither can see how the ROM's machine is wired, which is exactly
+ * the shape that let the CQM mount regress silently while five differentials exited 0.
+ *
+ * WHAT IT DOES NOT DO, same as CqmDecodeFloor: it does not look for the string `?53`, and must not.
+ * It grades the CAUSE -- the hooks are wired and firing on this walk -- not the ROM's reaction.
+ *
+ * WHY `tick` SPECIFICALLY AND NOT "any call": a total-call floor cannot see this defect at all.
+ * MEASURED on the unmutated walk: with `cpu.clk` cleared, ClkVAX still records tens of thousands of
+ * read/todrRd calls from the ROM's own MFPRs, so "ClkVAX was called" stays true while the clock has
+ * stopped.  The tick count is the only quantity that goes to zero.
+ *
+ * The floor is on the REQUIREMENT (two named hooks, non-zero) and so does not scale with the budget
+ * or with anything else (HANDOFF.md standing rule 4).
+ */
+const TimerHookFloor = {
+
+    /** [class name as it appears in rommachine.js's `devices` roster, census method name] */
+    REQUIRED: [["ClkVAX", "tick"], ["SSCVAX", "tick"]],
+
+    /**
+     * @param {Object} js as returned by runJS()
+     * @returns {Array.<string>} problems; empty when the floor holds
+     */
+    verify(js) {
+        let problems = [];
+        for (let [name, method] of this.REQUIRED) {
+            if (!js.deviceNames.includes(name)) {
+                problems.push(`COVERAGE FLOOR: the ROM machine did not construct ${name} -- one of ` +
+                    `the two facilities the ROM's self-test 53 measures against each other is ` +
+                    `missing, so this machine has no working sense of time (pcjsvax-a6f).  ` +
+                    `Constructed devices: ${js.deviceNames.join(", ")}`);
+            } else if ((js.tally.get(`${name}.${method}`) || 0) === 0) {
+                problems.push(`COVERAGE FLOOR: ${name} is constructed but its per-instruction ` +
+                    `${method}() hook never fired in ${js.steps} instruction(s) -- cpustate.js's ` +
+                    `cpu.${name === "ClkVAX" ? "clk" : "tmr"} slot is not wired, so this machine's ` +
+                    `time does not advance even though the device's registers still answer`);
+            }
+        }
+        return problems;
+    },
+
+    /**
+     * @param {Object} js as returned by runJS()
+     * @returns {string} the one-line PHASE D report, whether the floor held or not
+     */
+    report(js) {
+        return this.REQUIRED.map(([n, m]) =>
+            `${n}.${m}=${js.deviceNames.includes(n) ? (js.tally.get(`${n}.${m}`) || 0) : "NOT CONSTRUCTED"}`).join("  ");
     }
 };
 
@@ -1189,6 +1287,7 @@ function runAll(romBytes, opts, magicByte, simh, rawCache, fQuiet = false)
             `output routine never completed a character`);
     }
     problems.push(...CqmDecodeFloor.verify(js));
+    problems.push(...TimerHookFloor.verify(js));
 
     sampleHeap();
     if (g_peakHeapMB > PEAK_HEAP_MB_MAX) {
@@ -1296,6 +1395,7 @@ function runAll(romBytes, opts, magicByte, simh, rawCache, fQuiet = false)
         /* The one part of PHASE D that IS a gate -- see CqmDecodeFloor for why these two devices and
            no others.  Printed on every run, held or not, so the floor cannot go quiet. */
         say(`  CQM DECODE FLOOR (graded): ${CqmDecodeFloor.report(js)}`);
+        say(`  TIMER HOOK FLOOR (graded): ${TimerHookFloor.report(js)}`);
     }
 
     return {problems, js, oA, oB, oShort, searched, searchSteps, fullSteps, repro, oracleRepro,
@@ -1458,6 +1558,43 @@ const MUTATIONS = {
         MachineBuild.build = function(romBytes) {
             orig.call(this, romBytes);
             return makeRomMachine(romBytes, false, true);
+        };
+        return () => { MachineBuild.build = orig; };
+    },
+
+    /* pcjsvax-a6f: the ROM machine's SSC-timer hook unwired.  cpustate.js drives SSCVAX from a
+       plain `cpu.tmr` slot (cpustate.js:1020) and the DEVICE GOES ON WORKING WITHOUT IT -- every
+       register still decodes, reads and writes, so the census still shows it constructed and busy.
+       What stops is time.  MEASURED: the ROM then emits 5 bytes in 12,000,000 instructions (it
+       parks in a timer loop before the banner), so this one is caught by the banner floor as well
+       as by TimerHookFloor.  Its pair below is the one no other check sees. */
+    "rom-machine-tmr-hook-unwired": function() {
+        let orig = MachineBuild.build;
+        MachineBuild.build = function(romBytes) {
+            let m = orig.call(this, romBytes);
+            m.cpu.tmr = null;
+            return m;
+        };
+        return () => { MachineBuild.build = orig; };
+    },
+
+    /* pcjsvax-a6f, AND IT IS `cqm-window-undecoded` ONE ITEM LATER -- the regression with no other
+       tripwire.  Unwiring `cpu.clk` (cpustate.js:1016) stops TODR advancing while leaving ClkVAX
+       fully functional as an IPR device: the ROM's MFPRs still read it tens of thousands of times,
+       so a census floor on "was this device called" cannot see it.  MEASURED with it applied: the
+       ROM runs its banner and countdown normally and emits 833 bytes ending in a LIVE `?53 2 05`
+       failure -- and PHASE C still matches the oracle over the first 104 bytes, comfortably past
+       the 64-byte floor, because the oracle's own capture emits `?53` at that very offset too.  So
+       every other assertion in this file passes with a self-test failure restored.  That is exactly
+       what happened to `?80` (HANDOFF.md 0: five differentials, no tripwire), and TimerHookFloor is
+       the answer to it, verified by removing the floor and confirming this mutation then SURVIVES.
+       Composed over the shipped MachineBuild.build, like every mutation above. */
+    "rom-machine-clk-hook-unwired": function() {
+        let orig = MachineBuild.build;
+        MachineBuild.build = function(romBytes) {
+            let m = orig.call(this, romBytes);
+            m.cpu.clk = null;
+            return m;
         };
         return () => { MachineBuild.build = orig; };
     }

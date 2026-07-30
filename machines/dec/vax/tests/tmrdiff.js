@@ -105,9 +105,13 @@ import { OPCODES } from "../modules/v2/drom.js";
 import SSCVAX, {
     REG_T0CSR, REG_T0INT, REG_T0NI, REG_T0VEC, REG_T1CSR, REG_T1INT, REG_T1NI, REG_T1VEC,
     TMR_CSR_ERR, TMR_CSR_DON, TMR_CSR_IE, TMR_CSR_SGL, TMR_CSR_XFR, TMR_CSR_STP, TMR_CSR_RUN,
-    TMR_VEC_MASK, INT_V_TMR0, INT_V_TMR1, SSC_BASE
+    TMR_VEC_MASK, INT_V_TMR0, INT_V_TMR1, SSC_BASE, TIR_USECS_PER_INSTR
 } from "../modules/v2/ssc.js";
 import VAXExc, { IPL_HMIN, SCB, QB_VEC_MASK } from "../modules/v2/exc.js";
+/* clk.js is timerdiff.js's device, not this file's, and nothing below grades a TODR value.  What
+   it is here for is the CROSS-CALIBRATION section: the one quantity neither suite could see while
+   both were green.  See that section's own doc comment. */
+import ClkVAX, { MT_TODR, INSTRS_PER_TICK, TICK_USECS } from "../modules/v2/clk.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -241,7 +245,11 @@ const covered = {
        the measured, live-injection-confirmed gap each one closes. */
     stpClearsRun: false,
     overflowNoIeNoInterrupt: false,
-    t0intWriteNoOp: false
+    t0intWriteNoOp: false,
+    /* pcjsvax-a6f: the ratio between this file's device and clk.js's, which the KA655 ROM measures
+       in self-test 53 and which no file in this tree owned until now.  See the CROSS-CALIBRATION
+       section for the 50x error both suites stayed green through. */
+    tirTodrCalibration: false
 };
 
 /* ------------------------------------------------------------------------------------------- *
@@ -757,6 +765,135 @@ function proveDeterminism()
 }
 
 /* ------------------------------------------------------------------------------------------- *
+ * CROSS-CALIBRATION -- the SSC timers' rate against clk.js's TODR (pcjsvax-a6f)                    *
+ *                                                                                                 *
+ * WHY THIS EXISTS -- MEASURED, not reasoned.  Every check in this file grades T0/T1 in isolation   *
+ * and every check in timerdiff.js grades ICCS/TODR in isolation, and BOTH SUITES WERE GREEN while  *
+ * the two devices were 50x out of calibration with each other: ssc.js counted 1 usec per           *
+ * instruction (correct, and graded against the LIVE ORACLE by caseRunModeCountingRom() above)      *
+ * while clk.js ticked a 10 ms TODR every 200 instructions, i.e. a 50 usec instruction.  Nothing in *
+ * this tree could see it, because the defect is in neither device -- it is in the RATIO, and no    *
+ * file owned the ratio.  The KA655 ROM sees it: self-test 53 reads T1's interval register across   *
+ * 10 TODR ticks and requires 100,000 usec, measured 2,002, and failed with subtest 09 on every     *
+ * boot.  Two gates that both went on measuring, and a quantity that fell between them.             *
+ *                                                                                                  *
+ * WHAT IT GRADES AND WHAT IT CANNOT.  It is JS-only, deliberately rather than as a concession:     *
+ * real SIMH's clk_svc is WALL-CLOCK calibrated (sim_rtcn_calb) while its ROM-window SSC timer is   *
+ * instruction-scheduled, so the ratio ON THE ORACLE is a function of host speed and load -- which  *
+ * is why the oracle itself fails test 53 intermittently (HANDOFF.md 5: `Tests completed.` on 4 of  *
+ * 6 runs under load at 16 MB) and why grading this cross-engine would be a coin flip dressed as a  *
+ * gate.  This engine has no wall clock in either device, so the ratio is a fixed, checkable        *
+ * property of the model.  It is checked by RUNNING both devices together and counting -- not by    *
+ * comparing the two constants, which ssc.js's own load-time assertion already does and which by    *
+ * construction cannot see a defect in the counting code itself.                                    *
+ * ------------------------------------------------------------------------------------------- */
+
+/** Self-test 53's own window: the ROM samples the SSC timer across 10 TODR ticks and requires
+    100,000 usec.  Used here for the same reason caseRunModeCountingRom() runs from the ROM address
+    window -- exercise the real shape, not a convenient one.  Costs TODR_TICKS_SAMPLED *
+    INSTRS_PER_TICK = 100,000 retired NOPs, well under a second. */
+const TODR_TICKS_SAMPLED = 10;
+
+/**
+ * calibrationTrial()
+ *
+ * One free-running T0 (TNIR=0 copied in by XFR, so TIR starts at 0 and cannot wrap inside this
+ * window; IE clear, so no interrupt state is disturbed) and one running TODR, stepped together by
+ * the SAME cpu.stepCPU() loop that drives the ROM.  Both devices are the SHIPPED ones on the
+ * SHIPPED per-instruction hooks (cpu.tmr / cpu.clk); nothing here reimplements a tick.
+ *
+ * TODR must be RUNNING to count at all -- clk_svc's increment is gated on `!todr_blow && todr_reg`
+ * (vax_stddev.c:455-469) -- hence the explicit MT_TODR write, and hence the zero-tick assertion in
+ * proveCalibration(), which is what catches that going wrong instead of passing vacuously.
+ *
+ * THE OBSERVATION CHANNEL, stated because HANDOFF.md standing rule 16 is about precisely this: the
+ * TODR count is read from `clk.todrReg` -- the raw counted field clk_svc increments -- and NOT
+ * through todrRd().  That is not a shortcut past the interface, it is the only sound read here:
+ * this trial's code runs from RAM, and todrRd() OUTSIDE the ROM window deliberately returns a value
+ * computed from the HOST WALL CLOCK (clk.js's own header), which would make a measurement whose
+ * whole point is instruction determinism depend on how long the trial happened to take.
+ *
+ * @returns {{tirCounts: number, todrTicks: number, steps: number}}
+ */
+function calibrationTrial()
+{
+    let { bus, cpu, ssc } = makeMachine();
+    let clk = new ClkVAX(cpu.exc);
+    /*
+     * `cpu.clk` ONLY, and NOT cpu.exc.setIPRDevice(clk).  MEASURED, and it is the difference
+     * between measuring the shipped machine and measuring a different one: exc.js's setIRQL()
+     * calls `this.iprDevice.tick(cpu)` once per instruction ON TOP of cpustate.js's own
+     * `this.clk.tick(this)`, so a clock installed as the IPR device is ticked TWICE per retired
+     * instruction.  The SHIPPED ROM machine does not do that -- rommachine.js installs
+     * iprdevice.js's COMPOSITE, whose tick() deliberately forwards only to the console ("clk is
+     * deliberately NOT ticked here", iprdevice.js:71) -- and a probe over its first 200,000
+     * instructions confirms exactly 1 clk.tick() per instruction there, against 2 with
+     * setIPRDevice(clk).  Nothing here needs IPR access anyway (the TODR write below is a direct
+     * call, not an MTPR), so the faithful wiring is also the simpler one.  This was found by this
+     * very check failing on its first run with 20 TODR ticks where 10 were required -- see
+     * pcjsvax-7db for the same wiring inside timerdiff.js's own machine, which is NOT this file's
+     * to change.
+     */
+    cpu.clk = clk;
+
+    const TODR_START = 0x10000001;              // non-zero => running; the write also clears BLOW
+    clk.write(MT_TODR, TODR_START);
+
+    let steps = TODR_TICKS_SAMPLED * INSTRS_PER_TICK;
+    for (let i = 0; i < steps + 8; i++) bus.setByte(i, NOP_BYTE);
+    ssc.writeReg(REG_T0NI & 0xFF, 0);                                   // TNIR = 0
+    ssc.writeReg(REG_T0CSR & 0xFF, (TMR_CSR_XFR | TMR_CSR_RUN) | 0);    // TIR := 0, then free-run
+    cpu.setPC(0);
+    for (let i = 0; i < steps; i++) cpu.stepCPU(1);
+
+    return {
+        tirCounts: ssc.tir[0] >>> 0,
+        todrTicks: ((clk.todrReg >>> 0) - TODR_START) | 0,
+        steps
+    };
+}
+
+/**
+ * proveCalibration(failures)
+ *
+ * @param {Array.<string>} failures
+ * @returns {Object} the trial, for the report
+ */
+function proveCalibration(failures)
+{
+    let tag = "tir_todr_calibration";
+    let t = calibrationTrial();
+
+    /* A trial that observed nothing must FAIL, not pass quietly (HANDOFF.md standing rule 6). */
+    if (t.todrTicks <= 0) {
+        failures.push(`${tag}: TODR did not advance at all across ${t.steps} instruction(s) -- the ` +
+            `trial itself is broken (is the clock running?  is cpu.clk wired?), so nothing was measured`);
+        return t;
+    }
+    if (t.tirCounts <= 0) {
+        failures.push(`${tag}: T0's TIR did not advance at all across ${t.steps} instruction(s) -- the ` +
+            `trial itself is broken (is cpu.tmr wired?  is RUN set?), so nothing was measured`);
+        return t;
+    }
+    if (t.todrTicks !== TODR_TICKS_SAMPLED) {
+        failures.push(`${tag}: expected exactly ${TODR_TICKS_SAMPLED} TODR tick(s) across ${t.steps} ` +
+            `instruction(s) at INSTRS_PER_TICK=${INSTRS_PER_TICK}, observed ${t.todrTicks}`);
+    }
+    /* THE ASSERTION THE ROM ITSELF MAKES.  Exact, not a band: both devices are driven off the same
+       per-instruction hook with no wall clock anywhere, so this is arithmetic, and a tolerance here
+       would be somewhere for a real drift to hide. */
+    let wantTir = t.todrTicks * TICK_USECS;
+    if (t.tirCounts !== wantTir) {
+        failures.push(`${tag}: the microsecond-counting TIR advanced ${t.tirCounts} count(s) across ` +
+            `${t.todrTicks} TODR tick(s); the ROM's self-test 53 requires ${wantTir} (${TICK_USECS} ` +
+            `usec per 10 ms tick).  ssc.js TIR_USECS_PER_INSTR=${TIR_USECS_PER_INSTR}, clk.js ` +
+            `INSTRS_PER_TICK=${INSTRS_PER_TICK}, TICK_USECS=${TICK_USECS}`);
+    }
+    covered.tirTodrCalibration = true;
+    return t;
+}
+
+/* ------------------------------------------------------------------------------------------- *
  * --selfcheck -- named mutations (the item's own four), every one must be CAUGHT.  Graded          *
  * JS-only against an independently-known-correct expectation, matching timerdiff.js's/              *
  * hwintdiff.js's own convention (re-invoking SIMH per mutation is not needed and not done).          *
@@ -942,6 +1079,47 @@ const MUTATIONS = {
             return result;
         };
         return () => { SSCVAX.prototype.writeReg = orig; };
+    },
+    /*
+     * pcjsvax-a6f, #8: THE DEFECT THIS ITEM FIXED, reinstated as a perturbation -- the SSC timers
+     * advance 50x too slowly against TODR.  Expressed on the TIMER side (drop 49 of every 50 ticks)
+     * rather than by editing a constant, because the point is that the shipped counting code runs:
+     * `orig` is CALLED on the 50th instruction and does everything it normally does.  If shipped
+     * tick() were already broken in this direction the wrapper only makes it slower still, so this
+     * cannot certify coverage it does not have (HANDOFF.md standing rule 11).
+     *
+     * NOTE WHAT IT DOES NOT PERTURB: the run-mode counting case above (graded against the live
+     * oracle) would ALSO catch this one, and that is deliberate corroboration, not redundancy --
+     * the historical defect was NOT on this side at all, it was clk.js's INSTRS_PER_TICK, and the
+     * matching mutation for that direction is todr_ticks_50x_too_fast below.  Neither device alone
+     * is where the bug was; a mutation on each side is the minimum that demonstrates the new check
+     * looks at the RATIO rather than at one device.
+     */
+    tir_rate_50x_too_slow() {
+        let orig = SSCVAX.prototype.tick;
+        const SKIP = 50;
+        SSCVAX.prototype.tick = function(cpu) {
+            /* per-INSTANCE counter, so the restore below has nothing to clean up on the prototype
+               and two trials cannot inherit each other's phase */
+            this._a6fSkip = ((this._a6fSkip || 0) + 1) % SKIP;
+            if (this._a6fSkip === 0) orig.call(this, cpu);
+        };
+        return () => { SSCVAX.prototype.tick = orig; };
+    },
+    /*
+     * pcjsvax-a6f, #9: the same 50x error seen from the OTHER device -- TODR ticks 50x too fast
+     * against a correct microsecond TIR, which is the literal shape of what shipped before this
+     * item (INSTRS_PER_TICK = 200 against a 10 ms tick).  Composed over clk.js's shipped tick():
+     * `orig` is called 50 times per instruction, so all of its real work happens 50 times; nothing
+     * is replaced.  If clk.js were already ticking too fast this makes it faster, never equal.
+     */
+    todr_ticks_50x_too_fast() {
+        let orig = ClkVAX.prototype.tick;
+        const EXTRA = 50;
+        ClkVAX.prototype.tick = function(cpu) {
+            for (let i = 0; i < EXTRA; i++) orig.call(this, cpu);
+        };
+        return () => { ClkVAX.prototype.tick = orig; };
     }
 };
 
@@ -1066,6 +1244,15 @@ function selfcheck()
         let stillPending = (cpu.exc.intReq[IPL_HMIN - IPL_HMIN] & (1 << INT_V_TMR0)) !== 0;
         results.push({ name: "request_not_cleared_on_ack", caught: stillPending });
     }
+    /* pcjsvax-a6f: both directions of the calibration defect, graded through proveCalibration()
+       itself -- the same function main() runs, not a private re-derivation of it, so a mutation
+       that survives here is a hole in the SHIPPED check and not in a copy of it. */
+    for (let name of ["tir_rate_50x_too_slow", "todr_ticks_50x_too_fast"]) {
+        let restore = MUTATIONS[name]();
+        let f = [];
+        try { proveCalibration(f); } finally { restore(); }
+        results.push({ name, caught: f.length > 0 });
+    }
 
     return { results, allCaught: results.every((r) => r.caught) };
 }
@@ -1110,6 +1297,15 @@ function main()
     let det = proveDeterminism();
     allFailures = allFailures.concat(det.failures);
     console.log(det.failures.length ? `  ${det.failures.length} failures` : `  MATCH across two independent runs (${det.overflows} overflows each)`);
+
+    console.log("\nCROSS-CALIBRATION (SSC TIR vs. clk.js TODR -- the ratio self-test 53 measures)");
+    let calFailures = [];
+    let cal = proveCalibration(calFailures);
+    allFailures = allFailures.concat(calFailures);
+    console.log(`  ${cal.tirCounts} TIR count(s) over ${cal.todrTicks} TODR tick(s) in ${cal.steps} ` +
+        `instruction(s) -- ${cal.todrTicks ? (cal.tirCounts / cal.todrTicks) : "n/a"} usec/tick ` +
+        `(required ${TICK_USECS})`);
+    console.log(calFailures.length ? `  ${calFailures.length} failures` : "  CALIBRATED");
 
     console.log("\nCOVERAGE FLOORS");
     for (let k in covered) {
