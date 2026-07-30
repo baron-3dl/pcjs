@@ -139,12 +139,27 @@ var LOCALDISKS = false;
 
 /*
  * Platform-agnostic way to isolate global variables (both mine and the system's).
+ *
+ * pcjsvax-de8: this used to read `(typeof window != "undefined")? {} : global`, i.e. it treated
+ * "there is no window" as "this is Node".  There is a THIRD platform where that is false -- a Web
+ * WORKER, which has neither `window` nor `global` -- and the reference threw
+ * `ReferenceError: global is not defined` at module load, taking down every module that imports
+ * this one.  That is not hypothetical: machines/dec/vax/browser/vaxworker.js runs the VAX in a
+ * Worker because rq.js reads disk blocks SYNCHRONOUSLY and `FileReaderSync` is the only synchronous
+ * lazy read a browser has, so it is the only place a 1 GB disk image can be served from at all.
+ *
+ * `globalThis` is the platform-agnostic spelling and exists in Node, in a window and in a Worker,
+ * so `window` needs nothing else.  `node` is now decided by asking about NODE rather than by
+ * asking about `window`: under Node it is still the global object (globalThis === global there),
+ * and in a browser -- window or worker -- it is still `{}`, which is what weblib.js's
+ * `globals.node.readFileSync` guard expects.
  */
+const IS_NODE = (typeof process != "undefined") && !!(process.versions && process.versions.node);
 let globals = {
     browser: (typeof window != "undefined"),
-    node: (typeof window != "undefined")? {} : global,
+    node: IS_NODE? globalThis : {},
     process: (typeof process != "undefined")? process : {},
-    window: (typeof window != "undefined")? window : global,
+    window: (typeof window != "undefined")? window : globalThis,
     document: (typeof document != "undefined")? document : {},
     pcjs: { 'machines': {}, 'components': [], 'commands': {}, 'files': null }
 };

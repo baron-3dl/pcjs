@@ -14,6 +14,42 @@ control-flow, string/queue/INDEX/PROBE and NOP slices of instruction execution, 
 point, SCB exception/interrupt dispatch with the privileged registers, and — as of `pcjsvax-c05` —
 the CPU loop that wires them together.
 
+### Running it in a browser
+
+    cd ~/projects/pcjs && python3 -m http.server 8000
+    open http://localhost:8000/machines/dec/vax/browser/vax.html
+
+Pick a `ka655x.bin` console ROM and an ODS-2 `.dsk` image, press **Start**, and OpenVMS boots to its
+`Username:` prompt in the tab.  MEASURED 2026-07-30 in headless Chrome 149: 117.6M instructions in
+36 s (~3.8M instr/s) from power-on to a bare `Username: `, and a `SYSTEM` login through to DCL.
+
+**Nothing is shipped with the page.**  HANDOFF.md §8 keeps OpenVMS media and DEC firmware out of the
+repository, so both files are supplied by the user at run time and neither is uploaded anywhere.
+
+Three things about it are load-bearing rather than stylistic, and each is explained where it lives:
+
+  - **The machine runs in a Worker** (`browser/vaxworker.js`) because `rq.js`'s image provider is
+    read SYNCHRONOUSLY from inside the instruction stream, and `FileReaderSync` over `File.slice()`
+    is the only synchronous lazy read a browser has.  On the main thread the only option would be
+    loading the whole 1 GB container.
+  - **The disk is read 64 KB at a time** through a bounded chunk cache (`browser/imageprovider.js`).
+    A boot touches ~55 MiB of a 1 GB volume with 16 MiB resident.
+  - **Writes go to an in-memory copy-on-write overlay**, not to the user's file.  That is not a
+    nicety: `rq.js`'s `attach()` reads the ABSENCE of a provider's `write` as `sim_disk`'s
+    `"rb+"`→`"rb"` fallback and forces `UNIT_RO`, and a read-only DUA0 stops OpenVMS dead at
+    `%SYSTEM-I-MOUNTVER, VAX1$DUA0: has been write-locked`.  A boot dirties ~10.9 MiB; the ceiling
+    is 128 MiB and it refuses by name rather than growing.
+
+Two harnesses grade it, and neither is in the 34-check gate:
+
+    node machines/dec/vax/tests/overlayprovider.js --volume PATH   # provider vs fileImageProvider()
+    node machines/dec/vax/tests/vaxbrowserboot.js  --volume PATH   # the boot, under Node
+    node machines/dec/vax/tests/browserboot.mjs    --volume PATH   # the PAGE, in real Chrome, over CDP
+
+It is an ADAPTER, not PCjs `Component` wiring: there is still no `.xml` machine definition and no
+`embedVAX()`.  See `browser/vaxmachine.js`'s header for why, and `pcjsvax-f23` for the framework
+step.  The terminal is a glass TTY, not a VT100 (`pcjsvax-582`).
+
 As of `pcjsvax-e49`, the **entire Base Instruction Group is implemented** — all 242 opcodes of
 `IG_BASE`/`IG_BSGFL`/`IG_BSDFL`. `tests/base_group_residual.js` is the re-runnable computation that
 proves it and fails on any drift; `cpustate.js` makes the same claim a load-time invariant of the

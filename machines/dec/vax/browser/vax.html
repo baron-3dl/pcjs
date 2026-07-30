@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<!--
+  pcjsvax-de8 / pcjsvax-ae1 -- the MicroVAX 3900 (KA655) in a browser tab, booting OpenVMS VAX from
+  a disk image the user picks off their own machine.
+
+  HOW TO RUN IT
+    cd ~/projects/pcjs && python3 -m http.server 8000
+    open http://localhost:8000/machines/dec/vax/browser/vax.html
+
+  Any static server works; there is no build step and nothing here is Jekyll-processed.  A server IS
+  required: this page loads ES modules and a module Worker, and both are blocked under file://.
+
+  NOTHING IS SHIPPED WITH IT.  HANDOFF.md section 8 keeps OpenVMS media and DEC firmware out of the
+  repository entirely, so BOTH files are supplied by the user at run time:
+    - the KA655 console ROM, ka655x.bin (128 KB), and
+    - an ODS-2 disk image for DUA0 (~1 GB).
+  Neither is uploaded anywhere; the ROM is read whole into the Worker and the disk is read LAZILY,
+  64 KB at a time, straight out of the local File.  The disk file is NEVER MODIFIED -- writes go to
+  an in-memory copy-on-write overlay (browser/imageprovider.js), which is also what keeps OpenVMS
+  from stopping at "%SYSTEM-I-MOUNTVER, VAX1$DUA0: has been write-locked".
+
+  QUERY PARAMETERS, all optional:
+    ?rom=URL        fetch the ROM instead of picking it
+    ?image=URL      back DUA0 with a ranged HTTP GET instead of a picked file.  THE SERVER MUST
+                    HONOUR `Range`; python3 -m http.server DOES NOT (see browser/vaxworker.js).
+    ?mem=16         RAM in MB
+    ?autoboot=0     leave the machine at `>>>` instead of typing `B DUA0`
+
+  The control markup keeps PCjs's binding convention (`data-binding="mountDisk"` mirrors
+  machines/dec/pdp11/rk11/default.xml's `<control type="file" binding="mountDisk"/>`) so that the
+  eventual Component wiring -- pcjsvax-f23 -- can adopt these controls rather than replace them.
+  See browser/vaxmachine.js's header for why this is an adapter and not a Component subclass today.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MicroVAX 3900 (KA655) — PCjs</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem; background: #f4f4f4; color: #111; }
+  @media (prefers-color-scheme: dark) { body { background: #16181c; color: #ddd; } }
+  h1 { font-size: 1.1rem; margin: 0 0 .5rem; font-weight: 600; }
+  .machine { max-width: 78rem; margin: 0 auto; }
+  .panel { display: flex; flex-wrap: wrap; gap: .75rem 1.25rem; align-items: end;
+           padding: .75rem; border: 1px solid #8884; border-radius: 6px; margin-bottom: .75rem; }
+  .panel label { display: block; font-size: .75rem; opacity: .75; margin-bottom: .15rem; }
+  .panel .field { display: flex; flex-direction: column; }
+  button { padding: .4rem .9rem; font: inherit; cursor: pointer; border-radius: 4px;
+           border: 1px solid #8886; background: #fff2; }
+  button:disabled { opacity: .45; cursor: default; }
+  #screen { font-family: "DejaVu Sans Mono", Menlo, Consolas, monospace; font-size: 12.5px;
+            line-height: 1.15; white-space: pre; overflow: auto; height: 34rem; margin: 0;
+            padding: .6rem .8rem; background: #04120a; color: #4ee07a; border-radius: 6px;
+            border: 1px solid #0a3; outline: none; }
+  #screen:focus { box-shadow: 0 0 0 2px #4ee07a66; }
+  #status, #attach { font-family: ui-monospace, monospace; font-size: .72rem; opacity: .8;
+                     margin-top: .4rem; white-space: pre-wrap; }
+  .err { color: #d33; font-weight: 600; }
+  .hint { font-size: .75rem; opacity: .7; margin: .3rem 0 0; }
+</style>
+</head>
+<body>
+<div class="machine">
+  <h1>DEC MicroVAX 3900 &mdash; KA655 &mdash; OpenVMS VAX</h1>
+
+  <div class="panel">
+    <div class="field">
+      <label for="rom">Console ROM (ka655x.bin)</label>
+      <input type="file" id="rom" data-binding="loadRom">
+    </div>
+    <div class="field">
+      <label for="disk">DUA0 disk image (.dsk)</label>
+      <input type="file" id="disk" data-binding="mountDisk">
+    </div>
+    <div class="field">
+      <label for="mem">RAM</label>
+      <select id="mem" data-binding="memSize">
+        <option value="16" selected>16 MB</option>
+        <option value="32">32 MB</option>
+        <option value="64">64 MB</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="autoboot">Auto-boot</label>
+      <input type="checkbox" id="autoboot" data-binding="autoBoot" checked>
+    </div>
+    <button id="run" data-binding="run" disabled>Start</button>
+    <button id="pause" data-binding="pause" disabled>Pause</button>
+  </div>
+
+  <pre id="screen" tabindex="0">Pick a ka655x.bin ROM and an ODS-2 .dsk image, then press Start.
+
+The disk is read lazily, 64 KB at a time, and is never modified: writes land in an
+in-memory copy-on-write overlay.  Click this screen to give it the keyboard.
+
+A boot to the OpenVMS login prompt is a few hundred million instructions and takes
+a couple of minutes; output streams as it goes.</pre>
+  <p class="hint">Click the screen to type. Backspace sends DEL (VMS rubout); Ctrl-key combinations are sent as control characters.</p>
+  <div id="attach"></div>
+  <div id="status"></div>
+</div>
+
+<script type="module">
+import { VaxTerminal } from "./vaxterm.js";
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+
+let worker = null, romBytes = null, diskFile = null, running = false, started = false;
+
+const term = new VaxTerminal($("screen"), (text) => {
+    if (worker && started) worker.postMessage({cmd: "input", text});
+});
+/* One render per frame, not one per message: a boot posts console bytes ~60 times a second and
+   re-rendering the scrollback on each one is the only thing in this page that could drop frames. */
+(function frame() { term.render(); requestAnimationFrame(frame); })();
+
+function say(html, cls) { $("status").innerHTML = `<span class="${cls || ""}">${html}</span>`; }
+function mib(n) { return (n / (1 << 20)).toFixed(1) + " MiB"; }
+
+function readyToRun() { $("run").disabled = !(romBytes && (diskFile || params.get("image"))); }
+
+$("rom").addEventListener("change", async (e) => {
+    let f = e.target.files[0];
+    if (!f) return;
+    romBytes = await f.arrayBuffer();                       /* 128 KB: read whole, unlike the disk */
+    say(`ROM ${f.name}, ${romBytes.byteLength} bytes`);
+    readyToRun();
+});
+$("disk").addEventListener("change", (e) => {
+    diskFile = e.target.files[0] || null;
+    if (diskFile) say(`DUA0 ${diskFile.name}, ${diskFile.size.toLocaleString()} bytes ` +
+                      `(read lazily; this file will not be modified)`);
+    readyToRun();
+});
+
+if (params.get("rom")) {
+    fetch(params.get("rom")).then((r) => r.arrayBuffer()).then((b) => {
+        romBytes = b; say(`ROM ${params.get("rom")}, ${b.byteLength} bytes`); readyToRun();
+    }).catch((e) => say(`ROM fetch failed: ${e}`, "err"));
+}
+if (params.get("mem")) $("mem").value = params.get("mem");
+if (params.get("autoboot") === "0") $("autoboot").checked = false;
+
+$("run").addEventListener("click", () => {
+    if (started) return;
+    started = true; running = true;
+    $("run").disabled = true; $("pause").disabled = false;
+    $("rom").disabled = $("disk").disabled = $("mem").disabled = $("autoboot").disabled = true;
+    term.clear();
+    $("screen").focus();
+
+    worker = new Worker("./vaxworker.js", {type: "module"});
+    worker.onerror = (e) => {
+        /* filename/lineno are included because the failure this catches in practice is a MODULE
+           that does not load in a Worker at all, and "Worker error: <message>" alone does not say
+           which file (see machines/modules/v2/defines.js's globals block). */
+        window.vaxError = `${e.message} (${e.filename}:${e.lineno})`;
+        say(`Worker error: ${window.vaxError}`, "err");
+    };
+    worker.onmessage = (e) => {
+        let m = e.data;
+        switch (m.type) {
+        case "out":
+            term.write(new Uint8Array(m.bytes));
+            break;
+        case "info": {
+            let a = m.attach;
+            $("attach").textContent =
+                `DUA0  ${m.diskName || "(no disk)"}\n` +
+                (a ? `      container ${a.containerBytes.toLocaleString()} bytes; volume declares ` +
+                     `${a.filesystemBytes === undefined ? "(not ODS-2)" : a.filesystemBytes.toLocaleString()}; ` +
+                     `unit ${a.capacBefore.toLocaleString()} -> ${a.capacAfter.toLocaleString()} blocks, ` +
+                     `${a.readOnly ? "READ-ONLY (OpenVMS will stop at MOUNTVER)" : "read/write via copy-on-write overlay"}\n` : "") +
+                `RAM   ${(m.memBytes / (1 << 20)).toFixed(0)} MB\n` +
+                `Bus   ${m.devices.join(", ")}`;
+            break;
+        }
+        case "stat": {
+            let d = m.disk;
+            say(`${(m.steps / 1e6).toFixed(1)}M instructions in ${m.elapsed.toFixed(0)}s ` +
+                `(${m.mips.toFixed(2)}M instr/s)` +
+                (d ? ` | disk ${d.reads} reads ${d.writes} writes, ${mib(d.rawBytes)} of the image touched` +
+                     ` | overlay ${mib(d.overlayBytes)} / ${mib(d.overlayCeilingBytes)}` +
+                     ` | cache ${mib(d.cacheResidentBytes)} / ${mib(d.cacheCeilingBytes)}` : "") +
+                (m.typed.length ? ` | auto-typed: ${m.typed.join(", ")}` : ""));
+            break;
+        }
+        case "stopped":
+            window.vaxError = `HALTED: ${m.reason}`;
+            say(`HALTED: ${m.reason}`, "err");
+            running = false; $("pause").disabled = true;
+            break;
+        case "error":
+            window.vaxError = m.message;
+            say(`ERROR: ${m.message}`, "err");
+            running = false; $("pause").disabled = true;
+            break;
+        }
+    };
+    worker.postMessage({
+        cmd: "start",
+        rom: romBytes,
+        disk: diskFile ? {file: diskFile} : (params.get("image") ? {url: params.get("image")} : null),
+        memMB: parseInt($("mem").value, 10),
+        autoBoot: $("autoboot").checked
+    }, [romBytes]);
+    romBytes = null;                                        /* transferred; the Worker owns it now */
+});
+
+$("pause").addEventListener("click", () => {
+    if (!worker) return;
+    running = !running;
+    worker.postMessage({cmd: running ? "resume" : "pause"});
+    $("pause").textContent = running ? "Pause" : "Resume";
+});
+
+/* Exposed so a headless run (tests/browserboot.mjs) can drive this page over CDP without
+   synthesising key events -- it reads term.lines and calls vaxType(). */
+window.vaxTerm = term;
+window.vaxType = (s) => { if (worker && started) worker.postMessage({cmd: "input", text: s}); };
+window.vaxStatus = () => $("status").textContent;
+window.vaxError = null;
+</script>
+</body>
+</html>
