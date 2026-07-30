@@ -1,28 +1,42 @@
 <!DOCTYPE html>
 <!--
-  pcjsvax-de8 / pcjsvax-ae1 -- the MicroVAX 3900 (KA655) in a browser tab, booting OpenVMS VAX from
-  a disk image the user picks off their own machine.
+  pcjsvax-de8 / pcjsvax-ae1 / pcjsvax-6e1 -- the MicroVAX 3900 (KA655) in a browser tab, booting
+  OpenVMS VAX either from a disk image the user picks off their own machine, or from one FETCHED
+  over plain HTTP with no file picker at all.
 
   HOW TO RUN IT
     cd ~/projects/pcjs && python3 -m http.server 8000
     open http://localhost:8000/machines/dec/vax/browser/vax.html
+    # or, no picker at all, from the vaxdisks convention (see _developer.yml):
+    open "http://localhost:8000/machines/dec/vax/browser/vax.html?rom=/disks/vaxdisks/ka655x.bin&diskgz=/disks/vaxdisks/vms55-rd54.dsk.gz"
 
   Any static server works; there is no build step and nothing here is Jekyll-processed.  A server IS
   required: this page loads ES modules and a module Worker, and both are blocked under file://.
 
-  NOTHING IS SHIPPED WITH IT.  HANDOFF.md section 8 keeps OpenVMS media and DEC firmware out of the
-  repository entirely, so BOTH files are supplied by the user at run time:
-    - the KA655 console ROM, ka655x.bin (128 KB), and
-    - an ODS-2 disk image for DUA0 (~1 GB).
-  Neither is uploaded anywhere; the ROM is read whole into the Worker and the disk is read LAZILY,
-  64 KB at a time, straight out of the local File.  The disk file is NEVER MODIFIED -- writes go to
-  an in-memory copy-on-write overlay (browser/imageprovider.js), which is also what keeps OpenVMS
-  from stopping at "%SYSTEM-I-MOUNTVER, VAX1$DUA0: has been write-locked".
+  BY DEFAULT NOTHING IS SHIPPED WITH THE PAGE.  Both the ROM and the disk are supplied by the user
+  at run time via the file pickers -- HANDOFF.md section 8's user-supplied-file path, which MUST
+  keep working regardless of what else this page can do.  pcjsvax-6e1 ADDS a second path (`?rom=`
+  and `?diskgz=`, see below) that fetches media the fork itself hosts, so a visitor needs to pick
+  nothing.  Either way the disk is read LAZILY once attached -- 64 KB at a time out of a `File`-like
+  object -- and is NEVER MODIFIED: writes go to an in-memory copy-on-write overlay
+  (browser/imageprovider.js), which is also what keeps OpenVMS from stopping at
+  "%SYSTEM-I-MOUNTVER, VAX1$DUA0: has been write-locked".
 
   QUERY PARAMETERS, all optional:
     ?rom=URL        fetch the ROM instead of picking it
-    ?image=URL      back DUA0 with a ranged HTTP GET instead of a picked file.  THE SERVER MUST
-                    HONOUR `Range`; python3 -m http.server DOES NOT (see browser/vaxworker.js).
+    ?diskgz=URL     fetch a GZIP-COMPRESSED disk image with ONE plain GET (no Range needed -- see
+                    below), decompress it in the browser with DecompressionStream, and hand the
+                    result to DUA0 exactly like a picked file (same lazy readRaw/overlay path).
+                    This is the shipping path for pcjsvax-545's demo: the VMS 5.5 system disk is
+                    159,334,400 bytes raw / 19.1 MB gzipped, nowhere near GitHub's 100 MB per-file
+                    limit or ~1 GB Pages cap, so one whole-file fetch is simplest thing that works.
+                    Chunking was considered and is NOT needed at this size (pcjsvax-6e1); revisit
+                    only if tab memory proves to be a real problem on real hardware.
+    ?image=URL      back DUA0 with a RANGED HTTP GET instead of a picked file.  THE SERVER MUST
+                    HONOUR `Range`; python3 -m http.server DOES NOT, and neither does GitHub
+                    Pages/raw.githubusercontent -- which is exactly why this is NOT the hosted-demo
+                    path (pcjsvax-ba6) and `?diskgz=` exists instead.  Kept for a Range-capable
+                    self-hosted server, where lazy fetching can beat pulling the whole image.
     ?mem=16         RAM in MB
     ?autoboot=0     leave the machine at `>>>` instead of typing `B DUA0`
 
@@ -90,6 +104,7 @@
   </div>
 
   <pre id="screen" tabindex="0">Pick a ka655x.bin ROM and an ODS-2 .dsk image, then press Start.
+(Or open this page with ?rom=URL&diskgz=URL to fetch both -- no picker needed.)
 
 The disk is read lazily, 64 KB at a time, and is never modified: writes land in an
 in-memory copy-on-write overlay.  Click this screen to give it the keyboard.
@@ -139,6 +154,38 @@ if (params.get("rom")) {
     fetch(params.get("rom")).then((r) => r.arrayBuffer()).then((b) => {
         romBytes = b; say(`ROM ${params.get("rom")}, ${b.byteLength} bytes`); readyToRun();
     }).catch((e) => say(`ROM fetch failed: ${e}`, "err"));
+}
+
+/**
+ * fetchGzipDisk(url)
+ *
+ * pcjsvax-6e1's new backend: ONE plain GET (no Range) of a gzip-compressed disk image, decompressed
+ * in the browser with the standard `DecompressionStream`, producing a `File`.  A `File` is used
+ * (not a bare `Blob`) purely so the result carries a `.name` for the status line and the attach
+ * report; vaxworker.js's `fileBacking()` only ever calls `.size` and `.slice()`, both of which
+ * `Blob` already has, so THIS IS THE SAME CODE PATH AS A PICKED FILE from vaxworker.js onward --
+ * no change to vaxworker.js, vaxmachine.js or imageprovider.js was needed to add this backend.
+ * The decompressed bytes are held in memory (a 159 MB VMS 5.5 disk decompresses to 159 MB), then
+ * read lazily 64 KB at a time from there on, same as any other picked file.
+ */
+async function fetchGzipDisk(url)
+{
+    let resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching ${url}`);
+    let stream = resp.body.pipeThrough(new DecompressionStream("gzip"));
+    let blob = await new Response(stream).blob();
+    let name = url.split("/").pop().replace(/\.gz$/i, "");
+    return new File([blob], name, {type: "application/octet-stream"});
+}
+
+if (params.get("diskgz")) {
+    say(`fetching ${params.get("diskgz")} ...`);
+    fetchGzipDisk(params.get("diskgz")).then((f) => {
+        diskFile = f;
+        say(`DUA0 ${f.name}, ${f.size.toLocaleString()} bytes ` +
+            `(fetched + decompressed in the browser; this file will not be modified)`);
+        readyToRun();
+    }).catch((e) => say(`disk fetch failed: ${e}`, "err"));
 }
 if (params.get("mem")) $("mem").value = params.get("mem");
 if (params.get("autoboot") === "0") $("autoboot").checked = false;
