@@ -98,8 +98,20 @@ import { fileURLToPath } from "url";
 
 import { VAX } from "../modules/v2/defines.js";
 import { VAXStop, ROM_MAGIC_BYTE } from "../modules/v2/cpustate.js";
-import ClkVAX, { INSTRS_PER_TICK } from "../modules/v2/clk.js";
+import ClkVAX, { INSTRS_PER_TICK, USECS_PER_INSTR } from "../modules/v2/clk.js";
+import { IdleThrottle } from "../modules/v2/idle.js";        /* pcjsvax-af8 */
 import { makeRomMachine } from "./rommachine.js";
+
+/** pcjsvax-af8.  Node's only SYNCHRONOUS sleep, and this probe's run loop is synchronous.  The
+    buffer is never written, so the wait always runs to its timeout; `Atomics.wait` on the main
+    thread requires a SharedArrayBuffer, which is why it is not a plain Int32Array. */
+const IDLE_SLEEPER = new Int32Array(new SharedArrayBuffer(4));
+
+/** Bound on ONE idle wait, milliseconds.  See browser/vaxworker.js's IDLE_WAIT_MAX_MS for the
+    reasoning; it is throttling, not timekeeping, so a short wait costs accuracy in nothing. */
+const IDLE_WAIT_MAX_MS = 50;
+
+
 import {
     RQVAX, RQ_BASE, IOLN_RQ, RQDX3_CTYPE, fileImageProvider, vaxRepo, hex
 } from "./mscpharness.js";
@@ -478,6 +490,14 @@ function run(opts)
         qbus: opts.noDisk ? undefined : makeQbus(opts.volume, opts.writable, qreport)
     });
     let {cpu, consoleDev} = machine;
+    /* pcjsvax-af8: guest-idle detection, ON by default here.  This probe's whole job is to sit at
+       a login prompt for minutes at a time; without it that is minutes of a pinned core.  `--no-idle`
+       turns it off, which is how the before/after measurement in the item was taken. */
+    cpu.idleEnable = !opts.noIdle;
+    if (!cpu.setIdleMode(opts.idleMode)) {
+        console.log(`vmsbootprobe: --idle-mode ${opts.idleMode} is not an OS idle.js knows`);
+        process.exit(2);
+    }
     cpu.reset();
     cpu.boot(opts.magicByte);
 
@@ -500,6 +520,10 @@ function run(opts)
        sampled once per chunk, plus the number of quiet instructions a held keystroke still owes. */
     let lastOutLen = 0, lastOutStep = 0, holdQuiet = 0;
     let peakHeap = 0, t0 = Date.now(), deadline = t0 + opts.maxSeconds * 1000, lastBeat = 0;
+    let idleSleptMs = 0, idleWaits = 0;                 /* pcjsvax-af8, reported at the end */
+    /* HOW LONG to sleep is a measured host rate, not the guest time skipped -- see
+       modules/v2/idle.js's IdleThrottle for the measurement that decided that. */
+    let throttle = new IdleThrottle({maxSleepMs: IDLE_WAIT_MAX_MS});
     /* Console output length at the moment each rule fired, so the transcript can be split at the
        exact byte the probe typed rather than at a string search done afterwards. */
     let marks = [];
@@ -519,6 +543,7 @@ function run(opts)
 
     try {
         while (steps < opts.maxSteps) {
+            let chunkT0 = Date.now();               /* pcjsvax-af8: pure execution time, no sleep in it */
             /* Two copies of the same loop rather than a per-instruction `if`: the PC capture is a
                diagnostic window measured in thousands of instructions inside a run measured in
                hundreds of millions, and a branch on every one of those would be paid by every run
@@ -535,20 +560,40 @@ function run(opts)
                 for (let i = 0; i < CHUNK && steps < opts.maxSteps; i++) { cpu.stepCPU(1); steps++; }
             }
 
-            /* Console quiescence, sampled once per chunk -- the clock a `quiet` rule waits on. */
-            if (consoleDev.output.length !== lastOutLen) { lastOutLen = consoleDev.output.length; lastOutStep = steps; }
+            /*
+             * pcjsvax-af8.  `idleUsecs` is guest time the CPU fast-forwarded through rather than
+             * executing.  The GUEST CLOCK HAS ALREADY ADVANCED BY IT -- this sleep is pure host
+             * throttling, and skipping the sleep would keep correct time and burn a core, which is
+             * exactly what this item exists to stop.  Atomics.wait on a zeroed SharedArrayBuffer is
+             * the only SYNCHRONOUS sleep Node has, and synchronous is required: this is a plain
+             * `while` loop with no event loop to return to.
+             */
+            let idleUs = cpu.takeIdleUsecs();
+            if (idleUs === 0) throttle.noteBusy(CHUNK, Date.now() - chunkT0);
+            let ms = throttle.sleepMsFor(idleUs / USECS_PER_INSTR);
+            if (ms > 0) { idleSleptMs += ms; idleWaits++; Atomics.wait(IDLE_SLEEPER, 0, 0, ms); }
+
+            /* Console quiescence, sampled once per chunk -- the clock a `quiet` rule waits on.
+               GUEST TIME, not instructions retired: see browser/vaxmachine.js's pumpInput() for the
+               measurement (pcjsvax-af8).  `cpu.nTotalCycles` counts elided instructions too, so a
+               `quiet` threshold means the same number of guest microseconds whether the machine
+               idled through them or executed them. */
+            let guestNow = cpu.nTotalCycles;
+            if (consoleDev.output.length !== lastOutLen) { lastOutLen = consoleDev.output.length; lastOutStep = guestNow; }
 
             /* Feed one character at a time, and only into an empty RXDB.  A keystroke with a
                `quiet` requirement is HELD until the console has been silent that long (see
                INPUT_RULES); the hold is released once and does not re-arm mid-string, because a
                reply the guest is echoing would otherwise stall its own remaining characters. */
             if (pending !== null && holdQuiet > 0) {
-                if (steps - lastOutStep >= holdQuiet) holdQuiet = 0;
+                if (guestNow - lastOutStep >= holdQuiet) holdQuiet = 0;
             } else if (pending !== null) {
                 while (pendingIdx < pending.length && !(consoleDev.rxcs & CSR_DONE)) {
                     consoleDev.injectChar(pending.charCodeAt(pendingIdx++) & 0xFF);
                 }
-                if (pendingIdx >= pending.length) { pending = null; pendingIdx = 0; }
+                /* Retire the hold with the string it belonged to -- see browser/vaxmachine.js's
+                   pumpInput() for what leaving it set costs a human typing at the prompt. */
+                if (pendingIdx >= pending.length) { pending = null; pendingIdx = 0; holdQuiet = 0; }
             } else if (fired.size < INPUT_RULES.length) {
                 let text = "";
                 for (let k = scanFrom; k < consoleDev.output.length; k++) {
@@ -663,7 +708,10 @@ function run(opts)
         rulesLeft: INPUT_RULES.filter((r) => !fired.has(r.name)).map((r) => r.name),
         pc: cpu.regs[15] >>> 0, psl: cpu.psl >>> 0, elapsedMs: Date.now() - t0, peakHeap,
         deviceNames: machine.devices.map((d) => d.name),
-        memSize: machine.memSize, qreport
+        memSize: machine.memSize, qreport,
+        /* pcjsvax-af8 */
+        idleCount: cpu.idleCount, idleSkipped: cpu.idleSkipped,
+        idleSites: [...cpu.idleSites.entries()], idleSleptMs, idleWaits
     };
 }
 
@@ -680,6 +728,9 @@ function main()
         quiet: hasArg("--quiet"),
         heartbeat: parseInt(getArg("--heartbeat", "50000000"), 10),
         tickScale: parseInt(getArg("--tick-scale", "1"), 10),
+        /* pcjsvax-af8.  Idling is ON here; `--no-idle` is what the before/after measurement used. */
+        noIdle: hasArg("--no-idle"),
+        idleMode: getArg("--idle-mode", "VMS"),
         consoleFile: getArg("--console-file", null),
         magicByte: parseInt(getArg("--magic", String(ROM_MAGIC_BYTE)), 10),
         /* pcjsvax-6c9's instrument.  See makeInputTrace(). */
@@ -723,6 +774,8 @@ function main()
     console.log(`  clk       INSTRS_PER_TICK ${INSTRS_PER_TICK} x tick-scale ${opts.tickScale} = ` +
                 `${INSTRS_PER_TICK * opts.tickScale} instructions per 100 Hz tick, i.e. ` +
                 `${INSTRS_PER_TICK * opts.tickScale * 100} instructions per GUEST second`);
+    console.log(`  idle      ${opts.noIdle ? "OFF (--no-idle)" : "ON, mode " + opts.idleMode.toUpperCase()}` +
+                ` -- pcjsvax-af8, modules/v2/idle.js`);
 
     let r = run(opts);
 
@@ -737,6 +790,14 @@ function main()
     console.log(`  ran       ${r.steps} instructions in ${(r.elapsedMs / 1000).toFixed(1)} s ` +
         `(${(r.steps / Math.max(1, r.elapsedMs) / 1000).toFixed(2)} M/s), peak heap ` +
         `${(r.peakHeap / (1 << 20)).toFixed(0)} MB`);
+    /* pcjsvax-af8.  Both halves are reported, because either alone is misleading: instructions
+       ELIDED is what the guest clock was advanced by, and milliseconds SLEPT is what the host got
+       back.  A run with a large elision and no sleep is a run that saved nothing. */
+    console.log(`  idle      ${r.idleCount} skips over ${r.idleSkipped} elided instructions ` +
+        `(${(100 * r.idleSkipped / Math.max(1, r.steps + r.idleSkipped)).toFixed(1)}% of guest time), ` +
+        `${r.idleWaits} waits totalling ${(r.idleSleptMs / 1000).toFixed(1)} s ` +
+        `(${(100 * r.idleSleptMs / Math.max(1, r.elapsedMs)).toFixed(1)}% of wall clock)` +
+        (r.idleSites.length ? `; sites ${r.idleSites.map(([k, v]) => `${k}=${v}`).join(" ")}` : ""));
     console.log(`  stopped   ${r.stop} at step ${r.stopStep}, PC=${hex(r.pc)} PSL=${hex(r.psl)}`);
     console.log(`  typed     ${r.sentNames.length ? r.sentNames.join(", ") : "(nothing)"}` +
         `${r.rulesLeft.length ? `; NEVER FIRED: ${r.rulesLeft.join(", ")}` : ""}`);
