@@ -108,7 +108,41 @@ const CSR_DONE = 0x0080;
  */
 const INPUT_RULES = [
     {name: "console-prompt", match: ">>>", send: "B DUA0\r"},
-    {name: "vms-date-prompt", match: "PLEASE ENTER DATE AND TIME", send: "30-JUL-2026 12:00\r"}
+    {name: "vms-date-prompt", match: "PLEASE ENTER DATE AND TIME", send: "30-JUL-2026 12:00\r"},
+    /* The V7.3 INSTALLATION procedure asks the same question in different words and different case
+       ("* Please enter the date and time (DD-MMM-YYYY HH:MM)"), so the rule above never fires on it
+       and the boot stalls at the prompt.  Matched on the mixed-case wording rather than folding case
+       on the rule above, because folding case would let one rule swallow both prompts and make the
+       installer and the booted system indistinguishable in the transcript. */
+    {name: "vms-install-date-prompt", match: "Please enter the date and time", send: "30-JUL-2026 12:00\r"},
+    /* MEASURED 2026-07-30: when startup finishes, the console goes SILENT and stays silent -- the
+       last thing printed is the startup job's accounting block, ending "Elapsed time:".  That is not
+       a hang and not a divergence: LOGINOUT on OPA0 is waiting for a keystroke before it paints the
+       login prompt, exactly as a real console terminal does.  Nothing in this probe types unless a
+       rule tells it to, so without this the run parks forever one RETURN short of the prompt.
+       Matched on "Elapsed time:" because it is the LAST line of that block; matching the earlier
+       "job terminated" fires mid-block and the RETURN is swallowed before LOGINOUT is listening. */
+    {name: "post-startup-wakeup", match: "Elapsed time:", send: "\r"}
+];
+
+/**
+ * REPEATABLE rules, consulted only when no one-shot rule above matches.
+ *
+ * The OpenVMS VAX V7.3 installation procedure is a long sequence of questions, and the volume Baron
+ * supplied is the FIRST-BOOT half of a DEC installation: the media is a BACKUP saveset restored onto
+ * the disk, and booting it runs a procedure that self-assembles the system.  Most of its questions
+ * want their own bracketed default, so `[...]:` answered with a bare RETURN carries the procedure a
+ * long way without this file having to have transcribed every prompt in advance.
+ *
+ * `]: ` is deliberately narrow.  It is the tail of DEC's own defaulted-prompt convention
+ * ("* Enter the volume label for this system disk [OVMSVAXSYS]: "), so it appears when input is
+ * WANTED rather than in ordinary output.  A question with no bracketed default -- a bare Y/N -- will
+ * NOT match, and the run will park at it; that is intended, because guessing an unprompted yes/no
+ * during an OS installation is how you silently answer something that mattered.  When a run parks,
+ * read the console file, add a one-shot rule for that specific question, and re-run.
+ */
+const REPEAT_RULES = [
+    {name: "accept-bracketed-default", match: "]: ", send: "\r"}
 ];
 
 function getArg(name, def) { let i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] : def; }
@@ -238,7 +272,7 @@ function run(opts)
     };
 
     let steps = 0, stop = null, stopStep = null;
-    let ruleIdx = 0, scanFrom = 0, pending = null, pendingIdx = 0, sent = [];
+    let fired = new Set(), scanFrom = 0, pending = null, pendingIdx = 0, sent = [];
     let peakHeap = 0, t0 = Date.now(), deadline = t0 + opts.maxSeconds * 1000, lastBeat = 0;
     /* Console output length at the moment each rule fired, so the transcript can be split at the
        exact byte the probe typed rather than at a string search done afterwards. */
@@ -258,19 +292,48 @@ function run(opts)
                     consoleDev.injectChar(pending.charCodeAt(pendingIdx++) & 0xFF);
                 }
                 if (pendingIdx >= pending.length) { pending = null; pendingIdx = 0; }
-            } else if (ruleIdx < INPUT_RULES.length) {
+            } else if (fired.size < INPUT_RULES.length) {
                 let text = "";
                 for (let k = scanFrom; k < consoleDev.output.length; k++) {
                     text += String.fromCharCode(consoleDev.output[k]);
                 }
-                let r = INPUT_RULES[ruleIdx];
-                let at = text.indexOf(r.match);
-                if (at >= 0) {
-                    scanFrom = scanFrom + at + r.match.length;
-                    marks.push({rule: r.name, atByte: consoleDev.output.length, atStep: steps});
-                    sent.push(r);
-                    pending = r.send; pendingIdx = 0;
-                    ruleIdx++;
+                /* ANY not-yet-fired rule may match, not just the next one in the list.  The original
+                   version advanced a single `ruleIdx` and so required the transcript to hit the rules
+                   in the order written -- which was an accident of there being exactly two rules for
+                   one volume, not a design requirement, and it silently wedges on any other volume:
+                   MEASURED 2026-07-30, the OpenVMS V7.3 INSTALLATION disk never prints the booted
+                   system's "PLEASE ENTER DATE AND TIME", so rule 2 never fired, rule 3 was never
+                   evaluated, and the run sat at the installer's own date prompt until the cap.
+                   One-shot semantics -- the property pcjsvax-459 records as necessary, because a
+                   re-firing `>>>` rule injects `B DUA0` into VMS's date prompt and halts the system
+                   -- are preserved by `fired`, which retires each rule permanently.  The EARLIEST
+                   match in the stream wins, so a rule cannot jump the queue on text that appeared
+                   before an earlier prompt. */
+                let best = null, bestAt = -1;
+                for (let r of INPUT_RULES) {
+                    if (fired.has(r.name)) continue;
+                    let at = text.indexOf(r.match);
+                    if (at >= 0 && (bestAt < 0 || at < bestAt)) { best = r; bestAt = at; }
+                }
+                /* REPEATABLE rules are consulted ONLY when no one-shot rule matched, so a specific
+                   answer always beats the generic one no matter where each appears in the stream.
+                   They exist for the OpenVMS installation procedure, which asks a long sequence of
+                   questions that mostly want their own default -- one-shot rules cannot answer a
+                   prompt shape that recurs.  A repeatable rule never retires, so its pattern must be
+                   something that only appears when input is actually wanted; `scanFrom` still
+                   advances past each match, so it cannot re-answer text it has already consumed. */
+                if (!best) {
+                    for (let r of REPEAT_RULES) {
+                        let at = text.indexOf(r.match);
+                        if (at >= 0 && (bestAt < 0 || at < bestAt)) { best = r; bestAt = at; }
+                    }
+                }
+                if (best) {
+                    scanFrom = scanFrom + bestAt + best.match.length;
+                    marks.push({rule: best.name, atByte: consoleDev.output.length, atStep: steps});
+                    sent.push(best);
+                    fired.add(best.name);
+                    pending = best.send; pendingIdx = 0;
                 }
             }
 
@@ -284,6 +347,17 @@ function run(opts)
                 process.stderr.write(`  .. ${(steps / 1e6).toFixed(0)}M steps, ` +
                     `${((Date.now() - t0) / 1000).toFixed(0)} s, console ${consoleDev.output.length} bytes, ` +
                     `PC=${hex(cpu.regs[15] >>> 0)}\n`);
+                /* --console-file writes the stream so far on every heartbeat.  Without it the console
+                   is only readable once the run ENDS, which makes discovering an interactive prompt a
+                   one-guess-per-run loop -- and the OpenVMS installer is a sequence of prompts nobody
+                   has transcribed yet.  Written whole rather than appended so the file is always a
+                   valid prefix of the stream even if the run is killed mid-write.  Observation only:
+                   it never touches the machine, and the run's own result still carries the bytes. */
+                if (opts.consoleFile) {
+                    try {
+                        fs.writeFileSync(opts.consoleFile, Buffer.from(consoleDev.output));
+                    } catch (e) { /* a probe must not die because its observation channel failed */ }
+                }
             }
             if (Date.now() > deadline) { stop = "WALL-CLOCK CAP"; stopStep = steps; break; }
         }
@@ -317,6 +391,7 @@ function main()
         quiet: hasArg("--quiet"),
         heartbeat: parseInt(getArg("--heartbeat", "50000000"), 10),
         tickScale: parseInt(getArg("--tick-scale", "1"), 10),
+        consoleFile: getArg("--console-file", null),
         magicByte: parseInt(getArg("--magic", String(ROM_MAGIC_BYTE)), 10)
     };
     opts.memBytes = (opts.memMB * 1024 * 1024) >>> 0;
