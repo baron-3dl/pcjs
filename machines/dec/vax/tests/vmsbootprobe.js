@@ -74,6 +74,19 @@
  *     --no-disk         build the SAME machine with NO RQ window at all, the control run
  *     --tick-scale N    divide the interval timer's rate by N (see makeTickScale)
  *     --quiet           omit the escaped byte-by-byte stream
+ *     --console-file P  rewrite the console stream to P on every heartbeat (watch a run live)
+ *
+ *   pcjsvax-6c9's instrument -- all OFF by default, all observation only (see makeInputTrace):
+ *     --trace-input     wrap the console model, the interrupt seam and the dispatch chokepoint
+ *     --trace-arm NAME  arm the log when this INPUT_RULES rule fires (default post-startup-wakeup)
+ *     --trace-limit N / --trace-pre N       bounds on the log after / ring before arming
+ *     --trace-exc-after N   after the TTI vector dispatches, log EVERY exception/interrupt for N
+ *     --trace-pc N      capture N executed PCs from the injection, for diffing against SIMH's
+ *                       own `SET CPU HISTORY` -- this is how pcjsvax-6c9 found its divergence
+ *     --trace-stop-after N  end the run N instructions after arming
+ *     --snap-pc HEX --snap-reg N --snap-len N   one register+memory snapshot the first time the
+ *                       guest is about to execute HEX, to diff against SIMH stopped on a BREAK
+ *     --dump-va HEX --dump-len N   guest virtual memory, read in kernel mode after the run
  */
 
 import fs from "fs";
@@ -99,6 +112,10 @@ const DEFAULT_VOLUME = "/home/baron/vax1/data/d0.dsk";
     "has the ROM taken the last character yet". */
 const CSR_DONE = 0x0080;
 
+/** console.js's SCB_TTI, the console-receive SCB offset (vax_defs.h:397).  Read ONLY by the
+    pcjsvax-6c9 instrument, to recognise the dispatch it is watching for. */
+const SCB_TTI_VEC = 0x00F8;
+
 /**
  * THE INPUT SCRIPT, and it is pcjsvax-459's `expect`/`send` list transcribed one-for-one.
  *
@@ -122,7 +139,19 @@ const INPUT_RULES = [
        rule tells it to, so without this the run parks forever one RETURN short of the prompt.
        Matched on "Elapsed time:" because it is the LAST line of that block; matching the earlier
        "job terminated" fires mid-block and the RETURN is swallowed before LOGINOUT is listening. */
-    {name: "post-startup-wakeup", match: "Elapsed time:", send: "\r"}
+    /* `quiet` -- MEASURED 2026-07-30, pcjsvax-6c9, and it is the whole difference between this
+       rule waking VMS and being swallowed.  "Elapsed time:" is the last LINE of the accounting
+       block but not its last BYTE: the value, the CRLF and the trailing blank line are still
+       queued in the terminal driver's output path when the match fires, so a character injected
+       at the very next chunk boundary arrives at a console the driver considers BUSY WRITING.
+       VMS's console ISR (SYSLOA655 at 80ACA689) reaches `TSTW 70(R1)` on the OPA0 UCB and takes
+       the not-zero arm, which is NOT the unsolicited-input arm that notifies the job controller.
+       The oracle never hits this because SIMH's own `tti_svc` polls the keyboard on the CALIBRATED
+       100 Hz clock -- on a modern host that is ~1e6 instructions after `expect` fired, by which
+       time the line has long drained.  `quiet` reproduces that by construction rather than by
+       luck: hold the keystroke until the console has emitted NOTHING for this many instructions,
+       which is also what a human at a terminal does. */
+    {name: "post-startup-wakeup", match: "Elapsed time:", send: "\r", quiet: 200000}
 ];
 
 /**
@@ -240,6 +269,161 @@ function makeTickScale(n)
 }
 
 /**
+ * makeInputTrace(cpu, consoleDev, getStep, opts)
+ *
+ * pcjsvax-6c9's INSTRUMENT.  Observation only, and it COMPOSES over the shipped instance methods
+ * rather than replacing them (HANDOFF.md standing rule 11): every wrapper calls the original and
+ * reports what the original did.  Nothing here changes a register, an interrupt request or a clock,
+ * so a traced run and an untraced run execute the same instructions.
+ *
+ * It answers, by running, the three questions pcjsvax-6c9 asks:
+ *   1. what RXCS (and therefore CSR_IE) is at the instant injectChar() lands;
+ *   2. whether the TTI request that injectChar() raises is ever ARBITRATED (getVector at IPL 0x14)
+ *      and DISPATCHED (intexc with that vector);
+ *   3. what the guest does with RXCS/RXDB afterwards.
+ *
+ * Tracing is ARMED by name -- the first time the named input rule fires -- so the pre-boot traffic
+ * (thousands of ROM polls) does not swamp the window that matters.  A bounded ring keeps the last
+ * `pre` events before arming, and the log stops at `limit` events after it; counters keep running
+ * either way, so a truncated log still reports totals.
+ *
+ * @param {Object} cpu
+ * @param {Object} consoleDev
+ * @param {function():number} getStep
+ * @param {{limit:number, pre:number}} opts
+ * @returns {Object} the trace state (`arm(name)`, `counts`, `pre`, `events`)
+ */
+function makeInputTrace(cpu, consoleDev, getStep, opts)
+{
+    let exc = cpu.exc;
+    let st = {armed: false, armedAt: null, events: [], pre: [], counts: {}, limit: opts.limit, preMax: opts.pre};
+    st.arm = function(name) {
+        if (st.armed) return;
+        st.armed = true; st.armedAt = getStep();
+    };
+    const bump = (k) => { st.counts[k] = (st.counts[k] || 0) + 1; };
+    const where = () => `PC=${hex(cpu.regs[15] >>> 0)} PSL=${hex(cpu.psl >>> 0)} IPL=${hex((cpu.psl >>> 16) & 0x1F, 2)}`;
+    /* A polling guest reads RXCS thousands of times with an identical result; logging each one
+       buries the transitions that matter.  Consecutive identical event TEXTS (the step number is
+       excluded from the comparison) collapse into one line with a repeat count -- no event is
+       dropped, and the first and last step of each run are both reported. */
+    const log = (s) => {
+        let sink = st.armed ? st.events : st.pre;
+        let last = sink[sink.length - 1];
+        if (last && last.text === s) { last.n++; last.lastStep = getStep(); return; }
+        if (!st.armed) { sink.push({text: s, n: 1, step: getStep(), lastStep: getStep()});
+                         if (sink.length > st.preMax) sink.shift(); return; }
+        if (sink.length < st.limit) sink.push({text: s, n: 1, step: getStep(), lastStep: getStep()});
+        else st.dropped++;
+    };
+    st.dropped = 0;
+    st.fmt = (e) => `[${e.step}${e.n > 1 ? `..${e.lastStep}, x${e.n}` : ""}] ${e.text}`;
+
+    for (let name of ["rxcsRd", "rxdbRd", "txcsRd"]) {
+        let orig = consoleDev[name];
+        consoleDev[name] = function(...a) {
+            let v = orig.apply(this, a);
+            bump(name);
+            if (name !== "txcsRd") log(`${name} -> ${hex(v >>> 0, 4)} rxcs=${hex(this.rxcs >>> 0, 4)} ${where()}`);
+            return v;
+        };
+    }
+    for (let name of ["rxcsWr", "txcsWr"]) {
+        let orig = consoleDev[name];
+        consoleDev[name] = function(val) {
+            bump(name);
+            if (name === "rxcsWr") log(`rxcsWr ${hex(val >>> 0, 4)} (was ${hex(this.rxcs >>> 0, 4)}) ${where()}`);
+            return orig.call(this, val);
+        };
+    }
+    {
+        let orig = consoleDev.txdbWr;
+        consoleDev.txdbWr = function(val) { bump("txdbWr"); return orig.call(this, val); };
+    }
+    {
+        let orig = consoleDev.injectChar;
+        consoleDev.injectChar = function(byte) {
+            bump("injectChar");
+            let before = this.rxcs >>> 0;
+            let r = orig.call(this, byte);
+            log(`injectChar ${hex(byte & 0xFF, 2)} rxcs ${hex(before, 4)} -> ${hex(this.rxcs >>> 0, 4)} ` +
+                `IE=${(before & 0x40) ? 1 : 0} ` +
+                `intReq[0]=${hex(exc.intReq[0] >>> 0, 8)} ${where()}`);
+            /* The PC capture starts HERE, not at the TTI dispatch, because injectChar() is called
+               between two instruction chunks while the dispatch happens inside one -- starting it
+               on the dispatch would begin at the next chunk boundary and miss the driver's ISR
+               entirely, which is the one place the two engines most need to be compared. */
+            if (st.armed && st.pcTrace === null && st.pcWanted > 0) st.pcTrace = [];
+            return r;
+        };
+    }
+    for (let name of ["raiseInterrupt", "clearInterrupt"]) {
+        let orig = exc[name];
+        exc[name] = function(lvl, bit) {
+            if (lvl === 0x14 && (bit === 8 || bit === 9)) {
+                bump(`${name}-${bit === 8 ? "TTI" : "TTO"}`);
+                if (bit === 8) log(`${name}(TTI) ${where()}`);
+            }
+            return orig.call(this, lvl, bit);
+        };
+    }
+    {
+        let orig = exc.getVector;
+        exc.getVector = function(c, lvl) {
+            let v = orig.call(this, c, lvl);
+            if (lvl === 0x14) { bump("getVector-0x14"); log(`getVector(lvl=14) -> ${hex(v >>> 0, 4)} ${where()}`); }
+            return v;
+        };
+    }
+    {
+        let orig = exc.intexc;
+        exc.intexc = function(c, vec, lvl, ie, ...rest) {
+            bump(`intexc-vec${hex(vec >>> 0, 4)}`);
+            /* Every dispatch is COUNTED; only IPL>=0x14 hardware interrupts are LOGGED by default,
+               because the 100 Hz clock and the software-interrupt levels would bury the window.
+               Once the TTI vector has been dispatched, --trace-exc-after opens the log to EVERY
+               dispatch for that many events, which is what makes "what did the guest DO with the
+               character" an observation rather than an inference. */
+            if (lvl >= 0x14 || st.excOpen-- > 0) {
+                log(`intexc vec=${hex(vec >>> 0, 4)} lvl=${hex(lvl, 2)} ${where()}`);
+            }
+            if ((vec >>> 0) === SCB_TTI_VEC) {
+                if (st.pcTrace === null && st.pcWanted > 0) st.pcTrace = [];
+                st.excOpen = st.excWanted;
+            }
+            return orig.call(this, c, vec, lvl, ie, ...rest);
+        };
+    }
+    st.pcTrace = null;
+    st.pcWanted = opts.pc | 0;
+    st.excOpen = 0;
+    st.excWanted = opts.exc | 0;
+    /* --snap-pc: one snapshot of the register file plus a block of guest memory based at one of
+       those registers, taken the first time the guest is ABOUT to execute a named instruction.
+       It exists to be diffed against the oracle stopped at a SIMH breakpoint on the same PC.
+       NOTE the perturbation this costs, since HANDOFF standing rule 11 applies to probes: the
+       memory read goes through mmu.readData() and so can FILL A TLB ENTRY the guest had not
+       filled yet.  It is taken one instruction before the guest reads the same page itself, so
+       the entry would have been filled either way -- but it is not free, and this option must
+       stay off in any run whose instruction stream is being compared. */
+    st.snapPc = opts.snapPc;
+    st.snapReg = opts.snapReg | 0;
+    st.snapLen = opts.snapLen | 0;
+    st.snap = null;
+    st.takeSnap = function() {
+        let base = cpu.regs[st.snapReg] | 0, bytes = [], error = null, savedPsl = cpu.psl;
+        try {
+            cpu.psl = 0;
+            for (let i = 0; i < st.snapLen; i++) bytes.push(cpu.mmu.readData((base + i) | 0, 1, cpu.accR()) & 0xFF);
+        } catch (e) { error = String((e && e.message) || e); }
+        cpu.psl = savedPsl;
+        st.snap = {step: getStep(), pc: cpu.regs[15] >>> 0, psl: cpu.psl >>> 0,
+                   regs: Array.from(cpu.regs, (r) => r >>> 0), base: base >>> 0, bytes, error};
+    };
+    return st;
+}
+
+/**
  * run(opts)
  *
  * One boot attempt.  Every bound here is ABSOLUTE and fails the run rather than scaling with
@@ -259,6 +443,7 @@ function run(opts)
     cpu.reset();
     cpu.boot(opts.magicByte);
 
+
     /* Bus faults per (address, direction), for the report only.  romdiff.js's FaultGrader owns
        grading them; duplicating that here is the drift standing rule 7 warns about. */
     let faults = new Map(), faultEvents = 0;
@@ -273,6 +458,9 @@ function run(opts)
 
     let steps = 0, stop = null, stopStep = null;
     let fired = new Set(), scanFrom = 0, pending = null, pendingIdx = 0, sent = [];
+    /* `quiet` support (see INPUT_RULES): the console length and the step at which it last changed,
+       sampled once per chunk, plus the number of quiet instructions a held keystroke still owes. */
+    let lastOutLen = 0, lastOutStep = 0, holdQuiet = 0;
     let peakHeap = 0, t0 = Date.now(), deadline = t0 + opts.maxSeconds * 1000, lastBeat = 0;
     /* Console output length at the moment each rule fired, so the transcript can be split at the
        exact byte the probe typed rather than at a string search done afterwards. */
@@ -282,12 +470,43 @@ function run(opts)
        thousands of instructions wide. */
     const CHUNK = 2000;
 
+    /* pcjsvax-6c9's instrument -- observation only, see makeInputTrace().  Off unless asked for. */
+    let trace = opts.traceInput
+        ? makeInputTrace(cpu, consoleDev, () => steps,
+              {limit: opts.traceLimit, pre: opts.tracePre, pc: opts.tracePc, exc: opts.traceExcAfter,
+               snapPc: opts.snapPc === null ? null : (parseInt(opts.snapPc, 16) >>> 0),
+               snapReg: opts.snapReg, snapLen: opts.snapLen})
+        : null;
+    let armStep = null;
+
     try {
         while (steps < opts.maxSteps) {
-            for (let i = 0; i < CHUNK && steps < opts.maxSteps; i++) { cpu.stepCPU(1); steps++; }
+            /* Two copies of the same loop rather than a per-instruction `if`: the PC capture is a
+               diagnostic window measured in thousands of instructions inside a run measured in
+               hundreds of millions, and a branch on every one of those would be paid by every run
+               whether or not it asked for a trace. */
+            let wantPc = trace && trace.pcTrace !== null && trace.pcTrace.length < trace.pcWanted;
+            let wantSnap = trace && trace.armed && trace.snapPc !== null && trace.snap === null;
+            if (wantPc || wantSnap) {
+                for (let i = 0; i < CHUNK && steps < opts.maxSteps; i++) {
+                    if (wantPc && trace.pcTrace.length < trace.pcWanted) trace.pcTrace.push(cpu.regs[15] >>> 0);
+                    if (wantSnap && trace.snap === null && (cpu.regs[15] >>> 0) === trace.snapPc) trace.takeSnap();
+                    cpu.stepCPU(1); steps++;
+                }
+            } else {
+                for (let i = 0; i < CHUNK && steps < opts.maxSteps; i++) { cpu.stepCPU(1); steps++; }
+            }
 
-            /* Feed one character at a time, and only into an empty RXDB. */
-            if (pending !== null) {
+            /* Console quiescence, sampled once per chunk -- the clock a `quiet` rule waits on. */
+            if (consoleDev.output.length !== lastOutLen) { lastOutLen = consoleDev.output.length; lastOutStep = steps; }
+
+            /* Feed one character at a time, and only into an empty RXDB.  A keystroke with a
+               `quiet` requirement is HELD until the console has been silent that long (see
+               INPUT_RULES); the hold is released once and does not re-arm mid-string, because a
+               reply the guest is echoing would otherwise stall its own remaining characters. */
+            if (pending !== null && holdQuiet > 0) {
+                if (steps - lastOutStep >= holdQuiet) holdQuiet = 0;
+            } else if (pending !== null) {
                 while (pendingIdx < pending.length && !(consoleDev.rxcs & CSR_DONE)) {
                     consoleDev.injectChar(pending.charCodeAt(pendingIdx++) & 0xFF);
                 }
@@ -334,7 +553,15 @@ function run(opts)
                     sent.push(best);
                     fired.add(best.name);
                     pending = best.send; pendingIdx = 0;
+                    holdQuiet = best.quiet | 0;
+                    if (trace && opts.traceArm && best.name === opts.traceArm) {
+                        trace.arm(best.name);
+                        armStep = steps;
+                    }
                 }
+            }
+            if (armStep !== null && opts.traceStopAfter && steps - armStep >= opts.traceStopAfter) {
+                stop = "TRACE WINDOW COMPLETE"; stopStep = steps; break;
             }
 
             let mu = process.memoryUsage();
@@ -369,9 +596,27 @@ function run(opts)
     }
 
     if (unscale) unscale();
+
+    /* --dump-va: read guest VIRTUAL memory through the same mmu.readData() the CPU uses, in KERNEL
+       mode (PSL is saved and restored around it) so an S0 address is readable whatever mode the run
+       happened to stop in.  Taken AFTER the run, which is sound only for S0 space -- SBR/SLR do not
+       move once VMS is up -- and is how a driver's own instruction bytes get disassembled. */
+    let dump = null;
+    if (opts.dumpVa) {
+        let va = parseInt(opts.dumpVa, 16) | 0, savedPsl = cpu.psl;
+        dump = {va: va >>> 0, bytes: [], error: null};
+        try {
+            cpu.psl = 0;
+            for (let i = 0; i < opts.dumpLen; i++) dump.bytes.push(cpu.mmu.readData((va + i) | 0, 1, cpu.accR()) & 0xFF);
+        } catch (e) { dump.error = String((e && e.message) || e); }
+        cpu.psl = savedPsl;
+    }
+
     return {
+        dump,
         bytes: Uint8Array.from(consoleDev.output), steps, stop, stopStep, faults, faultEvents,
-        marks, sentNames: sent.map((r) => r.name), rulesLeft: INPUT_RULES.slice(ruleIdx).map((r) => r.name),
+        marks, sentNames: sent.map((r) => r.name), trace,
+        rulesLeft: INPUT_RULES.filter((r) => !fired.has(r.name)).map((r) => r.name),
         pc: cpu.regs[15] >>> 0, psl: cpu.psl >>> 0, elapsedMs: Date.now() - t0, peakHeap,
         deviceNames: machine.devices.map((d) => d.name),
         memSize: machine.memSize, qreport
@@ -392,7 +637,20 @@ function main()
         heartbeat: parseInt(getArg("--heartbeat", "50000000"), 10),
         tickScale: parseInt(getArg("--tick-scale", "1"), 10),
         consoleFile: getArg("--console-file", null),
-        magicByte: parseInt(getArg("--magic", String(ROM_MAGIC_BYTE)), 10)
+        magicByte: parseInt(getArg("--magic", String(ROM_MAGIC_BYTE)), 10),
+        /* pcjsvax-6c9's instrument.  See makeInputTrace(). */
+        traceInput: hasArg("--trace-input"),
+        traceArm: getArg("--trace-arm", "post-startup-wakeup"),
+        traceLimit: parseInt(getArg("--trace-limit", "4000"), 10),
+        tracePre: parseInt(getArg("--trace-pre", "40"), 10),
+        traceStopAfter: parseInt(getArg("--trace-stop-after", "0"), 10),
+        tracePc: parseInt(getArg("--trace-pc", "0"), 10),
+        traceExcAfter: parseInt(getArg("--trace-exc-after", "0"), 10),
+        dumpVa: getArg("--dump-va", null),
+        dumpLen: parseInt(getArg("--dump-len", "256"), 10),
+        snapPc: getArg("--snap-pc", null),
+        snapReg: parseInt(getArg("--snap-reg", "1"), 10),
+        snapLen: parseInt(getArg("--snap-len", "256"), 10)
     };
     opts.memBytes = (opts.memMB * 1024 * 1024) >>> 0;
     if (!opts.noDisk && !fs.existsSync(opts.volume)) {
@@ -435,6 +693,51 @@ function main()
             `x${f.count}, first at step ${f.firstStep}`);
     }
     if (sorted.length > 40) console.log(`            ... and ${sorted.length - 40} more`);
+
+    if (r.trace) {
+        let t = r.trace;
+        console.log(`\n----- pcjsvax-6c9 INPUT TRACE -----`);
+        console.log(`  armed     ${t.armed ? `yes, at step ${t.armedAt}` : `NO -- rule "${opts.traceArm}" never fired`}`);
+        console.log(`  counts    ${Object.entries(t.counts).map(([k, v]) => `${k}=${v}`).join(" ") || "(none)"}`);
+        console.log(`  last ${t.pre.length} distinct console event(s) BEFORE arming:`);
+        for (let e of t.pre) console.log(`    ${t.fmt(e)}`);
+        console.log(`  ${t.events.length} distinct event(s) AFTER arming` +
+            `${t.dropped ? ` (${t.dropped} DROPPED past --trace-limit ${t.limit})` : ""}:`);
+        for (let e of t.events) console.log(`    ${t.fmt(e)}`);
+        if (t.pcTrace) {
+            console.log(`  PC trace, ${t.pcTrace.length} instruction(s) from the TTI dispatch:`);
+            let line = [], prev = null, run = 0;
+            for (let p of t.pcTrace) {
+                if (p === prev) { run++; continue; }
+                if (prev !== null) line.push(hex(prev) + (run > 1 ? `x${run}` : ""));
+                prev = p; run = 1;
+                if (line.length === 8) { console.log(`    ${line.join(" ")}`); line = []; }
+            }
+            if (prev !== null) line.push(hex(prev) + (run > 1 ? `x${run}` : ""));
+            if (line.length) console.log(`    ${line.join(" ")}`);
+        }
+    }
+    if (r.trace && r.trace.snapPc !== null) {
+        let s = r.trace.snap;
+        console.log(`\n----- SNAPSHOT at PC=${hex(r.trace.snapPc)} -----`);
+        if (!s) console.log(`  NEVER REACHED -- the guest did not execute PC=${hex(r.trace.snapPc)} after arming`);
+        else {
+            console.log(`  step ${s.step}  PC=${hex(s.pc)} PSL=${hex(s.psl)}`);
+            console.log(`  regs ${s.regs.map((v, i) => `R${i}=${hex(v)}`).join(" ")}`);
+            if (s.error) console.log(`  memory read FAILED: ${s.error}`);
+            for (let i = 0; i < s.bytes.length; i += 16) {
+                console.log(`  ${hex((s.base + i) >>> 0)}  ` + s.bytes.slice(i, i + 16).map((b) => hex(b, 2)).join(" "));
+            }
+        }
+    }
+    if (r.dump) {
+        console.log(`\n----- MEMORY DUMP at ${hex(r.dump.va)} -----`);
+        if (r.dump.error) console.log(`  FAILED: ${r.dump.error}`);
+        for (let i = 0; i < r.dump.bytes.length; i += 16) {
+            console.log(`  ${hex((r.dump.va + i) >>> 0)}  ` +
+                r.dump.bytes.slice(i, i + 16).map((b) => hex(b, 2)).join(" "));
+        }
+    }
 
     if (!opts.quiet) {
         console.log(`\n----- CONSOLE STREAM, ESCAPED -----`);
