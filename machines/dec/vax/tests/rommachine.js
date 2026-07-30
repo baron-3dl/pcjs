@@ -66,16 +66,38 @@ const MEMSIZE = 0x01000000;
  * same reason `fOmitCdg` does: so a gate can hand the ROM a REAL missing decode and require an
  * instrument to notice.  conoutdiff.js's `cqm-window-undecoded` mutation is its only caller.
  *
+ * `opts` (pcjsvax-319) is the ONE additive parameter, and it carries exactly two fields:
+ *
+ *   `memSize`   RAM size in bytes, defaulting to MEMSIZE.  It is a PARAMETER rather than a second
+ *               constant because pcjsvax-59f fixed 16MB as the ROM SELF-TEST target while the
+ *               OpenVMS oracle reference (pcjsvax-459) was captured at `set cpu 128m`, and a second
+ *               hardcoded size is precisely the drift standing rule 7 was earned by.  Every
+ *               existing caller passes nothing and gets 16MB.  Note it is threaded to ALL FOUR
+ *               places the old constant was read -- addMemory(), CQBICVAX and CMCTLVAX both take it
+ *               as "the size passed to addMemory()", and a machine whose CMCTL disagrees with its
+ *               own RAM reports a memory size the ROM's self-test then contradicts.
+ *
+ *   `qbus`      a FUNCTION, called with {bus, cpu, cqbic, memSize}, returning
+ *               {windows: [{base, length, dev}], tickDev}.  Its windows are appended to the ONE
+ *               addIoPage() call below and its devices join the `devices` roster; `tickDev` becomes
+ *               `cpu.qbus`, the per-instruction event hook cpustate.js already calls.  It is a
+ *               CALLBACK rather than a device argument so that this file -- which every ROM
+ *               differential imports -- does not gain an import of rq.js for the sake of one
+ *               caller: tests/vmsbootprobe.js passes the RQVAX construction it takes from
+ *               tests/mscpharness.js, and nothing else in the tree passes anything.
+ *
  * @param {Uint8Array} romBytes
  * @param {boolean} [fOmitCdg]
  * @param {boolean} [fOmitCqm]
+ * @param {Object} [opts] {memSize, qbus}
  * @returns {Object} {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, cqipc, dbl, cmctl, ka655, cdg,
- *   cqmap, cqm, devices}
+ *   cqmap, cqm, memSize, devices}
  */
-function makeRomMachine(romBytes, fOmitCdg = false, fOmitCqm = false)
+function makeRomMachine(romBytes, fOmitCdg = false, fOmitCqm = false, opts = {})
 {
+    let memSize = (opts.memSize === undefined) ? MEMSIZE : (opts.memSize >>> 0);
     let bus = new BusVAX({busWidth: VAX.PAWIDTH, id: "bus"}, null, null);
-    bus.addMemory(0, MEMSIZE, MemoryVAX.TYPE.RAM);
+    bus.addMemory(0, memSize, MemoryVAX.TYPE.RAM);
     bus.addRom(romBytes);
     /* SSCVAX's REG_BTO and CQBICVAX's DSER/MEAR are the SAME state pcjsvax-446/d22 already track on
        cpu.exc (sscBto/cqDser/cqMear) -- see ssc.js's and cqbic.js's file headers -- so both devices
@@ -107,14 +129,14 @@ function makeRomMachine(romBytes, fOmitCdg = false, fOmitCqm = false)
        without them cqbic.js's requireBus() throws on every map access, and memSize 0 makes isMem()
        false for every address.  This machine passed one argument until pcjsvax-ee7 measured that
        the ROM's self-test 80 programs all 8,192 map entries and then walks CQMBASE. */
-    let cqbic = new CQBICVAX(cpu.exc, bus, MEMSIZE);
+    let cqbic = new CQBICVAX(cpu.exc, bus, memSize);
     /* CMCTLVAX (pcjsvax-622) is the memory controller's register file.  It takes MEMSIZE because
        SIMH's cmctl_rd()/cmctl_wr() read `MEMSIZE` in two places -- register 18's KA655X test and
        the signature request's ADDR_IS_MEM() -- and MEMSIZE is `cpu_unit.capac`, i.e. exactly the
        size passed to addMemory() above.  Its base and length are IMPORTED, not restated: the
        length is a computation over the bank geometry (see cmctl.js's header), and a second
        hand-written copy of it here is precisely the drift standing rule 7 was earned by. */
-    let cmctl = new CMCTLVAX(MEMSIZE);
+    let cmctl = new CMCTLVAX(memSize);
     /* CQIPCVAX (pcjsvax-b8a) is `cq_ipc`, ONE register with TWO address paths -- the local register
        at CQIPCBASE and the Qbus I/O-page doorbell the QBA's DIB autoconfigures (see cqipc.js's
        header).  Both mounts below share this one instance for the same reason console.js's IPR and
@@ -155,7 +177,13 @@ function makeRomMachine(romBytes, fOmitCdg = false, fOmitCqm = false)
        Everything else in the range keeps faulting through the identical path it took before -- see
        bus.js's addIoPage() and cqipc.js's SCOPE section. */
     let dbl = new DBLVAX(cqipc);
-    bus.addIoPage([{base: DBL_BASE, length: DBL_SIZE, dev: dbl}]);
+    /* `opts.qbus`'s windows join the SAME addIoPage() call: bus.js's addIoPage() installs ONE
+       controller over the whole page and a second call would replace the first, so a caller that
+       mounts a Qbus device cannot do it from outside this function. */
+    let qbusExtra = opts.qbus ? opts.qbus({bus, cpu, cqbic, memSize}) : null;
+    let qbusWindows = (qbusExtra && qbusExtra.windows) || [];
+    bus.addIoPage([{base: DBL_BASE, length: DBL_SIZE, dev: dbl}, ...qbusWindows]);
+    if (qbusExtra && qbusExtra.tickDev) cpu.qbus = qbusExtra.tickDev;
     let cdg = null;
     if (!fOmitCdg) { cdg = new CDGVAX(ka655); bus.addCdg(cdg); }
     cpu.setBus(bus);
@@ -174,10 +202,11 @@ function makeRomMachine(romBytes, fOmitCdg = false, fOmitCqm = false)
        measurable -- deleting both mounts reintroduced `?80` and NOT ONE of cqmmapdiff, cqmerrdiff,
        qdmadiff, romdiff or conoutdiff failed. */
     let devices = [consoleDev, clk, ssc, nvr, cqbic, cqipc, dbl, cmctl, ka655, cdg, cqmap, cqm]
+        .concat(qbusWindows.map((w) => w.dev))
         .filter((d) => d !== null)
         .map((d) => ({name: d.constructor.name, dev: d}));
     return {bus, cpu, consoleDev, clk, ssc, nvr, cqbic, cqipc, dbl, cmctl, ka655, cdg, cqmap, cqm,
-            devices};
+            memSize, devices};
 }
 
 export { makeRomMachine, MEMSIZE };
