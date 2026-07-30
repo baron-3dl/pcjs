@@ -77,6 +77,7 @@ import { VAX } from "../modules/v2/defines.js";
 import VAXCpu, { DISPATCH } from "../modules/v2/cpu.js";
 import { OPCODES } from "../modules/v2/drom.js";
 import VAXExc, { executeExc, MT, IPL_HMIN, PSL_V_IPL, KERN, SCB } from "../modules/v2/exc.js";
+import { executeControl } from "../modules/v2/control.js";
 import SSCVAX from "../modules/v2/ssc.js";
 import ConsoleVAX, { SCB_TTI, SCB_TTO, TTI_BIT, TTO_BIT, CSR_DONE, CSR_IE } from "../modules/v2/console.js";
 import ClkVAX, { IPL_CLK_ABS, INT_V_CLK } from "../modules/v2/clk.js";
@@ -135,6 +136,12 @@ class ConsoleCpu extends VAXCpu {
     }
     executeOne(opc, decoder, cpu) {
         if (executeExc(opc, decoder, cpu)) return;
+        /* control.js's group, added by pcjsvax-6c9's ARRIVAL phase: cpu.js's DISPATCH is the base
+           arithmetic/move group ONLY and contains no branch at all, so a program that WAITS for an
+           asynchronous event -- the whole point of an arrival case -- could not be written here
+           before.  Additive: it can only make an opcode that used to throw execute, never change
+           one that already ran, so the phases above are unaffected. */
+        if (executeControl(opc, decoder, cpu)) return;
         let fn = DISPATCH[opc];
         if (fn) { fn(cpu, decoder); return; }
         throw new Error(`consoledif: opcode ${hex(opc, 3)} (${OPCODES[opc] || "?"}) has no body wired into this harness`);
@@ -749,6 +756,235 @@ function phaseInterrupt(simh, scratch)
 }
 
 /* ------------------------------------------------------------------------------------------- *
+ * ARRIVAL phase (pcjsvax-6c9) -- a character ARRIVES while RXCS.IE is ALREADY set.                 *
+ *                                                                                                  *
+ * WHY THIS EXISTS, AND WHY THE INTERRUPT PHASE ABOVE IS NOT IT.  phaseInterrupt()'s "tti" case      *
+ * deposits a character with IE CLEAR and then has the guest WRITE RXCS with IE set -- that grades   *
+ * `rxcs_wr()`'s edge (vax_stddev.c:308-316), the "was already pending, now unmasked" transition.    *
+ * It does NOT grade the OTHER direction, which is the only one an interrupt-driven terminal driver  *
+ * ever takes: IE is set first and stays set, and the interrupt is raised by the ARRIVAL itself --   *
+ * `tti_svc()`'s own tail, vax_stddev.c:362-364:                                                     *
+ *                                                                                                   *
+ *     tti_csr = tti_csr | CSR_DONE;                                                                 *
+ *     if (tti_csr & CSR_IE)                                                                         *
+ *         SET_INT (TTI);                                                                            *
+ *                                                                                                   *
+ * console.js's injectChar() is the port of exactly those three lines, and pcjsvax-6c9 measured that *
+ * NOTHING in the 34-check gate touched it: consoledif and conoutdiff exercise the ROM's POLLED      *
+ * console, and no OS-level terminal driver runs in any differential.  Deleting the raise, or making *
+ * it UNCONDITIONAL, both survived the whole gate.  Those are this phase's two mutations.            *
+ *                                                                                                   *
+ * DETERMINISM.  The character really arrives on the oracle -- SCP's `send`, delivered through        *
+ * `sim_poll_kbd()` inside `tti_svc()`, i.e. the actual C path, not a `deposit TTI CSR` that would    *
+ * merely ASSERT what that function does.  WHEN it arrives is calibrated-clock dependent and is       *
+ * therefore never observed: both cases run the guest to a SELF-LOOP whose address is a breakpoint,   *
+ * so the observation point is a state the guest reaches, not a step count (HANDOFF.md standing rule  *
+ * 17 -- "close it by construction ... so the observation point became deterministic rather than      *
+ * probable").  The `step` ceiling on the SIMH side and the step guard on the JS side bound a         *
+ * FAILURE; neither is the observation point, and a run that hits either is reported BY NAME.         *
+ * ------------------------------------------------------------------------------------------- */
+
+const R_FLAG = (R_DATA + 0x40) | 0;             // handler writes 1 here -- "the TTI ISR ran"
+const R_CHAR = (R_DATA + 0x44) | 0;             // RXDB as the guest read it
+const R_RXCS = (R_DATA + 0x48) | 0;             // RXCS immediately after that read
+const ARRIVAL_CHAR = 0x5A;                      // 'Z'
+
+const BRB_OPC = OPCODES.indexOf("BRB");
+const BBC_OPC = OPCODES.indexOf("BBC");
+for (let [name, v] of [["BRB", BRB_OPC], ["BBC", BBC_OPC]]) {
+    if (v < 0 || v > 0xFF) throw new Error(`consoledif: ${name} opcode not found or not single-byte`);
+}
+
+/** MFPR #iprNum,Rn -- register destination (emitMfprToAbs's sibling). */
+function emitMfprToReg(bytes, iprNum, reg)
+{
+    if (iprNum < 0 || iprNum > 63) throw new Error("consoledif: MFPR iprNum must fit a short literal");
+    bytes.push(MFPR_OPC & 0xFF, iprNum & 0xFF, 0x50 | (reg & 0x0F));
+}
+
+/**
+ * arrivalCases()
+ *
+ * Both cases share ONE handler image, so "the ISR ran" is observable in the case where it MUST run
+ * and in the case where it must NOT -- a case that cannot report the wrong answer is not a case.
+ *
+ * @returns {Object[]}
+ */
+function arrivalCases()
+{
+    /* The handler: mark that it ran, read RXDB, read RXCS back, then park on a self-loop. */
+    let handler = [];
+    emitMovlImmToAbs(handler, 1, R_FLAG);
+    emitMfprToAbs(handler, MT.RXDB, R_CHAR);
+    emitMfprToAbs(handler, MT.RXCS, R_RXCS);
+    let handlerStop = (R_HANDLER + handler.length) | 0;
+    handler.push(BRB_OPC & 0xFF, 0xFE);                 // BRB . -- park
+
+    let cases = [];
+
+    /* IE armed FIRST, with RXDB empty, so rxcs_wr()'s own edge condition (DONE set) cannot hold and
+       the ONLY thing that can raise TTI is the arrival.  The guest then parks; the handler's park
+       address is the breakpoint. */
+    {
+        let code = [];
+        emitMtprImm(code, CSR_IE, MT.RXCS);
+        let spin = (R_CODE + code.length) | 0;
+        code.push(BRB_OPC & 0xFF, 0xFE);
+        cases.push({
+            name: "arrival_ie_set", handler, handlerStop, code,
+            stops: [handlerStop],                       // `spin` is NOT a stop: it is where we WAIT
+            /* `spin` is the park the case must END at.  For this arm that is the HANDLER's park:
+               the guest's own loop at `wait` is where it sits UNTIL the interrupt arrives, and
+               making that a breakpoint would stop the run before the character ever landed. */
+            expectFlag: 1, spin: handlerStop, wait: spin
+        });
+    }
+
+    /* IE never set.  The guest POLLS RXCS for DONE instead, so it still has a deterministic
+       observation point, and the handler must never run.  Grading RXDB here is what keeps the case
+       from passing vacuously: it proves the character actually arrived on both engines. */
+    {
+        let code = [];
+        let poll = R_CODE;
+        emitMfprToReg(code, MT.RXCS, 0);
+        code.push(BBC_OPC & 0xFF, 0x07, 0x50);          // BBC #7,R0,poll  (bit 7 = CSR_DONE)
+        let next = (R_CODE + code.length + 1) | 0;      // PC after the displacement byte
+        code.push((poll - next) & 0xFF);
+        emitMfprToAbs(code, MT.RXDB, R_CHAR);
+        emitMfprToAbs(code, MT.RXCS, R_RXCS);
+        let stop = (R_CODE + code.length) | 0;
+        code.push(BRB_OPC & 0xFF, 0xFE);
+        cases.push({
+            name: "arrival_ie_clear", handler, handlerStop, code,
+            /* BOTH parks are breakpoints: if the raise ever became unconditional the guest would
+               park in the HANDLER, and the run must stop there and say so rather than burn the
+               whole step ceiling and report a timeout that looks like something else. */
+            stops: [stop, handlerStop],
+            expectFlag: 0, spin: stop
+        });
+    }
+    return cases;
+}
+
+const ARRIVAL_CASES = arrivalCases();
+
+/* Bounds a FAILURE, never the observation point -- see this phase's header.  ~2 s of SIMH, and
+   three orders of magnitude above the ~1e5-1e6 instructions a coscheduled 100 Hz keyboard poll
+   takes on any host this has run on. */
+const ARRIVAL_SIMH_CEILING = 50000000;
+const ARRIVAL_JS_CEILING = 4000000;
+
+function buildArrivalScript(c)
+{
+    let L = [`set cpu ${MEMSIZE / (1024 * 1024)}m`, "set cpu simhalt", "reset all"];
+    L.push(`deposit MAPEN 0`, `deposit SCBB ${hex(R_SCBB)}`, `deposit KSP ${hex(R_KSP)}`, `deposit R14 ${hex(R_KSP)}`);
+    for (let k = 0; k < 20; k++) L.push(`deposit -l ${hex((R_DATA + k * 4) | 0)} 0`);
+    for (let i = 0; i < c.handler.length; i++) L.push(`deposit -b ${hex((R_HANDLER + i) | 0)} ${c.handler[i].toString(16)}`);
+    L.push(`deposit ${hex(R_SCBB + SCB_TTI)} ${hex(R_HANDLER)}`, `deposit ${hex(R_SCBB + SCB_TTO)} ${hex(R_HANDLER)}`);
+    for (let i = 0; i < c.code.length; i++) L.push(`deposit -b ${hex((R_CODE + i) | 0)} ${c.code[i].toString(16)}`);
+    L.push(`deposit PSL 0`, `deposit PC ${hex(R_CODE)}`);
+    for (let s of c.stops) L.push(`break ${hex(s)}`);
+    L.push(`send after=200 delay=200 "${String.fromCharCode(ARRIVAL_CHAR)}"`);
+    L.push(`step ${ARRIVAL_SIMH_CEILING}`);
+    L.push(`echo CCASE_${c.name}`);
+    L.push(`examine -h ${hex(R_FLAG)}`, `examine -h ${hex(R_CHAR)}`, `examine -h ${hex(R_RXCS)}`);
+    L.push("examine -h PC", "examine -h PSL");
+    L.push("exit", "");
+    return L.join("\n") + "\n";
+}
+
+/**
+ * runArrivalJS(c, injectAt)
+ *
+ * The SAME program on this machine's JS.  `injectAt` is the step at which injectChar() is called --
+ * the JS stand-in for "the host typed a key", exactly as it is everywhere else in this file.  It is
+ * NOT a graded quantity: nothing this case compares depends on WHEN the character lands, which is
+ * the property that lets the oracle's calibrated keyboard poll and this deterministic injection be
+ * compared at all.
+ *
+ * @returns {{vals: number[], reached: boolean, steps: number}}
+ */
+function runArrivalJS(c, injectAt = 8)
+{
+    let {bus, cpu, consoleDev} = makeMachine();
+    cpu.exc.scbb = R_SCBB;
+    cpu.exc.stk[KERN] = R_KSP;
+    cpu.regs.fill(0);
+    cpu.regs[14] = R_KSP;
+    for (let k = 0; k < 20; k++) bus.setLong((R_DATA + k * 4) | 0, 0);
+    for (let i = 0; i < c.handler.length; i++) bus.setByte((R_HANDLER + i) | 0, c.handler[i]);
+    bus.setLong(R_SCBB + SCB_TTI, R_HANDLER);
+    bus.setLong(R_SCBB + SCB_TTO, R_HANDLER);
+    for (let i = 0; i < c.code.length; i++) bus.setByte((R_CODE + i) | 0, c.code[i]);
+    cpu.psl = 0;
+    cpu.regs[15] = R_CODE;
+    let n = 0, reached = false, injected = false;
+    while (n < ARRIVAL_JS_CEILING) {
+        if (!injected && n >= injectAt) { consoleDev.injectChar(ARRIVAL_CHAR); injected = true; }
+        cpu.stepOne(); n++;
+        /* Parked: the self-loop's own address is reached again and again once the guest is there. */
+        if (injected && c.stops.indexOf(cpu.regs[15] >>> 0) >= 0) { reached = true; break; }
+    }
+    return {
+        reached, steps: n,
+        vals: [bus.getLong(R_FLAG) >>> 0, bus.getLong(R_CHAR) >>> 0, bus.getLong(R_RXCS) >>> 0,
+               cpu.regs[15] >>> 0, cpu.psl >>> 0]
+    };
+}
+
+function phaseArrival(simh, scratch)
+{
+    let problems = [];
+    let sawDelivered = false, sawSuppressed = false;
+    for (let c of ARRIVAL_CASES) {
+        let out;
+        try {
+            out = runSimh(simh, buildArrivalScript(c), path.join(scratch, `consoledif-arrival-${c.name}.ini`));
+        } catch (e) {
+            problems.push(`ARRIVAL ${c.name}: SIMH did not run (${e.message})`);
+            continue;
+        }
+        let marker = out.indexOf(`CCASE_${c.name}`);
+        if (marker < 0) { problems.push(`ARRIVAL ${c.name}: SIMH produced no CCASE marker -- case did not reach comparison`); continue; }
+        let vals = [...out.slice(marker).matchAll(VALUE_RE_G)].map((m) => parseInt(m[2], 16) >>> 0);
+        if (vals.length < 5) { problems.push(`ARRIVAL ${c.name}: SIMH produced ${vals.length} of 5 readbacks -- case did not reach comparison`); continue; }
+        let [sFlag, sChar, sRxcs, sPC, sPSL] = vals;
+
+        /* The ORACLE's own behaviour is asserted before anything is compared against it: a case
+           whose oracle never received the character, or took the wrong arm, is grading noise. */
+        if ((sChar & 0xFF) !== ARRIVAL_CHAR) {
+            problems.push(`ARRIVAL ${c.name}: SIMH never received the character -- RXDB read back 0x${hex(sChar, 4)}, expected 0x${hex(ARRIVAL_CHAR, 2)}`);
+            continue;
+        }
+        if (sFlag !== c.expectFlag) {
+            problems.push(`ARRIVAL ${c.name}: SIMH's OWN handler-ran flag is ${sFlag}, expected ${c.expectFlag} -- the case is not exercising what it claims`);
+            continue;
+        }
+        if ((sPC >>> 0) !== (c.spin >>> 0)) {
+            problems.push(`ARRIVAL ${c.name}: SIMH parked at PC=0x${hex(sPC)}, expected the case's own park 0x${hex(c.spin)}`);
+            continue;
+        }
+
+        let js = runArrivalJS(c);
+        if (!js.reached) {
+            problems.push(`ARRIVAL ${c.name}: this machine never parked -- ran ${js.steps} instruction(s) to the guard, PC=0x${hex(js.vals[3])}`);
+            continue;
+        }
+        let names = ["handler-ran", "RXDB", "RXCS-after", "PC", "PSL"];
+        for (let i = 0; i < 5; i++) {
+            if ((js.vals[i] >>> 0) !== (vals[i] >>> 0)) {
+                problems.push(`ARRIVAL ${c.name}: ${names[i]} js=0x${hex(js.vals[i])} simh=0x${hex(vals[i])}`);
+            }
+        }
+        if (c.expectFlag) sawDelivered = true; else sawSuppressed = true;
+    }
+    /* Neither gate scales with anything: there are exactly two arms and both must have run. */
+    if (!sawDelivered) problems.push("COVERAGE: the IE-SET arrival (a character raising TTI by itself) was not confirmed");
+    if (!sawSuppressed) problems.push("COVERAGE: the IE-CLEAR arrival (a character that must NOT raise TTI) was not confirmed");
+    return problems;
+}
+
+/* ------------------------------------------------------------------------------------------- *
  * SELFCHECK -- the five named mutations, each proven caught against the case that exposes it.     *
  * ------------------------------------------------------------------------------------------- */
 
@@ -840,25 +1076,82 @@ function selfcheck()
                 return (iprVal !== sscVal) ? `ipr=0x${hex(iprVal, 2)} ssc=0x${hex(sscVal, 2)} -- the two paths disagree` : null;
             });
     }
-    /* 5. TTI/TTO vectors swapped at installation. */
+    /* 5. TTI/TTO vectors swapped at installation.
+     *
+     * pcjsvax-6c9 FIXED THIS MUTATION; it was HANDOFF.md standing rule 16 twice over, and it was
+     * found because it broke the two mutations added after it.
+     *   - Its restore was `delete VAXExc.prototype.addInterruptSource`.  That method is defined ON
+     *     the prototype, so the mutation OVERWROTE it and the delete then removed it outright --
+     *     every later mutation in this suite ran against a VAXExc with no addInterruptSource() at
+     *     all, and was reported CAUGHT because constructing a ConsoleVAX threw a TypeError.  A pass
+     *     boundary is a check, and this one was the broken one.
+     *   - Its mutation called `origAdd`, BOUND to a throwaway machine's exc, so the sources were
+     *     installed on THAT machine and the one under test got none.  `deviceVector()` then returned
+     *     0 for TTI because no source existed -- not because the vectors were swapped.  The
+     *     mutation was passing on a symptom it did not produce.
+     * Now it composes over the original on `this` (rule 11) and restores by re-assignment.
+     */
     {
-        let m = makeMachine();      // build once, unmutated, to get a real exc
-        let origAdd = m.cpu.exc.addInterruptSource.bind(m.cpu.exc);
+        let origAdd = VAXExc.prototype.addInterruptSource;
         check("tti-tto-vectors-swapped",
             () => {
-                VAXExc.prototype.addInterruptSource = function(lvl, bit, vec) {
+                VAXExc.prototype.addInterruptSource = function(lvl, bit, vec, vecSet) {
                     if (bit === TTI_BIT && vec === SCB_TTI) vec = SCB_TTO;
                     else if (bit === TTO_BIT && vec === SCB_TTO) vec = SCB_TTI;
-                    origAdd(lvl, bit, vec);
+                    return origAdd.call(this, lvl, bit, vec, vecSet);
                 };
             },
-            () => { delete VAXExc.prototype.addInterruptSource; },
+            () => { VAXExc.prototype.addInterruptSource = origAdd; },
             () => {
                 let mm = makeMachine();
                 let vec = mm.cpu.exc.deviceVector(mm.cpu, IPL_HMIN);   // nothing raised yet -- table only
                 mm.cpu.exc.raiseInterrupt(IPL_HMIN, TTI_BIT);
                 vec = mm.cpu.exc.deviceVector(mm.cpu, IPL_HMIN);
                 return (vec === SCB_TTI) ? null : `TTI delivered vector 0x${hex(vec, 2)}, expected 0x${hex(SCB_TTI, 2)}`;
+            });
+    }
+
+    /* 6/7. pcjsvax-6c9's two arms of `tti_svc()`'s raise (vax_stddev.c:362-364), the line this
+       project's whole OpenVMS login prompt hangs off and which NOTHING in the 34-check gate touched
+       before phaseArrival() existed.  Both mutations COMPOSE over the shipped injectChar() rather
+       than replacing it (HANDOFF.md standing rule 11): the real code runs, and the mutation then
+       adds or withdraws the ONE effect under test, so neither is idempotent on an already-broken
+       implementation.  These run the JS side only -- what the ORACLE does under the same program is
+       phaseArrival()'s job, and it asserts SIMH's own arm before comparing anything to it. */
+    {
+        let orig = ConsoleVAX.prototype.injectChar;
+        check("tti-arrival-never-raises",
+            () => {
+                ConsoleVAX.prototype.injectChar = function(byte) {
+                    orig.call(this, byte);
+                    this.exc.clearInterrupt(IPL_HMIN, TTI_BIT);         // withdraw the raise
+                };
+            },
+            () => { ConsoleVAX.prototype.injectChar = orig; },
+            () => {
+                let c = ARRIVAL_CASES.find((cc) => cc.name === "arrival_ie_set");
+                let js = runArrivalJS(c);
+                return (js.reached && js.vals[0] === 1) ? null :
+                    `a character arriving with RXCS.IE SET did not reach the TTI handler ` +
+                    `(parked=${js.reached}, handler-ran=${js.vals[0]})`;
+            });
+    }
+    {
+        let orig = ConsoleVAX.prototype.injectChar;
+        check("tti-arrival-raises-ignoring-ie",
+            () => {
+                ConsoleVAX.prototype.injectChar = function(byte) {
+                    orig.call(this, byte);
+                    this.exc.raiseInterrupt(IPL_HMIN, TTI_BIT);         // raise regardless of IE
+                };
+            },
+            () => { ConsoleVAX.prototype.injectChar = orig; },
+            () => {
+                let c = ARRIVAL_CASES.find((cc) => cc.name === "arrival_ie_clear");
+                let js = runArrivalJS(c);
+                return (js.reached && js.vals[0] === 0) ? null :
+                    `a character arriving with RXCS.IE CLEAR reached the TTI handler ` +
+                    `(parked=${js.reached}, handler-ran=${js.vals[0]}, PC=0x${hex(js.vals[3])})`;
             });
     }
 
@@ -909,6 +1202,9 @@ function main()
 
         console.log("\n=== INTERRUPT phase ===");
         for (let p of phaseInterrupt(simh, scratch)) problems.push(p);
+
+        console.log("\n=== ARRIVAL phase (pcjsvax-6c9) ===");
+        for (let p of phaseArrival(simh, scratch)) problems.push(p);
 
         if (problems.length) {
             console.error(`\nFAILED (${problems.length} problem(s)):`);
