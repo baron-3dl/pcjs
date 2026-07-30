@@ -75,6 +75,9 @@
  *     --tick-scale N    divide the interval timer's rate by N (see makeTickScale)
  *     --quiet           omit the escaped byte-by-byte stream
  *     --console-file P  rewrite the console stream to P on every heartbeat (watch a run live)
+ *     --login USER      type USER at a BARE `Username: ` prompt (see loginRules); off by default
+ *     --password PW     and PW at the `Password: ` that follows.  A run with --login and no
+ *                       --password still proves the prompt answered: the guest prints `Password: `
  *
  *   pcjsvax-6c9's instrument -- all OFF by default, all observation only (see makeInputTrace):
  *     --trace-input     wrap the console model, the interrupt seam and the dispatch chokepoint
@@ -153,6 +156,41 @@ const INPUT_RULES = [
        which is also what a human at a terminal does. */
     {name: "post-startup-wakeup", match: "Elapsed time:", send: "\r", quiet: 200000}
 ];
+
+/**
+ * THE LOGIN RULES, and they are OPT-IN (`--login USER [--password PW]`) rather than part of the
+ * list above, so the default transcript is byte-for-byte the one every earlier item captured.
+ *
+ * WHY TYPING A USERNAME IS THE MEASUREMENT AND `Username:` ON ITS OWN IS NOT.  pcjsvax-cff records
+ * two false positives already scored here: `Username:` also appears as a PADDED FIELD inside the
+ * OPCOM audit record both engines print during startup (`Username:                 SYSTEM`), and
+ * `LOGINOUT.EXE` -- the other thing that was grepped for -- appears NOWHERE in a successful boot,
+ * because it is the image name printed only in the audit record a FAILED login generates.  The only
+ * sound test is to type a name at the prompt and require the guest to answer it.
+ *
+ * `atEnd` is what separates the real prompt from the padded field WITHOUT relying on the padded
+ * field being absent.  A rule with `atEnd` matches only when its text is the LAST thing on the
+ * console, which a bare `Username: ` is (LOGINOUT then waits) and an audit record's field is not
+ * (its own value follows on the same line).  Combined with `quiet` -- hold the keystroke until the
+ * console has been silent, the condition pcjsvax-6c9 measured for the wake-up RETURN -- the pair
+ * says "the guest printed this and then stopped talking", which is what a prompt IS.
+ *
+ * MEASURED 2026-07-30 on the VMS 5.5-2H4 volume built by pcjsvax-cff: its startup prints NO padded
+ * `Username:` audit field at all, so on 5.5 the discrimination is not even exercised; it is written
+ * this way because V7.1's startup does print one.
+ *
+ * THERE IS A DELIBERATE HARD DEADLINE ON THE ANSWER, and it is the guest's, not ours: LOGINOUT gives
+ * up on an unanswered prompt and prints `Error reading command input` / `Timeout period expired`.
+ * MEASURED on this port, that is what a run with no login rule ends with -- which makes "the prompt
+ * was answered" a fact the transcript carries rather than a claim this file makes.
+ */
+function loginRules(user, password)
+{
+    let rules = [];
+    if (user) rules.push({name: "login-username", match: "Username: ", send: user + "\r", atEnd: true, quiet: 20000});
+    if (user && password) rules.push({name: "login-password", match: "Password: ", send: password + "\r", atEnd: true, quiet: 20000});
+    return rules;
+}
 
 /**
  * REPEATABLE rules, consulted only when no one-shot rule above matches.
@@ -531,7 +569,13 @@ function run(opts)
                 let best = null, bestAt = -1;
                 for (let r of INPUT_RULES) {
                     if (fired.has(r.name)) continue;
-                    let at = text.indexOf(r.match);
+                    /* `atEnd` (see loginRules): match ONLY when the pattern is the tail of what the
+                       guest has printed, i.e. it printed this and then stopped.  That is what tells
+                       a bare `Username: ` prompt apart from the same ten characters appearing as a
+                       padded field inside an OPCOM audit record, whose value follows on the line. */
+                    let at = r.atEnd
+                        ? (text.endsWith(r.match) ? text.length - r.match.length : -1)
+                        : text.indexOf(r.match);
                     if (at >= 0 && (bestAt < 0 || at < bestAt)) { best = r; bestAt = at; }
                 }
                 /* REPEATABLE rules are consulted ONLY when no one-shot rule matched, so a specific
@@ -646,6 +690,9 @@ function main()
         traceStopAfter: parseInt(getArg("--trace-stop-after", "0"), 10),
         tracePc: parseInt(getArg("--trace-pc", "0"), 10),
         traceExcAfter: parseInt(getArg("--trace-exc-after", "0"), 10),
+        /* pcjsvax-cff's login rules -- opt-in, see loginRules(). */
+        login: getArg("--login", null),
+        password: getArg("--password", null),
         dumpVa: getArg("--dump-va", null),
         dumpLen: parseInt(getArg("--dump-len", "256"), 10),
         snapPc: getArg("--snap-pc", null),
@@ -653,6 +700,15 @@ function main()
         snapLen: parseInt(getArg("--snap-len", "256"), 10)
     };
     opts.memBytes = (opts.memMB * 1024 * 1024) >>> 0;
+    INPUT_RULES.push(...loginRules(opts.login, opts.password));
+    /* `--wake-quiet` exists so the wake-up condition can be RE-DERIVED per volume rather than
+       inherited.  pcjsvax-6c9 measured V7.1's; pcjsvax-cff had to establish 5.5's own, and the way
+       to establish it is to run the same volume at two values and read the transcript, not to
+       assume the number carries over.  Nothing is graded on it; it changes one rule's hold. */
+    if (getArg("--wake-quiet", null) !== null) {
+        let n = parseInt(getArg("--wake-quiet", "0"), 10);
+        for (let r of INPUT_RULES) if (r.name === "post-startup-wakeup") r.quiet = n;
+    }
     if (!opts.noDisk && !fs.existsSync(opts.volume)) {
         console.log(`vmsbootprobe: the volume ${opts.volume} does not exist.  Pass --volume PATH.`);
         process.exit(2);

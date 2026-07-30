@@ -252,7 +252,9 @@ async function main()
             console.log(`  .. bare \`Username: \` on screen after ${((promptAt - t0) / 1000).toFixed(0)}s; typing "${login}"`);
             await cdp.evaluate(`window.vaxType(${JSON.stringify(login + "\r")})`);
         }
-        if (promptAt && /Password:|Welcome to OpenVMS/.test(text)) { stop = "LOGGED IN"; break; }
+        /* V5.5's post-login banner is `Welcome to VAX/VMS version V5.5-2H4`, not V7.x's
+           `Welcome to OpenVMS`; V5.5 also asks for a password, so `Password:` is what fires. */
+        if (promptAt && /Password:|Welcome to (OpenVMS|VAX\/VMS version)/.test(text)) { stop = "LOGGED IN"; break; }
         if (promptAt && Date.now() - promptAt > 60000) { stop = "THE PROMPT NEVER ANSWERED"; break; }
     }
     if (!stop) stop = "WALL-CLOCK CAP";
@@ -273,9 +275,21 @@ async function main()
     check("no uncaught exception in the page", pageErrors.length === 0, pageErrors[0]);
     check("the KA655 ROM ran and reached the console prompt `>>>`", /^>>>/m.test(text) || />>>/.test(text));
     check("DUA0 attached read/write (copy-on-write overlay, not UNIT_RO)", /read\/write via copy-on-write overlay/.test(attach), attach);
-    check("OpenVMS printed its banner", /VAX\/VMS V[0-9.]+ +node /.test(text));
+    /* THE BANNER IS VERSION-SHAPED, and the first form here was the only one that had ever been
+       run: V7.1 prints `VAX/VMS V7.1       node VAX1`, so requiring ` node ` made this a V7.1 check
+       wearing a general name.  MEASURED 2026-07-30 (pcjsvax-cff): VAX/VMS V5.5-2H4 prints
+       `        Welcome to VAX/VMS V5.5-2H4` with no node name at all, and scored FAIL on a boot
+       that reached DCL.  What the check is FOR is "the operating system, not the ROM, identified
+       itself AND its version", so it now requires the product name and a version and accepts either
+       release's surrounding words.  It is not widened past that -- a bare `VAX/VMS` with no version
+       still fails, which is what the boot block prints. */
+    check("OpenVMS printed its banner", /VAX\/VMS (version )?V[0-9]+\.[0-9]+[-0-9A-Z]*/.test(text));
     check("a BARE `Username: ` reached the SCREEN (not the padded OPCOM audit field)", sawBarePrompt);
-    check(`the prompt ANSWERED "${login}"`, /Password:|Welcome to OpenVMS/.test(text), stop);
+    /* `Welcome to OpenVMS` is V7.x's post-login banner; V5.5's is `Welcome to VAX/VMS version
+       V5.5-2H4`, and V5.5 also always asks for a password first, so the first alternative is what
+       actually fires here.  MEASURED 2026-07-30: this port answers `Username: SYSTEM` with
+       `Password: `, then `%LOGIN-S-LOGOPRCON, login allowed from OPA0:` and a DCL `$`. */
+    check(`the prompt ANSWERED "${login}"`, /Password:|Welcome to (OpenVMS|VAX\/VMS version)/.test(text), stop);
     check("the username was ECHOED, i.e. the keyboard path reached the terminal driver",
         new RegExp(`Username: ${login}`).test(text));
     check("the picked file was NOT modified", hashBefore === fs.statSync(volume).size + ":" + fs.statSync(volume).mtimeMs);
