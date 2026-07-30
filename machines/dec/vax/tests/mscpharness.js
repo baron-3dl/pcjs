@@ -54,6 +54,7 @@ import RQVAX, {
     RQ_NPKTS, RQ_PKT_SIZE_W, UQ_HCTC_V_CR, UQ_HCTC_M_CR,
     UQ_HCTC_V_TYP, UQ_HCTC_M_TYP, UQ_HCTC_V_CID, UQ_HCTC_M_CID
 } from "../modules/v2/rq.js";
+import { ods2VolumeBytesFrom } from "../modules/v2/ods2.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -705,67 +706,36 @@ export function fileImageProvider(p, opts = {})
 /**
  * ods2VolumeBytes(fd)
  *
- * get_ods2_filesystem_size() (sim_disk.c:1257-1340), reduced to the one number it returns:
+ * THE NODE `fs` ADAPTER over modules/v2/ods2.js's ods2VolumeBytesFrom(), which is
+ * get_ods2_filesystem_size() (sim_disk.c:1257-1340) reduced to the one number it returns:
  * `Scb.scb_l_volsize * 512`, the size the VOLUME declares for itself.
  *
- * *** THIS IS A FILE SYSTEM PARSER AND IT LIVES HERE RATHER THAN IN rq.js ON PURPOSE. ***  A disk
- * controller does not parse volumes; sim_disk does, before the controller ever sees the unit, and
- * hands the result to autosize.  rq.js takes it through the image provider's `filesystemBytes` and
+ * *** THE WALK ITSELF MOVED (pcjsvax-ae1) AND THIS IS ALL THAT IS LEFT OF IT HERE. ***  A browser
+ * image provider needs the same number -- rq.js's attach() takes it as `provider.filesystemBytes`
+ * and a unit attached without it takes autosize's OTHER arm -- and none of `fs.fstatSync`,
+ * `fs.readSync` or Buffer's LE readers exist there.  Two copies of an ODS-2 parser in one tree is
+ * exactly the drift HANDOFF.md standing rule 7 exists for, so the parser is parameterised by a
+ * block reader and this function supplies the `fs` one.  The behaviour, including the
+ * `undefined`-means-unrecognised contract, is unchanged; tests/mscpunitdiff.js grades it.
+ *
+ * *** THIS IS A FILE SYSTEM PARSER AND IT DOES NOT LIVE IN rq.js ON PURPOSE. ***  A disk controller
+ * does not parse volumes; sim_disk does, before the controller ever sees the unit, and hands the
+ * result to autosize.  rq.js takes the result through the image provider's `filesystemBytes` and
  * does the arithmetic; this is the Node half that produces it, exactly as fileImageProvider() is
  * the Node half of `read`.
- *
- * The walk is the C's: HOME BLOCK at LBN 1 -> the BITMAP.SYS file header at
- * `ibmaplbn + ibmapsize + 1` -> its first retrieval pointer -> the STORAGE CONTROL BLOCK.  The
- * validity tests are the C's too, minus the two ODS checksums: what they are here for is to REFUSE
- * a container that is not an ODS-2 volume, and a pattern-filled scratch file fails the structure
- * level, the cluster factor and the bitmap fields long before a checksum would matter.  Returning
- * undefined is the "unrecognised" answer and it selects autosize's OTHER arm, so a false positive
- * would change a unit's size -- which is why every field is checked and the final answer is
- * sanity-bounded rather than trusted.
  *
  * @param {number} fd an open descriptor
  * @returns {number|undefined} the volume's size in BYTES, or undefined if this is not ODS-2
  */
 export function ods2VolumeBytes(fd)
 {
-    try {
-        let size = fs.fstatSync(fd).size;
-        let rd = (lbn) => {
-            if ((lbn + 1) * 512 > size || lbn < 0) return null;
-            let b = Buffer.alloc(512);
-            return fs.readSync(fd, b, 0, 512, lbn * 512) === 512 ? b : null;
-        };
-        let H = rd(1);
-        if (!H) return undefined;
-        let strucver = H[12], struclev = H[13], cluster = H.readUInt16LE(14);
-        let ibmapvbn = H.readUInt16LE(22), ibmaplbn = H.readUInt32LE(24);
-        let maxfiles = H.readUInt32LE(28), ibmapsize = H.readUInt16LE(32);
-        let resfiles = H.readUInt16LE(34);
-        if (H.readUInt32LE(0) === 0 || H.readUInt32LE(4) === 0 || H.readUInt32LE(8) === 0) return undefined;
-        if ((struclev !== 2 && struclev !== 5) || strucver === 0 || cluster === 0) return undefined;
-        if (ibmapvbn === 0 || ibmaplbn === 0 || ibmapsize === 0) return undefined;
-        if (resfiles < 5 || resfiles >= maxfiles) return undefined;
-        let hdr = rd(ibmaplbn + ibmapsize + 1);
-        if (!hdr) return undefined;
-        let o = hdr[1] * 2;                             /* fh2_b_mpoffset, in WORDS */
-        if (o < 4 || o > 500) return undefined;
-        let w0 = hdr.readUInt16LE(o), fmt = (w0 >>> 14) & 3;
-        if (fmt === 0) { o += 2; w0 = hdr.readUInt16LE(o); fmt = (w0 >>> 14) & 3; }  /* placement */
-        let scbLbn;
-        if (fmt === 1) scbLbn = (((w0 >>> 8) & 0x3F) << 16) + hdr.readUInt16LE(o + 2);
-        else if (fmt === 2) scbLbn = (hdr.readUInt16LE(o + 4) << 16) + hdr.readUInt16LE(o + 2);
-        else if (fmt === 3) scbLbn = hdr.readUInt32LE(o + 4);
-        else return undefined;
-        let S = rd(scbLbn);
-        if (!S) return undefined;
-        if (S[0] !== strucver || S[1] !== struclev || S.readUInt16LE(2) !== cluster) return undefined;
-        let volsize = S.readUInt32LE(4);
-        /* A volume smaller than one cluster, or wildly larger than the container, is a misparse. */
-        if (volsize === 0 || volsize * 512 > size * 4) return undefined;
-        return volsize * 512;
-    } catch (e) {
-        return undefined;
-    }
+    let size;
+    try { size = fs.fstatSync(fd).size; } catch (e) { return undefined; }
+    return ods2VolumeBytesFrom(size, (lbn) => {
+        let b = Buffer.alloc(512);
+        try { if (fs.readSync(fd, b, 0, 512, lbn * 512) !== 512) return null; } catch (e) { return null; }
+        return new Uint8Array(b.buffer, b.byteOffset, 512);
+    });
 }
 
 /**
