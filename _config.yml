@@ -54,6 +54,11 @@ plugins:
   - jekyll-include-cache
 
 software:
+  # vaxdisks: pcjsvax-6e1 -- media for the VAX/VMS demo (pcjsvax-545), following the SAME
+  # class-name-per-subdomain convention as decdisks/diskettes/etc below.  Server value here is a
+  # placeholder pending pcjsvax-e1f, which owns the actual GitHub Pages deployment and domain.
+  vaxdisks:
+    server: https://vaxdisks.pcjs.org
   decdisks:
     server: https://decdisks.pcjs.org
   diskettes:

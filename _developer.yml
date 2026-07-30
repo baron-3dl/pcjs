@@ -49,6 +49,11 @@ exclude:
   - /tools/pc/disks
 
 softwareLocal:
+  # vaxdisks: pcjsvax-6e1 -- local mirror for the VAX/VMS demo media (ka655x.bin, the gzipped
+  # system disk).  /disks is already gitignored (see .gitignore), so this needs no new ignore rule.
+  # Retires the ad-hoc symlink formerly at machines/dec/vax/browser/local/.
+  vaxdisks:
+    server: /disks/vaxdisks
   decdisks:
     server: /disks/decdisks
   diskettes:
