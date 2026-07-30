@@ -85,6 +85,7 @@ import { VAXFault, VAXFAULT, OP_MEM } from "./decode.js";
 import VAXDecoder from "./decode.js";
 import MMUVAX from "./mmu.js";
 import { OPCODES } from "./drom.js";
+import { idleTstl, idleBitl, idleFfs } from "./idle.js";
 
 const L_BYTE = 1, L_WORD = 2, L_LONG = 4;
 
@@ -697,7 +698,14 @@ H.CLRQ = (cpu, d) => { storeQ(cpu, d, 0, 0); cpu.setCC(CC_Z | (cpu.cc & CC_C)); 
 
 H.TSTB = (cpu, d) => { cpu.setCC(ccIIZZ_B(d.opnd[0])); };
 H.TSTW = (cpu, d) => { cpu.setCC(ccIIZZ_W(d.opnd[0])); };
-H.TSTL = (cpu, d) => { cpu.setCC(ccIIZZ_L(d.opnd[0])); };
+/* vax_cpu.c:1638-1655.  The `cc == CC_Z` the C tests is, for CC_IIZZ_L, exactly `op0 === 0` --
+   N is clear and V/C are cleared unconditionally -- so the guard is the operand, not a re-read of
+   the condition codes.  See idle.js for what the site is and why it is gated on idleEnable. */
+H.TSTL = (cpu, d) => {
+    let op0 = d.opnd[0];
+    cpu.setCC(ccIIZZ_L(op0));
+    if (cpu.idleEnable && op0 === 0) idleTstl(cpu);
+};
 
 /* --- Single-operand, read/write: INCx/DECx src.mx --- */
 
@@ -783,7 +791,14 @@ H.CMPL = (cpu, d) => { cpu.setCC(ccCmp_L(d.opnd[0], d.opnd[1])); };
 
 H.BITB = (cpu, d) => { let r = d.opnd[1] & d.opnd[0]; cpu.setCC(ccIIZP_B(r, cpu.cc)); };
 H.BITW = (cpu, d) => { let r = d.opnd[1] & d.opnd[0]; cpu.setCC(ccIIZP_W(r, cpu.cc)); };
-H.BITL = (cpu, d) => { let r = (d.opnd[1] & d.opnd[0]) | 0; cpu.setCC(ccIIZP_L(r, cpu.cc)); };
+/* vax_cpu.c:1860-1872.  `cc == CC_Z` here is NOT `r === 0`: CC_IIZP preserves C, so a zero result
+   with C already set leaves cc == CC_Z|CC_C and the C's equality test FAILS.  Transcribed as the
+   equality it is, against the condition codes the instruction just wrote. */
+H.BITL = (cpu, d) => {
+    let r = (d.opnd[1] & d.opnd[0]) | 0;
+    cpu.setCC(ccIIZP_L(r, cpu.cc));
+    if (cpu.idleEnable && cpu.cc === CC_Z) idleBitl(cpu);
+};
 
 /* --- Two/three-operand read/write arithmetic and logical: op2 src.rx,dst.mx; op3 s1.rx,s2.rx,dst.wx --- */
 
@@ -1052,6 +1067,8 @@ H.FFS = (cpu, d) => {
     let temp = opFfs(r, size);
     storeL(cpu, d, (pos + temp) | 0);
     cpu.setCC(r ? 0 : CC_Z);
+    /* vax_cpu.c:2570-2585.  `cc == CC_Z` is "no set bits found", i.e. r === 0. */
+    if (cpu.idleEnable && r === 0) idleFfs(cpu);
 };
 H.FFC = (cpu, d) => {
     let pos = d.opnd[0], size = d.opnd[1], rn = d.opnd[2], wd = d.opnd[3];

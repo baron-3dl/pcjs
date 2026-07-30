@@ -490,6 +490,71 @@ export default class SSCVAX {
     }
 
     /**
+     * instrsToEvent()
+     *
+     * pcjsvax-af8.  How many more tick() calls -- counting the one about to happen as 1 -- until
+     * either running timer next WRAPS, which is the only thing tick() does that the guest can
+     * observe (DON/ERR, the reload, and the interrupt all hang off the wrap in _tmrIncr()).  A
+     * timer whose RUN bit is clear is not counting and therefore never fires: Infinity, so the
+     * min() in idle.js is decided by whichever device actually has something scheduled.
+     *
+     * TIR counts UP and wraps past 0xFFFFFFFF, so the distance is 2^32 - TIR at 1 usec per
+     * instruction.  Expressed against TIR_USECS_PER_INSTR rather than a bare 1 so it stays tied to
+     * the time base tick() itself uses (see "THE RATE" in the file header).
+     *
+     * @this {SSCVAX}
+     * @returns {number}
+     */
+    /**
+     * idleAble -- SIMH's UNIT_IDLE, and these units do NOT carry it: `sysd_unit[]`
+     * (vax_sysdev.c) declares no UNIT_IDLE on either programmable timer.  So a guest spinning
+     * while an SSC timer is the nearest scheduled event is not "idle" in sim_idle()'s sense and
+     * the host does not sleep -- see idle.js's idleSkip().  Stated as an explicit false rather
+     * than left absent, because idleSkip() treats absent as false and a reader should not have to
+     * infer which of the two this is (HANDOFF.md standing rule 7: scope lives in code).
+     *
+     * @this {SSCVAX}
+     * @returns {boolean}
+     */
+    get idleAble() { return false; }
+
+    instrsToEvent()
+    {
+        let n = Infinity;
+        for (let t = 0; t < 2; t++) {
+            if (!(this.tcsr[t] & TMR_CSR_RUN)) continue;
+            let d = Math.ceil((0x100000000 - (this.tir[t] >>> 0)) / TIR_USECS_PER_INSTR);
+            if (d < n) n = d;
+        }
+        return n;
+    }
+
+    /**
+     * skipInstrs(n)
+     *
+     * pcjsvax-af8.  Advance both running timers by `n` microseconds of guest time without firing.
+     * idle.js guarantees `n < instrsToEvent()`, so neither TIR can wrap here -- which matters more
+     * than it looks: _tmrIncr()'s overflow arm is written for a SINGLE wrap (its own doc comment
+     * says so), and a multi-wrap increment would lose every DON/ERR transition but the last.  The
+     * bound is asserted rather than trusted.
+     *
+     * @this {SSCVAX}
+     * @param {number} n
+     */
+    skipInstrs(n)
+    {
+        if (!(n >= 0) || n >= this.instrsToEvent()) {
+            throw new Error(`ssc.js: skipInstrs(${n}) would wrap a running timer ` +
+                `(${this.instrsToEvent()} to go).  _tmrIncr() models ONE overflow per call, so a ` +
+                `skip past a wrap loses the DON/ERR transition and the reload with it`);
+        }
+        if (n === 0) return;
+        for (let t = 0; t < 2; t++) {
+            if (this.tcsr[t] & TMR_CSR_RUN) this.tir[t] = ((this.tir[t] >>> 0) + n * TIR_USECS_PER_INSTR) >>> 0;
+        }
+    }
+
+    /**
      * _tmrIncr(tmr, inc)
      *
      * vax_sysdev.c:1575-1600, tmr_incr() -- ported literally, including the "ERR only after a

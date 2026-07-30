@@ -90,6 +90,7 @@ import Component from "../../../../modules/v2/component.js";
 import MESSAGE from "./message.js";
 import MMUVAX from "./mmu.js";
 import { VAX } from "./defines.js";
+import { idleSkip, OS_TAB, VAX_IDLE_VMS } from "./idle.js";
 import { OPCODES, DROM, DROM_STRIDE, DR, IG } from "./drom.js";
 import { VAXDecoder, VAXFault, VAXFAULT } from "./decode.js";
 import { DISPATCH as INT_DISPATCH, CC_MASK } from "./cpu.js";
@@ -421,6 +422,35 @@ export default class CPUStateVAX extends Component {
          * combines them behind one object the way iprdevice.js's makeIprDevice() does.
          */
         this.qbus = null;
+
+        /*
+         * ---------------------------------------------------------------------------------
+         * GUEST-IDLE DETECTION (pcjsvax-af8).  See modules/v2/idle.js for the mechanism, the
+         * measurement that chose it, and why it is off by default.
+         * ---------------------------------------------------------------------------------
+         * `idleEnable` is SIMH's `sim_idle_enab` (scp.c), which `SET CPU IDLE` sets and which the
+         * 34-check gate never issues -- so with it false this whole feature is one boolean test
+         * per idle site and NOTHING in tests/ observes a single bit of difference.  A driver that
+         * wants a machine that stops burning a core when the guest has nothing to do turns it on:
+         * browser/vaxmachine.js and tests/vmsbootprobe.js do.
+         *
+         * `idleMask` is SIMH's `cpu_idle_mask`, whose C initialiser for a non-INFOSERVER build is
+         * VAX_IDLE_VMS (vax_cpu.c:274-276) -- i.e. `SET CPU IDLE=VMS` is the default, not "no
+         * idling".  Same here, and setIdleMode() is `SET CPU IDLE=<os>`.
+         *
+         * The four counters are the instrument, not bookkeeping: tests/idlediff.js grades every
+         * one of them, and `idleSites` is what makes its per-site coverage assertion possible at
+         * all (HANDOFF.md standing rule 6 -- report by name any case that does not reach
+         * comparison).  reset() does NOT clear them, for the same reason it does not clear `clk`:
+         * they describe the RUN, not the machine.
+         */
+        this.idleEnable = false;
+        this.idleMask = VAX_IDLE_VMS;
+        this.idleRequest = null;                        /* site name, set by an instruction body */
+        this.idleSkipped = 0;                           /* instructions elided, total */
+        this.idleUsecs = 0;                             /* guest usec elided and NOT yet slept off */
+        this.idleCount = 0;                             /* how many times a skip actually happened */
+        this.idleSites = new Map();                     /* site name -> times that site requested */
 
         this.decoder = new VAXDecoder(this);
         this.exc = new VAXExc(this);
@@ -1008,6 +1038,29 @@ export default class CPUStateVAX extends Component {
             if (this.hst) this.hst.finish(this);
 
             /*
+             * pcjsvax-af8.  THE IDLE SKIP, and it goes HERE -- above the device ticks, below the
+             * previous instruction's history record -- for a reason that is arithmetic rather than
+             * taste.  Each device's `instrsToEvent()` counts the tick() call about to happen below
+             * as 1, so eliding here and then falling straight into those ticks makes the device
+             * fire on exactly the instruction it would have fired on had the guest's idle loop
+             * actually run.  Doing it after the ticks would double-count the current instruction;
+             * doing it inside the instruction body (where SIMH calls cpu_idle()) would fast-forward
+             * time in the middle of one, which is the only thing this loop takes care never to do.
+             *
+             * `idleRequest` is CLEARED whether or not idling is enabled.  If it were left set with
+             * idleEnable false it would be a stale flag waiting to fire on whatever instruction
+             * happened to be executing when a driver turned idling on.
+             */
+            if (this.idleRequest !== null) {
+                let site = this.idleRequest;
+                this.idleRequest = null;
+                if (this.idleEnable) {
+                    this.idleSites.set(site, (this.idleSites.get(site) || 0) + 1);
+                    if (idleSkip(this) > 0) this.idleCount++;
+                }
+            }
+
+            /*
              * pcjsvax-954: the device-service hook, once per instruction retired.  Placed here
              * (top of loop, alongside hst.finish()) rather than after the fetch/execute below, so
              * a device's tick is attributed to the boundary BETWEEN instructions, never inside
@@ -1080,6 +1133,55 @@ export default class CPUStateVAX extends Component {
         this.fStopped = true;
         this.stopReason = (e instanceof VAXStop) ? e : null;
     }
+
+    /**
+     * requestIdle(site)
+     *
+     * pcjsvax-af8.  `cpu_idle()`.  Called from an instruction body (modules/v2/idle.js's site
+     * predicates) to say "this guest has nothing to do".  It records the request and returns; the
+     * skip itself happens at the top of the next stepCPU() iteration, where the device event queue
+     * can be consulted at an instruction boundary.
+     *
+     * @this {CPUStateVAX}
+     * @param {string} site one of idle.js's IDLE_SITES names
+     */
+    requestIdle(site) { this.idleRequest = site; }
+
+    /**
+     * setIdleMode(name)
+     *
+     * `SET CPU IDLE=<os>` (vax_cpu.c:3756-3775).  Returns false for a name os_tab does not carry,
+     * rather than silently selecting nothing -- a mis-typed OS that quietly disabled idling would
+     * look exactly like idling that stopped working.
+     *
+     * @this {CPUStateVAX}
+     * @param {string} name
+     * @returns {boolean}
+     */
+    setIdleMode(name)
+    {
+        let want = String(name).toUpperCase();
+        let e = OS_TAB.find((o) => o.name.toUpperCase() === want);
+        if (!e) return false;
+        this.idleMask = e.mask;
+        return true;
+    }
+
+    /**
+     * takeIdleUsecs()
+     *
+     * pcjsvax-af8.  Read and ZERO the bank of guest microseconds elided since the driver last
+     * asked.  This is the whole driver contract: the CPU says how much guest time it fast-forwarded
+     * through, and the driver -- which is the only thing that knows what "sleep" means on its host
+     * -- decides how much wall clock to give back.  See idle.js's file header.
+     *
+     * Nothing here couples the two: the guest clock has ALREADY advanced by this much, so a driver
+     * that ignores the number entirely still keeps correct guest time, it just keeps burning CPU.
+     *
+     * @this {CPUStateVAX}
+     * @returns {number} guest microseconds
+     */
+    takeIdleUsecs() { let us = this.idleUsecs; this.idleUsecs = 0; return us; }
 
     /**
      * stopCPU()

@@ -1867,6 +1867,47 @@ export default class RQVAX {
     }
 
     /**
+     * instrsToEvent(cpu)
+     *
+     * pcjsvax-af8.  How many more tick() calls -- counting the one about to happen as 1 -- until
+     * the head of the event queue comes due.  tick() fires while `cpu.nTotalCycles >= e.due`, and
+     * `nTotalCycles` is incremented AFTER the tick call (cpustate.js's loop), so at the j-th call
+     * from now it holds C + (j - 1): the firing call is j = due - C + 1.  An already-due event
+     * gives j <= 1, i.e. "fire now, skip nothing", which is exactly what idle.js's `min - 1` turns
+     * into a zero-length skip.
+     *
+     * Nothing scheduled is Infinity.  Note this device needs no skipInstrs(): its queue is keyed
+     * on `cpu.nTotalCycles`, which idle.js advances directly, so it has no counter of its own to
+     * move -- and that is a property worth stating, because a future device with internal state
+     * MUST implement skipInstrs() or the skip will silently leave it behind.
+     *
+     * @this {RQVAX}
+     * @param {Object} cpu
+     * @returns {number}
+     */
+    /**
+     * idleAble -- SIMH's UNIT_IDLE, and NOT set for anything this file models.  pdp11_rq.c:3298
+     * sets `UNIT_IDLE|UNIT_DIS` on RQ_TIMER and on nothing else; RQ_QUEUE is `UNIT_DIS` alone and
+     * the drive units carry neither, and RQ_TIMER (the once-a-second host-access poll) is not
+     * modelled here at all (see the file header).  So while a transfer or a queue service is
+     * outstanding, idle.js will not sleep -- which is exactly right: the guest is waiting on
+     * something this emulator produces as fast as it can, and slowing to real time would slow down
+     * the thing being waited for.  MEASURED: without this, a V5.5 boot took 65.1 s instead of 20.4.
+     *
+     * @this {RQVAX}
+     * @returns {boolean}
+     */
+    get idleAble() { return false; }
+
+    instrsToEvent(cpu)
+    {
+        let e = this.nextEvent();
+        if (e === null) return Infinity;
+        let j = (e.due - cpu.nTotalCycles) + 1;
+        return j > 0 ? j : 0;
+    }
+
+    /**
      * drainOnHalt(cpu)
      *
      * The HALT INSTRUCTION's own event drain -- vax_cpu.c:2643-2652, called from exc.js's HALT

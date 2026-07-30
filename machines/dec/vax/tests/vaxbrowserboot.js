@@ -59,6 +59,9 @@ import path from "path";
 import crypto from "crypto";
 
 import { vaxRepo } from "./mscpharness.js";
+
+/** pcjsvax-af8: Node's only synchronous sleep; see tests/vmsbootprobe.js's copy for why. */
+const IDLE_SLEEPER = new Int32Array(new SharedArrayBuffer(4));
 import { overlayImageProvider } from "../browser/imageprovider.js";
 import { VaxMachine } from "../browser/vaxmachine.js";
 
@@ -117,10 +120,16 @@ function main()
     /* THE SAME SHAPE THE TAB RUNS: bounded slices, with the caller re-arming.  Under Node there is
        nothing to yield TO, so the slice budget is large; the point is that this exercises
        runSlice()/pumpInput() rather than a bespoke `while` loop. */
-    let out = [], t0 = Date.now(), deadline = t0 + maxSeconds * 1000, lastBeat = 0;
+    let out = [], t0 = Date.now(), deadline = t0 + maxSeconds * 1000, lastBeat = 0, idleSleptMs = 0;
     let stop = null, promptAt = 0, sawBarePrompt = false;
     while (Date.now() < deadline) {
         let r = m.runSlice(200);
+        /* pcjsvax-af8.  The tab's Worker answers `r.idleUsecs` with a timer; under Node there is no
+           event loop to return to, so this is the same policy expressed synchronously.  Without it
+           this loop would spin on a machine that has correctly stopped executing -- which would
+           hide the very defect the idle path exists to fix, from the one test that runs the tab's
+           own driver. */
+        if (r.idleSleepMs > 0) { idleSleptMs += r.idleSleepMs; Atomics.wait(IDLE_SLEEPER, 0, 0, r.idleSleepMs); }
         let chunk = m.drainOutput();
         if (chunk) for (let b of chunk) out.push(b);
         if (r.stop) { stop = r.stop; break; }
@@ -169,6 +178,11 @@ function main()
         `${(s.cacheResidentBytes / (1 << 20)).toFixed(1)} MiB of ${(s.cacheCeilingBytes / (1 << 20)).toFixed(0)} MiB`);
     console.log(`  heap      ${(process.memoryUsage().heapUsed / (1 << 20)).toFixed(0)} MB used, ` +
         `${(process.memoryUsage().external / (1 << 20)).toFixed(0)} MB external`);
+    /* pcjsvax-af8.  Reported, not graded -- tests/idlediff.js is where idling is GRADED, and
+       grading a wall-clock ratio here would be a flake (HANDOFF.md standing rule 17). */
+    console.log(`  idle      ${m.cpu.idleCount} skips over ${m.cpu.idleSkipped} elided instructions, ` +
+        `${(idleSleptMs / 1000).toFixed(1)} s slept of ${((Date.now() - t0) / 1000).toFixed(1)} s wall clock` +
+        (m.cpu.idleSites.size ? `; sites ${[...m.cpu.idleSites].map(([k, v]) => `${k}=${v}`).join(" ")}` : ""));
 
     let passed = 0, failed = 0;
     const check = (name, cond, detail) => {

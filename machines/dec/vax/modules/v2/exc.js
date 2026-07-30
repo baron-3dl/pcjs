@@ -138,6 +138,7 @@ import { VAXFault, VAXFAULT } from "./decode.js";
 import MMUVAX from "./mmu.js";
 import { OPCODES } from "./drom.js";
 import { VAX } from "./defines.js";
+import { idleMtprIpl } from "./idle.js";
 
 const L_LONG = 4;
 const nSP = 14, nPC = 15;
@@ -1468,6 +1469,11 @@ class VAXExc {
 
         case MT.IPL:
             cpu.psl = (cpu.psl & ~PSL_IPL) | ((val & PSL_M_IPL) << PSL_V_IPL);
+            /* vax_cpu1.c:1510-1513 -- NetBSD/OpenBSD's idle loop, the only cpu_idle() site that
+               lives in an IPR write rather than an instruction body, and the only one that tests
+               the LIVE PC rather than fault_PC (the C's own comment: "System Space (Not BOOT
+               ROM)").  See modules/v2/idle.js. */
+            if (cpu.idleEnable) idleMtprIpl(cpu, val);
             break;
 
         case MT.ASTLVL:

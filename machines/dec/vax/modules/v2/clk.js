@@ -519,6 +519,58 @@ export default class ClkVAX {
         if ((this.csr & CSR_IE) && exc) exc.raiseInterrupt(IPL_CLK_ABS, INT_V_CLK);
         if (!this.todrBlow && this.todrReg !== 0) this.todrReg = (this.todrReg + 1) | 0;
     }
+
+    /**
+     * instrsToEvent()
+     *
+     * pcjsvax-af8.  How many more tick() calls -- COUNTING THE ONE ABOUT TO HAPPEN AS 1 -- until
+     * this device next does something the guest can observe.  tick() fires on the call that brings
+     * `_instrsSinceTick` up to INSTRS_PER_TICK, so that call is the (INSTRS_PER_TICK -
+     * _instrsSinceTick)-th from now.  Never zero and never negative: `_instrsSinceTick` is reset to
+     * 0 by the firing call and only ever incremented by one per call in between.
+     *
+     * @this {ClkVAX}
+     * @returns {number}
+     */
+    instrsToEvent() { return INSTRS_PER_TICK - this._instrsSinceTick; }
+
+    /**
+     * idleAble -- SIMH's UNIT_IDLE.  `UNIT clk_unit = { UDATA (&clk_svc, UNIT_IDLE+UNIT_FIX, ...)}`
+     * (vax_stddev.c:218).  This is the ONE device in this machine whose next event is allowed to
+     * put the host to sleep; see idle.js's idleSkip() for why that distinction is load-bearing.
+     *
+     * @this {ClkVAX}
+     * @returns {boolean}
+     */
+    get idleAble() { return true; }
+
+    /**
+     * skipInstrs(n)
+     *
+     * pcjsvax-af8.  Advance this device's notion of retired instructions by `n` WITHOUT firing --
+     * idle.js guarantees `n < instrsToEvent()`, so the tick boundary is never crossed here and the
+     * next real tick() call fires on exactly the instruction it would have fired on anyway.  That
+     * is what keeps TODR bit-identical across an idle skip; a skip that stopped this counter would
+     * stop the guest clock, which is pcjsvax-c16 (`Event: Too Few Servers Detected`, a startup that
+     * never completes).
+     *
+     * The bound is ASSERTED, not assumed: a caller that oversteps would silently swallow a clock
+     * tick, and a swallowed tick is invisible in every direction except the guest's own idea of
+     * what time it is.
+     *
+     * @this {ClkVAX}
+     * @param {number} n
+     */
+    skipInstrs(n)
+    {
+        if (!(n >= 0) || n >= this.instrsToEvent()) {
+            throw new Error(`clk.js: skipInstrs(${n}) would cross the tick boundary ` +
+                `(${this._instrsSinceTick} of ${INSTRS_PER_TICK} elapsed, ` +
+                `${this.instrsToEvent()} to go).  A skip past a device's own event silently ` +
+                `swallows it; idle.js must pass min(instrsToEvent) - 1 over every device`);
+        }
+        this._instrsSinceTick += n;
+    }
 }
 
 export {

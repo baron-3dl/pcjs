@@ -56,8 +56,10 @@
  */
 
 import { VAXStop, ROM_MAGIC_BYTE } from "../modules/v2/cpustate.js";
+import { IdleThrottle } from "../modules/v2/idle.js";
 import { makeRomMachine } from "../tests/rommachine.js";
 import RQVAX, { RQ_BASE, IOLN_RQ, RQDX3_CTYPE, U_RO } from "../modules/v2/rq.js";
+import { USECS_PER_INSTR } from "../modules/v2/clk.js";
 
 /** console.js's CSR_DONE.  console.js does not export it; it is the architected bit at the
     architected offset every VAX CSR-shaped device shares, and it is read ONLY to answer "has the
@@ -67,6 +69,20 @@ const CSR_DONE = 0x0080;
 /** Instructions between wall-clock samples inside a slice.  Small enough that a slice overruns its
     budget by well under a frame, large enough that Date.now() is not in the hot path. */
 const BATCH = 20000;
+
+/** How often, inside a BATCH, the slice looks at `cpu.idleUsecs` (pcjsvax-af8).  A slice must
+    RETURN once the guest has gone idle, or the caller never gets the chance to sleep instead of
+    re-arming -- but a test on every instruction would be paid by the whole boot, which is not
+    idle.  64 is small enough that the overshoot is a rounding error against a 10 ms clk tick and
+    coarse enough to disappear into the call to stepCPU() next to it. */
+const IDLE_POLL = 64;
+
+/** The guest microseconds a slice must have elided before it hands control back to sleep on them.
+    Four clk ticks: at this engine's measured ~3,900 instructions per millisecond that converts to
+    about 10 ms of real sleep (see modules/v2/idle.js's IdleThrottle for why the conversion is a
+    measured rate and not the guest time), which is one frame -- often enough that a keystroke or a
+    device is never far away, rare enough that the wakeups are ~100/s rather than ~400/s. */
+const IDLE_YIELD_USECS = 40000;
 
 /**
  * THE AUTO-BOOT SCRIPT.  tests/vmsbootprobe.js's INPUT_RULES, unchanged in mechanism and in intent:
@@ -140,6 +156,8 @@ export class VaxMachine
      *   {number}     [memBytes]    RAM size; defaults to rommachine.js's 16 MB
      *   {Object}     [disk]        an rq.js image provider for DUA0, or null for no disk at all
      *   {boolean}    [autoBoot]    run AUTO_RULES
+     *   {boolean}    [idle]        guest-idle detection; DEFAULTS TRUE here (pcjsvax-af8)
+     *   {string}     [idleMode]    which OS's idle loops to recognise; defaults to VMS
      */
     constructor(opts)
     {
@@ -165,6 +183,16 @@ export class VaxMachine
         this.lastOutLen = 0;
         this.lastOutStep = 0;
         this.marks = [];
+        /* pcjsvax-af8: idling ON unless the caller says otherwise.  This is the tab's machine, and
+           a tab that pins a core at a login prompt is the defect the item exists to close.  The
+           34-check gate does NOT come through here -- it builds its machines from
+           tests/rommachine.js directly, where cpustate.js's own default (off) stands. */
+        this.cpu.idleEnable = opts.idle === undefined ? true : !!opts.idle;
+        this.throttle = new IdleThrottle();
+        if (opts.idleMode && !this.cpu.setIdleMode(opts.idleMode)) {
+            throw new Error(`VaxMachine: unknown idle mode "${opts.idleMode}"`);
+        }
+
         this.autoBoot = !!opts.autoBoot;
         this.rules = opts.rules || AUTO_RULES;
         this.repeatRules = opts.repeatRules || AUTO_REPEAT_RULES;
@@ -197,24 +225,61 @@ export class VaxMachine
      * yielding contract: the caller re-arms it from a timer/MessageChannel, so the event loop --
      * and therefore the UI, and therefore the keyboard -- runs between slices.
      *
+     * *** IT ALSO RETURNS EARLY WHEN THE GUEST GOES IDLE (pcjsvax-af8). ***  `idleUsecs` is guest
+     * time the CPU fast-forwarded through instead of executing; the moment a slice has banked a
+     * clk tick's worth of it, the slice ENDS and reports it, so browser/vaxworker.js can wait on a
+     * timer instead of re-arming its MessageChannel immediately.  Without the early return a slice
+     * would happily spend its whole 16 ms budget skipping through 60+ ticks of guest time and the
+     * tab would still pin a core -- the skip alone saves instructions, only the caller can save
+     * CPU.  MEASURED: at a V5.5 login prompt this returns after ~1,200 retired instructions where
+     * the un-idled slice retired ~65,000.
+     *
      * @param {number} msBudget
-     * @returns {{steps:number, stop:(string|null)}}
+     * @returns {{steps:number, stop:(string|null), idleUsecs:number, idleSleepMs:number}}
      */
     runSlice(msBudget)
     {
-        if (this.stop) return {steps: 0, stop: this.stop};
+        if (this.stop) return {steps: 0, stop: this.stop, idleUsecs: 0, idleSleepMs: 0};
         let t0 = Date.now(), n0 = this.steps, cpu = this.cpu;
         try {
             do {
-                for (let i = 0; i < BATCH; i++) cpu.stepCPU(1);
-                this.steps += BATCH;
-            } while (Date.now() - t0 < msBudget);
+                for (let i = 0; i < BATCH; i += IDLE_POLL) {
+                    for (let j = 0; j < IDLE_POLL; j++) cpu.stepCPU(1);
+                    this.steps += IDLE_POLL;
+                    if (cpu.idleUsecs >= IDLE_YIELD_USECS) break;
+                }
+            } while (cpu.idleUsecs < IDLE_YIELD_USECS && Date.now() - t0 < msBudget);
         } catch (e) {
             if (!(e instanceof VAXStop)) { this.stop = `ERROR ${(e && e.message) || e}`; throw e; }
             this.stop = `VAXStop ${e.reason} detail=${e.detail}`;
         }
         this.pumpInput();
-        return {steps: this.steps - n0, stop: this.stop};
+        let steps = this.steps - n0, idleUsecs = cpu.takeIdleUsecs();
+        /* The rate estimate is fed ONLY from slices that actually executed -- `Date.now() - t0`
+           here is pure execution time, because the caller has not slept yet.  An idling slice
+           retires a few hundred instructions in well under a millisecond and is dropped by
+           noteBusy()'s own filter, so it cannot drag the estimate down and make the machine sleep
+           longer than it should. */
+        if (idleUsecs === 0) this.throttle.noteBusy(steps, Date.now() - t0);
+        return {steps, stop: this.stop, idleUsecs,
+                idleSleepMs: this.throttle.sleepMsFor(idleUsecs / USECS_PER_INSTR)};
+    }
+
+    /**
+     * setIdle(on, mode)
+     *
+     * pcjsvax-af8.  `SET CPU IDLE=<os>` / `SET CPU NOIDLE`.  Returns false if `mode` is not a name
+     * modules/v2/idle.js's OS_TAB carries, so a typo cannot silently mean "no idling".
+     *
+     * @param {boolean} on
+     * @param {string} [mode]
+     * @returns {boolean}
+     */
+    setIdle(on, mode)
+    {
+        if (mode && !this.cpu.setIdleMode(mode)) return false;
+        this.cpu.idleEnable = !!on;
+        return true;
     }
 
     /**
@@ -228,17 +293,37 @@ export class VaxMachine
     {
         let dev = this.consoleDev;
 
-        /* Console quiescence, sampled once per slice -- the clock a `quiet` rule waits on. */
-        if (dev.output.length !== this.lastOutLen) { this.lastOutLen = dev.output.length; this.lastOutStep = this.steps; }
+        /*
+         * Console quiescence, sampled once per slice -- the clock a `quiet` rule waits on.
+         *
+         * *** THE CLOCK IS GUEST TIME, NOT INSTRUCTIONS RETIRED (pcjsvax-af8). ***  It used to be
+         * `this.steps`, and that was equivalent right up until the CPU learned to fast-forward
+         * through an idle loop instead of executing it.  A quiet threshold of 200,000 instructions
+         * is 200,000 microseconds of guest time (clk.js's USECS_PER_INSTR = 1) and that is what the
+         * rule means; measured against RETIRED instructions on an idling machine it becomes
+         * 200,000 / 17,000 per second = ELEVEN SECONDS, and the RETURN that wakes LOGINOUT arrives
+         * that much late -- which is pcjsvax-6c9's symptom exactly, reintroduced by the fix for a
+         * different item.  `cpu.nTotalCycles` counts retired AND elided instructions, so it is the
+         * same number it always was whether or not the machine idled through it.
+         */
+        let now = this.cpu.nTotalCycles;
+        if (dev.output.length !== this.lastOutLen) { this.lastOutLen = dev.output.length; this.lastOutStep = now; }
 
         if (this.pending.length && this.holdQuiet > 0) {
-            if (this.steps - this.lastOutStep >= this.holdQuiet) this.holdQuiet = 0;
+            if (now - this.lastOutStep >= this.holdQuiet) this.holdQuiet = 0;
             else return;
         }
         while (this.pending.length && !(dev.rxcs & CSR_DONE)) {
             dev.injectChar(this.pending.charCodeAt(0) & 0xFF);
             this.pending = this.pending.slice(1);
         }
+        /* *** RETIRE THE HOLD WITH THE STRING IT BELONGED TO. ***  `holdQuiet` is a property of the
+           RULE that queued these characters, not a mode of the machine, and nothing used to clear
+           it: once `post-startup-wakeup` (quiet: 200000) had fired, every LATER keystroke -- a
+           human's, at the login prompt -- inherited its hold and waited out a quiescence it was
+           never meant to wait for.  Invisible while the queue only ever carried auto-boot rules;
+           a keystroke that answers seconds late the moment a human types one. */
+        if (!this.pending.length) this.holdQuiet = 0;
         if (this.pending.length || !this.autoBoot) return;
         /* Once every one-shot rule has fired the script is DONE and nothing types again -- the same
            guard tests/vmsbootprobe.js uses, and here it also means the machine stops typing the

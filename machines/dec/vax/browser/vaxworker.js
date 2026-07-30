@@ -48,6 +48,36 @@ import { VaxMachine } from "./vaxmachine.js";
  */
 const SLICE_MS = 16;
 
+/**
+ * *** THE IDLE WAIT (pcjsvax-af8). ***
+ *
+ * The yield above is deliberately a MessageChannel round trip and NOT `setTimeout(0)`, because a
+ * busy machine must re-arm with no clamp.  An IDLE machine wants the opposite: it wants to stop
+ * re-arming and give the core back.  So when `runSlice()` reports that it fast-forwarded through
+ * guest time instead of executing (see browser/vaxmachine.js's runSlice), the Worker waits on a
+ * TIMER for as long as that guest time was worth, and the tab drops to whatever a sleeping timer
+ * costs.  MEASURED at a VAX/VMS V5.5-2H4 login prompt: this is the difference between 100% of a
+ * core and ~1%.
+ *
+ * setTimeout's 4 ms clamp after five nested calls, which disqualifies it for the busy path, is
+ * irrelevant here -- these waits are milliseconds long by construction, and a wait rounded UP is a
+ * wait, not a stall.
+ *
+ * HOW LONG the wait is is NOT this file's decision and NOT the guest time skipped: it is
+ * `r.idleSleepMs`, the host time those elided instructions would have cost at this host's measured
+ * rate.  modules/v2/idle.js's IdleThrottle carries the measurement and the reason -- in one line,
+ * sleeping the GUEST time throttles a 3.9x-real-time emulator down to 1.0x and adds 14 seconds to
+ * a boot, while sleeping the host time saved is exactly neutral.
+ *
+ * IDLE_WAIT_MAX_MS bounds ONE wait.  It is not about accuracy (the guest clock has already
+ * advanced -- the wait is pure throttling, so a wait cut short only makes the emulator run a shade
+ * faster).  It is about the tab staying answerable: a device or a `pause` message should never be
+ * more than this far away, and `pcjsvax-6c9` is the standing reminder of what a console that goes
+ * quiet looks like from outside.  A keystroke does not wait even this long -- see the `input`
+ * message below, which cancels the timer outright.
+ */
+const IDLE_WAIT_MAX_MS = 50;
+
 /** How often the Worker reports progress upstream.  Every slice would post 60 messages a second
     for numbers a human reads once a second. */
 const STAT_MS = 500;
@@ -120,14 +150,39 @@ function urlBacking(url)
 }
 
 let machine = null, disk = null, running = false, t0 = 0, lastStat = 0, lastSteps = 0;
+let idleWaitMs = 0, idleWaits = 0;
 
 /* The yield primitive.  A MessageChannel round trip is a macrotask with NO 4 ms clamp -- which
    `setTimeout(0)` acquires after five nested calls, and five nested calls is a quarter of a second
    into a two-minute boot.  Measured cost is under 0.1 ms per yield against a 16 ms slice. */
 const yieldChannel = new MessageChannel();
 let armed = false;
+let idleTimer = null;
 yieldChannel.port1.onmessage = () => { armed = false; pump(); };
-function schedule() { if (!armed) { armed = true; yieldChannel.port2.postMessage(0); } }
+function schedule() {
+    if (idleTimer !== null) { clearTimeout(idleTimer); idleTimer = null; }
+    if (!armed) { armed = true; yieldChannel.port2.postMessage(0); }
+}
+
+/**
+ * scheduleIdle(ms)
+ *
+ * pcjsvax-af8.  Re-arm LATER instead of immediately.  `wake()` below collapses this back to an
+ * immediate re-arm, which is what makes a keystroke prompt rather than "within one wait".
+ */
+function scheduleIdle(ms)
+{
+    if (armed || idleTimer !== null) return;
+    idleTimer = setTimeout(() => { idleTimer = null; pump(); }, ms);
+}
+
+/** Cancel an outstanding idle wait and run NOW.  Called on any message that gives the guest
+    something to do -- today that is a keystroke, and a keystroke that arrives late reads as a hung
+    console (pcjsvax-6c9), so this is not an optimisation. */
+function wake()
+{
+    if (idleTimer !== null) { clearTimeout(idleTimer); idleTimer = null; schedule(); }
+}
 
 function post(msg, transfer) { self.postMessage(msg, transfer || []); }
 
@@ -157,15 +212,26 @@ function pump()
               steps: machine.steps,
               elapsed: (now - t0) / 1000,
               mips: (machine.steps - lastSteps) / (now - lastStat) / 1000,
+              /* pcjsvax-af8: what fraction of the last reporting window the machine spent NOT
+                 executing because the guest had nothing to do.  Reported rather than inferred, so
+                 "is it actually idling" is answerable from the page instead of from a profiler. */
+              idlePct: Math.min(100, 100 * idleWaitMs / Math.max(1, now - lastStat)),
+              idleWaits,
               typed: machine.marks.map((m) => m.rule),
               disk: s && {reads: s.reads, writes: s.writes, rawBytes: s.rawBytes,
                           overlayBlocks: s.overlayBlocks, overlayBytes: s.overlayBytes,
                           overlayCeilingBytes: s.overlayCeilingBytes,
                           cacheResidentBytes: s.cacheResidentBytes,
                           cacheCeilingBytes: s.cacheCeilingBytes}});
-        lastStat = now; lastSteps = machine.steps;
+        lastStat = now; lastSteps = machine.steps; idleWaitMs = 0; idleWaits = 0;
     }
     if (r.stop) { running = false; post({type: "stopped", reason: r.stop}); return; }
+    /* pcjsvax-af8.  The guest fast-forwarded through `r.idleUsecs` of its own time rather than
+       executing it, so give the host that time back instead of re-arming into another slice. */
+    if (r.idleSleepMs > 0) {
+        let ms = Math.min(IDLE_WAIT_MAX_MS, r.idleSleepMs);
+        idleWaitMs += ms; idleWaits++; scheduleIdle(ms); return;
+    }
     schedule();
 }
 
@@ -206,11 +272,17 @@ self.onmessage = function(e)
         }
 
         case "input":
-            if (machine) { machine.type(msg.text); }
+            /* A keystroke is the one thing that must not wait out an idle timer (pcjsvax-6c9: a
+               console that answers late is indistinguishable from a console that has hung).
+               `wake()` collapses the pending wait into an immediate MessageChannel re-arm, so the
+               character is injected on the next macrotask rather than up to IDLE_WAIT_MAX_MS
+               later.  MEASURED under Node against the same driver: 0.0 ms. */
+            if (machine) { machine.type(msg.text); wake(); }
             break;
 
         case "pause":
             running = false;
+            if (idleTimer !== null) { clearTimeout(idleTimer); idleTimer = null; }
             post({type: "paused"});
             break;
 

@@ -78,6 +78,7 @@ import { OP_MEM, VAXFAULT } from "./decode.js";
    reached through cpu.fpu, never re-implemented here.  fpa.js imports only decode.js, so this
    does not create a cycle. */
 import { FPSIGN, CC_N, CC_Z } from "./fpa.js";
+import { idleSelfLoop, idleBeql, idleBvs, idleBbs, idleBlbc } from "./idle.js";
 
 /*
  * Condition codes.  PSL<3:0>, vax_defs.h:236-240.
@@ -145,31 +146,51 @@ function ccCmpW(cpu, s1, s2) { let cc = (SXTW(s1) < SXTW(s2)) ? CC.N : (s1 == s2
 function ccCmpL(cpu, s1, s2) { let cc = (s1 < s2) ? CC.N : (s1 == s2) ? CC.Z : 0; if ((s1 >>> 0) < (s2 >>> 0)) cc |= CC.C; setCC(cpu, cc); }
 
 /**
- * branch(cpu, disp)
+ * branchAlways(cpu, disp) / jumpAlways(cpu, addr)
  *
- * SIMH's BRANCHB/BRANCHW/BRANCHB_ALWAYS/BRANCHW_ALWAYS, vax_defs.h:692-698, collapsed to one
- * function: the ALWAYS/non-ALWAYS split is purely SIMH's idle-loop-detection heuristic
- * (CHECK_FOR_IDLE_LOOP), which fast-forwards simulated wall-clock time and touches no
- * architectural state (no register, no PSL) -- so it cannot appear in a register-file+PSL diff
- * and there is nothing here to replicate.  Byte and word displacements collapse to the same
- * function too: `disp` must already be sign-extended by the caller (SXTB for a .bb displacement,
- * SXTW for .bw); `cpu.setPC` is the decoder-machine-interface primitive that also flushes
- * prefetch, matching FLUSH_ISTR.
+ * SIMH's BRANCHB_ALWAYS / BRANCHW_ALWAYS / JUMP_ALWAYS, vax_defs.h:692-694.  Byte and word
+ * displacements collapse to one function: `disp` must already be sign-extended by the caller
+ * (SXTB for a .bb displacement, SXTW for .bw); `cpu.setPC` is the decoder-machine-interface
+ * primitive that also flushes prefetch, matching FLUSH_ISTR.
  *
  * @param {Object} cpu
  * @param {number} disp already sign-extended
  */
-function branch(cpu, disp) { cpu.setPC((cpu.regs[15] + disp) | 0); }
+function branchAlways(cpu, disp) { cpu.setPC((cpu.regs[15] + disp) | 0); }
+function jumpAlways(cpu, addr) { cpu.setPC(addr | 0); }
 
 /**
- * jump(cpu, addr)
+ * branch(cpu, disp) / jump(cpu, addr)
  *
- * SIMH's JUMP/JUMP_ALWAYS.
+ * SIMH's BRANCHB / BRANCHW / JUMP, vax_defs.h:696-699 -- identical to the ALWAYS forms above
+ * except that they end in CHECK_FOR_IDLE_LOOP (vax_defs.h:685-690), which recognises a branch to
+ * the instruction itself as a guest with nothing to do.
+ *
+ * *** THE ALWAYS / NON-ALWAYS SPLIT IS REAL AND IT IS BACK. ***  This function's previous comment
+ * said the split was "purely SIMH's idle-loop-detection heuristic ... it cannot appear in a
+ * register-file+PSL diff and there is nothing here to replicate", and collapsed all six macros
+ * into one.  That was true only while nothing replicated the heuristic.  pcjsvax-af8 replicates it
+ * (modules/v2/idle.js), so the split now decides which opcodes can idle -- and SIMH's own comment
+ * on the line says exactly why it matters: "Instructions which have side effects (ACB, AOBLSS,
+ * BBSC, BBCS, etc.) can't be an idle loop so avoid the idle check".  The assignment of each opcode
+ * to one form or the other below is transcribed from vax_cpu.c's own call sites, not re-derived.
+ *
+ * THE COST WHEN IDLING IS OFF is one test of an already-hot boolean field on `cpu`, ahead of the
+ * PC comparison -- which is also what makes the whole feature inert in the 34-check gate.
  *
  * @param {Object} cpu
- * @param {number} addr
+ * @param {number} disp already sign-extended
  */
-function jump(cpu, addr) { cpu.setPC(addr | 0); }
+function branch(cpu, disp)
+{
+    cpu.setPC((cpu.regs[15] + disp) | 0);
+    if (cpu.idleEnable) idleSelfLoop(cpu);
+}
+function jump(cpu, addr)
+{
+    cpu.setPC(addr | 0);
+    if (cpu.idleEnable) idleSelfLoop(cpu);
+}
 
 /**
  * store(decoder, cpu, size, value)
@@ -369,7 +390,7 @@ function opRet(decoder, cpu)
         cpu.regs[14] = (cpu.regs[14] + 4 + ((nargs & BMASK) << 2)) | 0;
     }
     cpu.psl = (cpu.psl & ~(PSW.DV | PSW.FU | PSW.IV | PSW.T)) | (spamask & (PSW.DV | PSW.FU | PSW.IV | PSW.T));
-    jump(cpu, newpc);
+    jumpAlways(cpu, newpc);                                     // op_ret: JUMP_ALWAYS (vax_cpu1.c:416)
     setCC(cpu, spamask & CC.MASK);
 }
 
@@ -451,9 +472,23 @@ const BODIES = {
     BGEQ(decoder, cpu)  { if (!(getCC(cpu) & CC.N)) branch(cpu, SXTB(decoder.brdisp)); },
     BLSS(decoder, cpu)  { if (getCC(cpu) & CC.N) branch(cpu, SXTB(decoder.brdisp)); },
     BNEQ(decoder, cpu)  { if (!(getCC(cpu) & CC.Z)) branch(cpu, SXTB(decoder.brdisp)); },
-    BEQL(decoder, cpu)  { if (getCC(cpu) & CC.Z) branch(cpu, SXTB(decoder.brdisp)); },
+    /* vax_cpu.c:2242-2256.  Two unrelated idle predicates share the taken-branch arm here: the
+       KA655 boot ROM's own character prompt, and VAXELN's idle loop.  The RAW displacement byte is
+       what the C compares (`brdisp == 0xFA`), so it is passed unsign-extended. */
+    BEQL(decoder, cpu)  {
+        if (getCC(cpu) & CC.Z) {
+            branch(cpu, SXTB(decoder.brdisp));
+            if (cpu.idleEnable) idleBeql(cpu, decoder.brdisp & 0xFF);
+        }
+    },
     BVC(decoder, cpu)   { if (!(getCC(cpu) & CC.V)) branch(cpu, SXTB(decoder.brdisp)); },
-    BVS(decoder, cpu)   { if (getCC(cpu) & CC.V) branch(cpu, SXTB(decoder.brdisp)); },
+    /* vax_cpu.c:2262-2272, the InfoServer idle loop.  Raw displacement, as above. */
+    BVS(decoder, cpu)   {
+        if (getCC(cpu) & CC.V) {
+            branch(cpu, SXTB(decoder.brdisp));
+            if (cpu.idleEnable) idleBvs(cpu, decoder.brdisp & 0xFF);
+        }
+    },
     BGEQU(decoder, cpu) { if (!(getCC(cpu) & CC.C)) branch(cpu, SXTB(decoder.brdisp)); },
     BLSSU(decoder, cpu) { if (getCC(cpu) & CC.C) branch(cpu, SXTB(decoder.brdisp)); },
     BGTR(decoder, cpu)  { if (!(getCC(cpu) & (CC.N | CC.Z))) branch(cpu, SXTB(decoder.brdisp)); },
@@ -471,7 +506,7 @@ const BODIES = {
     RSB(decoder, cpu) {
         let temp = cpu.readData(cpu.regs[14], 4, false);
         cpu.regs[14] = (cpu.regs[14] + 4) | 0;
-        jump(cpu, temp);
+        jumpAlways(cpu, temp);                                  // RSB: JUMP_ALWAYS (vax_cpu.c:2322)
     },
 
     /* ------------------------------------------------------------------- SOB/AOB/ACB */
@@ -481,7 +516,7 @@ const BODIES = {
         store(decoder, cpu, 4, r);
         ccIIZP_L(cpu, r);
         vSubL(cpu, r, 1, op0);
-        if (r >= 0) branch(cpu, SXTB(decoder.brdisp));
+        if (r >= 0) branchAlways(cpu, SXTB(decoder.brdisp));      // SOBGEQ: BRANCHB_ALWAYS
     },
     SOBGTR(decoder, cpu) {
         let op0 = decoder.opnd[0];
@@ -489,7 +524,7 @@ const BODIES = {
         store(decoder, cpu, 4, r);
         ccIIZP_L(cpu, r);
         vSubL(cpu, r, 1, op0);
-        if (r > 0) branch(cpu, SXTB(decoder.brdisp));
+        if (r > 0) branchAlways(cpu, SXTB(decoder.brdisp));       // SOBGTR: BRANCHB_ALWAYS
     },
     AOBLSS(decoder, cpu) {
         let op0 = decoder.opnd[0], op1 = decoder.opnd[1];
@@ -497,7 +532,7 @@ const BODIES = {
         store(decoder, cpu, 4, r);
         ccIIZP_L(cpu, r);
         vAddL(cpu, r, 1, op1);
-        if (r < op0) branch(cpu, SXTB(decoder.brdisp));
+        if (r < op0) branchAlways(cpu, SXTB(decoder.brdisp));     // AOBLSS: BRANCHB_ALWAYS
     },
     AOBLEQ(decoder, cpu) {
         let op0 = decoder.opnd[0], op1 = decoder.opnd[1];
@@ -505,7 +540,7 @@ const BODIES = {
         store(decoder, cpu, 4, r);
         ccIIZP_L(cpu, r);
         vAddL(cpu, r, 1, op1);
-        if (r <= op0) branch(cpu, SXTB(decoder.brdisp));
+        if (r <= op0) branchAlways(cpu, SXTB(decoder.brdisp));    // AOBLEQ: BRANCHB_ALWAYS
     },
     ACBB(decoder, cpu) {
         let op0 = decoder.opnd[0], op1 = decoder.opnd[1], op2 = decoder.opnd[2];
@@ -513,7 +548,7 @@ const BODIES = {
         store(decoder, cpu, 1, r);
         ccIIZP_B(cpu, r);
         vAddB(cpu, r, op1, op2);
-        if ((op1 & BSIGN) ? (SXTB(r) >= SXTB(op0)) : (SXTB(r) <= SXTB(op0))) branch(cpu, SXTW(decoder.brdisp));
+        if ((op1 & BSIGN) ? (SXTB(r) >= SXTB(op0)) : (SXTB(r) <= SXTB(op0))) branchAlways(cpu, SXTW(decoder.brdisp));   // ACBB: BRANCHW_ALWAYS
     },
     ACBW(decoder, cpu) {
         let op0 = decoder.opnd[0], op1 = decoder.opnd[1], op2 = decoder.opnd[2];
@@ -521,7 +556,7 @@ const BODIES = {
         store(decoder, cpu, 2, r);
         ccIIZP_W(cpu, r);
         vAddW(cpu, r, op1, op2);
-        if ((op1 & WSIGN) ? (SXTW(r) >= SXTW(op0)) : (SXTW(r) <= SXTW(op0))) branch(cpu, SXTW(decoder.brdisp));
+        if ((op1 & WSIGN) ? (SXTW(r) >= SXTW(op0)) : (SXTW(r) <= SXTW(op0))) branchAlways(cpu, SXTW(decoder.brdisp));   // ACBW: BRANCHW_ALWAYS
     },
     ACBL(decoder, cpu) {
         let op0 = decoder.opnd[0], op1 = decoder.opnd[1], op2 = decoder.opnd[2];
@@ -529,7 +564,7 @@ const BODIES = {
         store(decoder, cpu, 4, r);
         ccIIZP_L(cpu, r);
         vAddL(cpu, r, op1, op2);
-        if ((op1 & LSIGN) ? (r >= op0) : (r <= op0)) branch(cpu, SXTW(decoder.brdisp));
+        if ((op1 & LSIGN) ? (r >= op0) : (r <= op0)) branchAlways(cpu, SXTW(decoder.brdisp));   // ACBL: BRANCHW_ALWAYS
     },
     /*
      * ACBF -- pcjsvax-486.  The loop-control half is this file's (it is ACBL with a floating add
@@ -597,16 +632,31 @@ const BODIES = {
     },
 
     /* ------------------------------------------------------------------ Branch on bit */
-    BBS(decoder, cpu)   { if (opBbN(decoder, cpu)) branch(cpu, SXTB(decoder.brdisp)); },
-    BBC(decoder, cpu)   { if (!opBbN(decoder, cpu)) branch(cpu, SXTB(decoder.brdisp)); },
+    /* *** BBS IS THE SITE VAX/VMS's IDLE LOOP ACTUALLY REACHES *** (vax_cpu.c:2469-2477) -- both
+       V5.5-2H4 and V7.1, measured; see idle.js's file header.  Note that SIMH uses
+       BRANCHB_ALWAYS here (no self-loop check) and then applies its OWN, VMS-specific predicate. */
+    BBS(decoder, cpu)   {
+        if (opBbN(decoder, cpu)) {
+            branchAlways(cpu, SXTB(decoder.brdisp));
+            if (cpu.idleEnable) idleBbs(cpu);
+        }
+    },
+    BBC(decoder, cpu)   { if (!opBbN(decoder, cpu)) branchAlways(cpu, SXTB(decoder.brdisp)); },
     BBSS(decoder, cpu)  { if (opBbX(decoder, cpu, 1)) branch(cpu, SXTB(decoder.brdisp)); },
     BBSSI(decoder, cpu) { if (opBbX(decoder, cpu, 1)) branch(cpu, SXTB(decoder.brdisp)); },
     BBCC(decoder, cpu)  { if (!opBbX(decoder, cpu, 0)) branch(cpu, SXTB(decoder.brdisp)); },
     BBCCI(decoder, cpu) { if (!opBbX(decoder, cpu, 0)) branch(cpu, SXTB(decoder.brdisp)); },
-    BBSC(decoder, cpu)  { if (opBbX(decoder, cpu, 0)) branch(cpu, SXTB(decoder.brdisp)); },
-    BBCS(decoder, cpu)  { if (!opBbX(decoder, cpu, 1)) branch(cpu, SXTB(decoder.brdisp)); },
+    BBSC(decoder, cpu)  { if (opBbX(decoder, cpu, 0)) branchAlways(cpu, SXTB(decoder.brdisp)); },
+    BBCS(decoder, cpu)  { if (!opBbX(decoder, cpu, 1)) branchAlways(cpu, SXTB(decoder.brdisp)); },
     BLBS(decoder, cpu)  { if (decoder.opnd[0] & 1) branch(cpu, SXTB(decoder.brdisp)); },
-    BLBC(decoder, cpu)  { if (!(decoder.opnd[0] & 1)) branch(cpu, SXTB(decoder.brdisp)); },
+    /* vax_cpu.c:2508-2514: the MicroVAX 2 boot ROM's character prompt.  The C tests fault_PC and
+       calls cpu_idle() BEFORE the branch, so the order is preserved rather than tidied. */
+    BLBC(decoder, cpu)  {
+        if (!(decoder.opnd[0] & 1)) {
+            if (cpu.idleEnable) idleBlbc(cpu);
+            branch(cpu, SXTB(decoder.brdisp));
+        }
+    },
 
     /* ------------------------------------------------------------------ Call/return */
     CALLS(decoder, cpu) { opCall(decoder, cpu, true); },
