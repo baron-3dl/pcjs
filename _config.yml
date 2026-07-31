@@ -55,10 +55,20 @@ plugins:
 
 software:
   # vaxdisks: pcjsvax-6e1 -- media for the VAX/VMS demo (pcjsvax-545), following the SAME
-  # class-name-per-subdomain convention as decdisks/diskettes/etc below.  Server value here is a
-  # placeholder pending pcjsvax-e1f, which owns the actual GitHub Pages deployment and domain.
+  # class-name-per-subdomain convention as decdisks/diskettes/etc below.  We do not own a
+  # *.pcjs.org subdomain, so the class name is a path prefix on our own CloudFront distribution
+  # instead; downstream path construction (<server>/<file>) is unchanged.
+  #
+  # The media CANNOT live in this repo: the VMS 5.5 system disk is 159,334,400 bytes and GitHub
+  # hard-rejects any file over 100 MB.  Backed by S3 + CloudFront in AWS account 939005125687
+  # (provisioned by 3dl-dev/3dl-infra-aws#16 and #17; tenant Terraform in pcjs-vax/terraform/),
+  # serving the images RAW -- no gzip, no JSON conversion.  CORS is set on the distribution
+  # because this page is served from a different origin than the media, and ACAO alone is not
+  # enough: Content-Range must also appear in Access-Control-Expose-Headers, or a ranged read
+  # succeeds while the browser cannot see the range metadata -- which fails like disk corruption
+  # rather than like a CORS error.
   vaxdisks:
-    server: https://vaxdisks.pcjs.org
+    server: https://do6xafl18swnu.cloudfront.net/vaxdisks
   decdisks:
     server: https://decdisks.pcjs.org
   diskettes:
