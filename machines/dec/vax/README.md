@@ -14,7 +14,20 @@ control-flow, string/queue/INDEX/PROBE and NOP slices of instruction execution, 
 point, SCB exception/interrupt dispatch with the privileged registers, and — as of `pcjsvax-c05` —
 the CPU loop that wires them together.
 
-### Running it in a browser
+### Machines
+
+- [MicroVAX 3900 (KA655) with OpenVMS VAX](/machines/dec/vax/ka655/) — the PCjs machine, defined by
+  [machine.xml](/machines/dec/vax/ka655/machine.xml) and the
+  [RQDX3 Device XML](/machines/dec/vax/rqdx3/).  The page takes **no query parameters**: the ROM
+  comes from `<rom file="..."/>` and the system disk from the device's `autoMount`, exactly as
+  `machines/dec/pdp11/1170/panel/` gets its M9312 ROM and its RK03 cartridges.  Graded by
+  `tests/machineboot.mjs`.
+
+### Running the standalone adapter page in a browser
+
+`browser/vax.html` predates the machine XML (`pcjsvax-de8`), and it is kept because it is the path
+that takes **user-supplied local files** — HANDOFF.md §8's licensing firewall.  It is what
+`tests/browserboot.mjs` grades.
 
     cd ~/projects/pcjs && python3 -m http.server 8000
     open http://localhost:8000/machines/dec/vax/browser/vax.html

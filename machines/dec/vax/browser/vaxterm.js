@@ -141,7 +141,13 @@ export class VaxTerminal
         let cur = out[this.row] || "";
         out[this.row] = (cur.length < this.col ? cur + " ".repeat(this.col - cur.length) : cur.slice(0, this.col)) +
             "█" + cur.slice(this.col + 1);
-        this.el.textContent = out.join("\n");
+        /* pcjsvax-f23: browser/vax.html renders into a <pre>, but the PCjs machine XML's
+           `<control type="textarea" binding="print"/>` renders into a <textarea>, whose displayed
+           text is its VALUE and not its textContent once the browser has given it a value at all.
+           One terminal implementation, two hosts -- so the target is chosen here rather than
+           forked into a second widget. */
+        let text = out.join("\n");
+        if (this.el.tagName == "TEXTAREA") this.el.value = text; else this.el.textContent = text;
         this.el.scrollTop = this.el.scrollHeight;
     }
 
