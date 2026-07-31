@@ -20,8 +20,18 @@ Attached devices:
 - The console serial line on `OPA0:`, as a glass TTY
 
 The machine auto-boots `DUA0:` and answers OpenVMS's date prompt, so it arrives at a `Username:`
-prompt on its own.  Log in as `SYSTEM`.  Set `autoBoot="false"` on the `<cpu>` element (or press
-Reset and type at the console yourself) if you would rather stop at the KA655's `>>>` prompt.
+prompt on its own.  Set `autoBoot="false"` on the `<cpu>` element (or press Reset and type at the
+console yourself) if you would rather stop at the KA655's `>>>` prompt.
+
+> ### Log in with `SYSTEM` / `QUOKKA1953`
+>
+> The whole boot takes about a minute — the KA655's self-tests run first, then OpenVMS starts up, and
+> the login prompt is the last thing to appear.  Click the terminal before typing.
+>
+> There is no secret here worth keeping: this is a throwaway system disk running in your own browser
+> tab, the credentials are in this repository, and nothing you do reaches anything else.  Writes go
+> to an in-memory copy-on-write overlay and vanish when you close the tab — the disk image itself is
+> fetched read-only and is never modified.
 
 ### What works, and what does not
 
