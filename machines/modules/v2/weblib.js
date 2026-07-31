@@ -131,7 +131,21 @@ export default class WebLib {
         if (globals.window['LOCALDISKS'] && WebLib.getHostName().match(/^(.+\.local|localhost|127\.0\.0\.1|0\.0\.0\.0|pcjs)$/)) {
             sURL = sURL.replace(/^\/(diskettes|gamedisks|miscdisks|harddisks|decdisks|vaxdisks|pcsigdisks|pcsig[0-9a-z]*-disks|private)\//, "/disks/$1/").replace(/^\/discs\/([^/]*)\//, "/disks/cdroms/$1/");
         } else {
-            sURL = sURL.replace(/^\/(disks\/|)(diskettes|gamedisks|miscdisks|harddisks|decdisks|vaxdisks|pcsigdisks|pcsig[0-9a-z]*-disks|private)\//, "https://$2.pcjs.org/").replace(/^\/(disks\/cdroms|discs)\/([^/]*)\//, "https://$2.pcjs.org/");
+            /*
+             * pcjsvax-f07: "vaxdisks" is NOT a pcjs.org subdomain and must be rewritten before the
+             * generic rule below, which would otherwise aim it at https://vaxdisks.pcjs.org/ -- a
+             * host nobody owns.  This fork hosts its own VAX media on S3 + CloudFront (AWS account
+             * 939005125687, provisioned by 3dl-dev/3dl-infra-aws#16 and #17) because the VMS 5.5
+             * system disk is 159,334,400 bytes and GitHub hard-rejects files over 100 MB.
+             *
+             * The class name survives as a PATH PREFIX on the distribution rather than as a
+             * subdomain, so downstream construction is unchanged.  Kept here rather than read from
+             * _config.yml because this rule has always been hardcoded -- _config.yml's software.*
+             * entries document the mapping for humans and the Jekyll build, but nothing feeds them
+             * to the client.  If that ever changes, change both.
+             */
+            sURL = sURL.replace(/^\/(disks\/|)vaxdisks\//, WebLib.VAXDISKS_SERVER + "/");
+            sURL = sURL.replace(/^\/(disks\/|)(diskettes|gamedisks|miscdisks|harddisks|decdisks|pcsigdisks|pcsig[0-9a-z]*-disks|private)\//, "https://$2.pcjs.org/").replace(/^\/(disks\/cdroms|discs)\/([^/]*)\//, "https://$2.pcjs.org/");
         }
         return sURL;
     }
@@ -1216,6 +1230,22 @@ WebLib.fAdBlockerWarning = false;
  * @type {boolean|null}
  */
 WebLib.fLocalStorage = null;
+
+/**
+ * pcjsvax-f07: where this fork's VAX media actually lives.
+ *
+ * Every other media class in getResourceURL() maps to <class>.pcjs.org.  "vaxdisks" cannot: no such
+ * subdomain exists and this fork does not control pcjs.org.  The VMS 5.5 system disk is 159,334,400
+ * bytes, over GitHub's 100 MB per-file hard limit, so it is served from S3 + CloudFront in AWS
+ * account 939005125687 with CORS set for cross-origin fetches from the Pages site.
+ *
+ * If this fork is ever upstreamed, this constant is the single line to repoint at a real
+ * <class>.pcjs.org subdomain, after which the special case above collapses back into the generic
+ * rule.  Keep it a bare host+prefix with no trailing slash.
+ *
+ * @const {string}
+ */
+WebLib.VAXDISKS_SERVER = "https://do6xafl18swnu.cloudfront.net/vaxdisks";
 
 /**
  * TODO: Is there any way to get the Closure Compiler to stop inlining this string?  This isn't cutting it.
