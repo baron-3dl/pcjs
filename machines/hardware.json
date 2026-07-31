@@ -903,6 +903,15 @@
         }
       }
     },
+    "vax": {
+      "@title": "VAX",
+      "@instances": {
+        "ka655": {
+          "@title": "MicroVAX 3900 (KA655) with OpenVMS VAX",
+          "@permalink": "/machines/dec/vax/ka655/"
+        }
+      }
+    },
     "vt100": {
       "@title": "VT100",
       "@instances": {
