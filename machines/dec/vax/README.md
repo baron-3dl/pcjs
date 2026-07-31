@@ -23,6 +23,36 @@ the CPU loop that wires them together.
   `machines/dec/pdp11/1170/panel/` gets its M9312 ROM and its RK03 cartridges.  Graded by
   `tests/machineboot.mjs`.
 
+### The machine's media, and running it locally
+
+The system disk and the console ROM are **not in this repository** — they are DEC-copyright media,
+and they are served from the same kind of per-class media host PCjs uses for `decdisks`, `diskettes`
+and the rest.  For local development, put them in the gitignored `/disks/vaxdisks` mirror described
+by `_developer.yml`:
+
+    disks/vaxdisks/ka655x.json5      the console ROM, from tools/rom2json5.mjs
+    disks/vaxdisks/vms55-rd54.dsk    the OpenVMS V5.5-2H4 system disk (159,334,400 bytes = exactly RD54)
+
+`ka655x.json5` is produced from a raw KA655 ROM image with:
+
+    node machines/dec/vax/tools/rom2json5.mjs ka655x.bin disks/vaxdisks/ka655x.json5
+
+JSON5 rather than the raw `.bin` because that is what a `<rom file="..."/>` can load without a
+server: PCjs's ROM component sends any other extension to the `DumpAPI` converter, which does not
+exist on a static file server or on GitHub Pages.
+
+**There is no save/restore.**  The KA655, its bus, its memory and its Qbus devices execute inside a
+Web Worker, not on the page's main thread, so PCjs's `State`/`localStorage` resume path is not wired
+up — for the same synchronous-read reason the standalone page runs in a Worker (below).  A boot
+touches a measured 55.3 MiB of the 159 MB volume.
+
+**Opening `machine.xml` directly no longer works in current Chrome.**  Every PCjs machine XML
+carries an `<?xml-stylesheet?>` processing instruction so the raw file can be rendered by the
+browser's own XSLT engine, but as of Chrome 149 both that instruction and the `XSLTProcessor` API
+have been removed.  This is why PCjs pages load `/assets/js/xslt-polyfill.min.js` before the machine
+scripts — the machine page works, the raw XML URL does not.  The processing instruction is kept
+because it still works in engines that have not dropped XSLT yet.
+
 ### Running the standalone adapter page in a browser
 
 `browser/vax.html` predates the machine XML (`pcjsvax-de8`), and it is kept because it is the path
