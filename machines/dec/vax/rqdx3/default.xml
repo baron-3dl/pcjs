@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<device id="rqdx3" type="rqdx3" autoMountExample='{DUA0:{path:"/vaxdisks/vms55-rd54.dsk"}}' pos="left" width="45%" padLeft="8px" padBottom="8px">
+	<control type="container">
+		<control type="list" binding="listDisks">
+			<disk id="disk01" name="VAX/VMS V5.5-2H4 (RD54)" path="/vaxdisks/vms55-rd54.dsk"/>
+			<disk id="disk02" name="VAX/VMS V5.5-2H4 (RD54, gzip)" path="/vaxdisks/vms55-rd54.dsk.gz"/>
+		</control>
+		<control type="button" binding="loadDisk">Load</control>
+		<control type="description" binding="descDisk" padRight="8px"/>
+		<control type="file" binding="mountDisk"/>
+	</control>
+</device>

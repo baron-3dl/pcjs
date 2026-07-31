@@ -564,6 +564,49 @@
       "./machines/modules/v3/machine.js"
     ]
   },
+  "vax": {
+    "name": "VAXjs",
+    "version": "1.00",
+    "folder": "dec/vax",
+    "defines": [
+      "APPVERSION",
+      "DEBUG",
+      "SITEURL"
+    ],
+    "factory": "embedVAX",
+    "modules": [
+      "./machines/modules/v2/defines.js",
+      "./machines/modules/v2/message.js",
+      "./machines/modules/v2/format.js",
+      "./machines/modules/v2/strlib.js",
+      "./machines/modules/v2/usrlib.js",
+      "./machines/modules/v2/weblib.js",
+      "./machines/modules/v2/component.js",
+      "./machines/dec/vax/modules/v2/defines.js",
+      "./machines/dec/vax/modules/v2/message.js",
+      "./machines/dec/vax/modules/v2/rom.js",
+      "./machines/dec/vax/modules/v2/ram.js",
+      "./machines/dec/vax/modules/v2/cpuka655.js",
+      "./machines/dec/vax/modules/v2/serial.js",
+      "./machines/dec/vax/modules/v2/rqdx3.js",
+      "./machines/dec/vax/modules/v2/device.js",
+      "./machines/dec/vax/modules/v2/computer.js",
+      "./machines/dec/vax/modules/v2/machine.js",
+      "./machines/modules/v2/embed.js"
+    ],
+    "styles": [
+      "./machines/dec/vax/xsl/components.css"
+    ],
+    "css": [
+      "./machines/dec/vax/xsl/common.css",
+      "./machines/dec/vax/xsl/components.css"
+    ],
+    "xsl": [
+      "./machines/dec/vax/xsl/common.xsl",
+      "./machines/dec/vax/xsl/components.xsl",
+      "./machines/dec/vax/xsl/machine.xsl"
+    ]
+  },
   "shared": {
     "version": "2.21",
     "externs": [

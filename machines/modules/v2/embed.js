@@ -690,6 +690,24 @@ function embedPDP11(idMachine, sXMLFile, sXSLFile, sParms, sClass)
 }
 
 /**
+ * embedVAX(idMachine, sXMLFile, sXSLFile, sParms, sClass)
+ *
+ * pcjsvax-f23.  The MicroVAX 3900 (KA655); see machines/dec/vax/ka655/machine.xml.
+ *
+ * @param {string} idMachine
+ * @param {string} [sXMLFile]
+ * @param {string} [sXSLFile]
+ * @param {string} [sParms]
+ * @param {string} [sClass]
+ * @returns {boolean} true if successful, false if error
+ */
+function embedVAX(idMachine, sXMLFile, sXSLFile, sParms, sClass)
+{
+    if (fAsync) WebLib.enablePageEvents(false);
+    return embedMachine("VAXjs", "dec/vax", idMachine, sXMLFile, sXSLFile, sParms, sClass);
+}
+
+/**
  * findMachineComponent(idMachine, sType)
  *
  * @param {string} idMachine
@@ -751,9 +769,10 @@ globals.window['embedPCx86']  = embedPCx86;
 globals.window['embedPCx80']  = embedPCx80;
 globals.window['embedPDP10']  = embedPDP10;
 globals.window['embedPDP11']  = embedPDP11;
+globals.window['embedVAX']    = embedVAX;
 globals.window['commandMachine'] = commandMachine;
 
 globals.window['enableEvents'] = WebLib.enablePageEvents;
 globals.window['sendEvent']    = WebLib.doPageEvent;
 
-export { embedC1P, embedPCx86, embedPCx80, embedPDP10, embedPDP11, commandMachine, globals };
+export { embedC1P, embedPCx86, embedPCx80, embedPDP10, embedPDP11, embedVAX, commandMachine, globals };

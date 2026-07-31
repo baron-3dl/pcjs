@@ -103,6 +103,40 @@ import { DEBUG, SITEURL, globals } from "./defines.js";
  */
 export default class WebLib {
     /**
+     * getResourceURL(sURL)
+     *
+     * Maps a PCjs media path (eg, "/decdisks/pdp11/rk03/RK03-XXDP.json") onto the server that
+     * actually holds it: the local "/disks/" mirror when LOCALDISKS is set AND we're on a local
+     * host, otherwise the per-class pcjs.org subdomain.
+     *
+     * While it would be nice to simply import LOCALDISKS from defines.js, that merely defines the *default*
+     * value of the global variable 'LOCALDISKS'; since imported values are immutable, we must look at the global
+     * variable, since that's the only one that *might* have been changed at runtime.
+     *
+     * Factored out of getResource() (pcjsvax-f23) so that components which must fetch media
+     * themselves -- machines/dec/vax/modules/v2/rqdx3.js needs a Blob and a progress stream, not a
+     * string or an ArrayBuffer -- resolve paths through exactly the same rule instead of a copy of
+     * it.  "vaxdisks" is this fork's addition, alongside "decdisks"; see _config.yml/_developer.yml.
+     *
+     * @param {string} sURL
+     * @returns {string}
+     */
+    static getResourceURL(sURL)
+    {
+        /*
+         * pcjsvax-f23 added 127.0.0.1 to this list.  It is as local as 0.0.0.0 and it is what a
+         * headless Chrome and most `python3 -m http.server` instructions actually use; without it,
+         * a developer serving the repo locally silently gets media requests aimed at pcjs.org.
+         */
+        if (globals.window['LOCALDISKS'] && WebLib.getHostName().match(/^(.+\.local|localhost|127\.0\.0\.1|0\.0\.0\.0|pcjs)$/)) {
+            sURL = sURL.replace(/^\/(diskettes|gamedisks|miscdisks|harddisks|decdisks|vaxdisks|pcsigdisks|pcsig[0-9a-z]*-disks|private)\//, "/disks/$1/").replace(/^\/discs\/([^/]*)\//, "/disks/cdroms/$1/");
+        } else {
+            sURL = sURL.replace(/^\/(disks\/|)(diskettes|gamedisks|miscdisks|harddisks|decdisks|vaxdisks|pcsigdisks|pcsig[0-9a-z]*-disks|private)\//, "https://$2.pcjs.org/").replace(/^\/(disks\/cdroms|discs)\/([^/]*)\//, "https://$2.pcjs.org/");
+        }
+        return sURL;
+    }
+
+    /**
      * getResource(sURL, type, fAsync, done, progress)
      *
      * Request the specified resource (sURL), and once the request is complete, notify done().
@@ -141,16 +175,7 @@ export default class WebLib {
             return response;
         }
 
-        /*
-         * While it would be nice to simply import LOCALDISKS from defines.js, that merely defines the *default*
-         * value of the global variable 'LOCALDISKS'; since imported values are immutable, we must look at the global
-         * variable, since that's the only one that *might* have been changed at runtime.
-         */
-        if (globals.window['LOCALDISKS'] && WebLib.getHostName().match(/^(.+\.local|localhost|0\.0\.0\.0|pcjs)$/)) {
-            sURL = sURL.replace(/^\/(diskettes|gamedisks|miscdisks|harddisks|decdisks|pcsigdisks|pcsig[0-9a-z]*-disks|private)\//, "/disks/$1/").replace(/^\/discs\/([^/]*)\//, "/disks/cdroms/$1/");
-        } else {
-            sURL = sURL.replace(/^\/(disks\/|)(diskettes|gamedisks|miscdisks|harddisks|decdisks|pcsigdisks|pcsig[0-9a-z]*-disks|private)\//, "https://$2.pcjs.org/").replace(/^\/(disks\/cdroms|discs)\/([^/]*)\//, "https://$2.pcjs.org/");
-        }
+        sURL = WebLib.getResourceURL(sURL);
 
         Component.printf(MESSAGE.DEBUG, "getResource(%s)\n", sURL);
 
