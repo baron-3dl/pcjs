@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <?xml-stylesheet type="text/xsl" href="/machines/dec/vax/xsl/machine.xsl"?>
 <machine id="vax3900" type="vax" border="1" pos="center" background="default">
+	<script src="/assets/js/xslt-polyfill.min.js" xmlns="http://www.w3.org/1999/xhtml"></script>
 	<name pos="center">DEC MicroVAX 3900 (KA655) with 16Mb, RQDX3 and OpenVMS VAX</name>
 	<computer id="computer" busWidth="30">
 		<control type="container">
