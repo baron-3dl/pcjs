@@ -14,6 +14,17 @@ control-flow, string/queue/INDEX/PROBE and NOP slices of instruction execution, 
 point, SCB exception/interrupt dispatch with the privileged registers, and — as of `pcjsvax-c05` —
 the CPU loop that wires them together.
 
+### Source
+
+- **[machines/dec/vax/](https://github.com/baron-3dl/pcjs/tree/master/machines/dec/vax)** — the port
+- [`modules/v2/`](https://github.com/baron-3dl/pcjs/tree/master/machines/dec/vax/modules/v2) — the
+  emulator: CPU, instruction decode, MMU, SCB exceptions, the FPA, the CQBIC Qbus interface, the
+  CMCTL memory controller, the SSC, and the RQDX3/MSCP disk controller
+- [`tests/`](https://github.com/baron-3dl/pcjs/tree/master/machines/dec/vax/tests) — the
+  differentials that grade it against Open SIMH, register by register
+- [`browser/`](https://github.com/baron-3dl/pcjs/tree/master/machines/dec/vax/browser) — the Web
+  Worker it runs in, the console, and the HTTP disk provider
+
 ### Machines
 
 - [MicroVAX 3900 (KA655) with OpenVMS VAX](/machines/dec/vax/ka655/) — the PCjs machine, defined by

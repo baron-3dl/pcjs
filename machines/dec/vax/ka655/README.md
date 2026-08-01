@@ -34,3 +34,27 @@ when you close the tab.  Set `autoBoot="false"` on the `<cpu>` element of
 
 The port, the media it loads, and how to run it locally are described on the
 [DEC VAX](/machines/dec/vax/) page.
+
+### Source
+
+The VAX emulator is JavaScript, and all of it is readable:
+
+- **[machines/dec/vax/](https://github.com/baron-3dl/pcjs/tree/master/machines/dec/vax)** — the port
+- [`modules/v2/`](https://github.com/baron-3dl/pcjs/tree/master/machines/dec/vax/modules/v2) — the
+  machine itself: [`cpu.js`](https://github.com/baron-3dl/pcjs/blob/master/machines/dec/vax/modules/v2/cpu.js)
+  and [`decode.js`](https://github.com/baron-3dl/pcjs/blob/master/machines/dec/vax/modules/v2/decode.js)
+  for instruction execution, [`mmu.js`](https://github.com/baron-3dl/pcjs/blob/master/machines/dec/vax/modules/v2/mmu.js)
+  for memory management, [`cqbic.js`](https://github.com/baron-3dl/pcjs/blob/master/machines/dec/vax/modules/v2/cqbic.js)
+  for the Qbus, [`rqdx3.js`](https://github.com/baron-3dl/pcjs/blob/master/machines/dec/vax/modules/v2/rqdx3.js)
+  and [`rq.js`](https://github.com/baron-3dl/pcjs/blob/master/machines/dec/vax/modules/v2/rq.js) for
+  the MSCP disk controller that `DUA0:` is attached to
+- [`tests/`](https://github.com/baron-3dl/pcjs/tree/master/machines/dec/vax/tests) — how it is
+  graded.  Most of these are **differentials**: they run the same instruction stream through this
+  emulator and through Open SIMH and compare state register by register, rather than asserting
+  against numbers somebody typed in.
+- [`browser/`](https://github.com/baron-3dl/pcjs/tree/master/machines/dec/vax/browser) — the Web
+  Worker the machine runs in, and the disk provider that fetches the volume over HTTP
+
+It is ported site-for-site from [Open SIMH](https://github.com/open-simh/simh)'s `VAX/` sources
+(MIT, © 1998–2019 Robert M Supnik), so a function here generally has a C original with the same
+name, and the comments say which one.
