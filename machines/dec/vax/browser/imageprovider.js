@@ -1,11 +1,14 @@
 /**
  * @fileoverview pcjsvax-ae1 -- rq.js's image-provider contract over a LAZY, READ-ONLY backing store
- *               plus a COPY-ON-WRITE overlay, so a browser `File` can be DUA0
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
+ *
+ *               plus a COPY-ON-WRITE overlay, so a browser `File` can be DUA0
  *
  * WHAT THIS IS
  * ------------

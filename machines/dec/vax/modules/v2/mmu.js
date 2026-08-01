@@ -1,18 +1,19 @@
 /**
  * @fileoverview VAX memory management -- virtual-to-physical translation and the software TLB
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2012-2026 Jeff Parsons, © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
+ *
+ * Portions adapted from PCjs, Copyright © 2012-2026 Jeff Parsons, used under the MIT
+ * license.
  *
  * Portions adapted from the Open SIMH VAX simulator, Copyright © 1998-2019 Robert M Supnik,
- * used under the MIT license.  Robert M Supnik's name is not used to endorse or promote this work.
- *
- * Specifically, this is a direct port of Open SIMH `VAX/vax_mmu.h` (the inline Read/Write/Test
- * fast path) and `VAX/vax_mmu.c` (fill(), zap_tb(), zap_tb_ent(), chk_tb_ent(), set_map_reg()).
- * It is deliberately structured so it can be read side by side with those two files, quirks and
- * all -- see the notes marked "SIMH quirk", each of which is copied rather than corrected.
+ * used under the MIT license.  Robert M Supnik's name is not used to endorse or promote this
+ * work.
  *
  * ============================================================================
  * THE SIGNED-int32 HAZARD LIVES HERE.  READ THIS BEFORE CHANGING ANY LINE.

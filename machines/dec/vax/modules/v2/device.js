@@ -1,10 +1,15 @@
 /**
  * @fileoverview Dispatches VAX `<device type="..."/>` elements to their components (pcjsvax-f23)
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2012-2026 Jeff Parsons, © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
+ *
+ * Portions adapted from PCjs, Copyright © 2012-2026 Jeff Parsons, used under the MIT
+ * license.
  *
  * The same job DevicePDP11.init() does (machines/dec/pdp11/modules/v2/device.js:1163): walk every
  * element of class "vax-device", read its `type` out of the XSL-generated `data-value`, and

@@ -1,11 +1,14 @@
 /**
  * @fileoverview pcjsvax-ae1 -- grade browser/imageprovider.js against tests/mscpharness.js's
- *               fileImageProvider() over the SAME container
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
+ *
+ *               fileImageProvider() over the SAME container
  *
  * WHY IT EXISTS
  * -------------

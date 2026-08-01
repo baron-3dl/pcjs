@@ -1,10 +1,15 @@
 /**
  * @fileoverview VAXjs machine entry point -- loads every Component a VAX machine XML can name
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2012-2026 Jeff Parsons, © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
+ *
+ * Portions adapted from PCjs, Copyright © 2012-2026 Jeff Parsons, used under the MIT
+ * license.
  *
  * This is what machines/dec/vax/xsl/components.xsl's componentScripts template loads.  PDPjs loads
  * a BUNDLE built by gulp (/machines/dec/pdp11/releases/2.21/pdp11.js) whose module list lives in

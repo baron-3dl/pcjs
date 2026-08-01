@@ -1,10 +1,15 @@
 /**
  * @fileoverview Implements the VAX RAM component (pcjsvax-f23)
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2012-2026 Jeff Parsons, © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
+ *
+ * Portions adapted from PCjs, Copyright © 2012-2026 Jeff Parsons, used under the MIT
+ * license.
  *
  * `<ram addr size/>`, in the shape of machines/dec/pdp11/modules/v2/ram.js.  Like rom.js here, it
  * does NOT allocate anything: the memory blocks live in the Worker (browser/vaxworker.js), so this

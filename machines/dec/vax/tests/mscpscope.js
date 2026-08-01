@@ -1,10 +1,16 @@
 /**
  * @fileoverview Re-derives the MSCP opcode / status / dispatch scope from Open SIMH's own sources
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
+ *
+ * Portions adapted from the Open SIMH VAX simulator, Copyright © 1998-2019 Robert M Supnik,
+ * used under the MIT license.  Robert M Supnik's name is not used to endorse or promote this
+ * work.
  *
  * WHY THIS FILE EXISTS -- HANDOFF.md STANDING RULE 5
  * ---------------------------------------------------

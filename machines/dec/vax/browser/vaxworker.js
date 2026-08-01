@@ -1,11 +1,14 @@
 /**
  * @fileoverview pcjsvax-de8 / pcjsvax-ae1 -- the Worker the VAX actually runs in, and the two
- *               SYNCHRONOUS browser backings for rq.js's image provider
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
+ *
+ *               SYNCHRONOUS browser backings for rq.js's image provider
  *
  * *** WHY A WORKER, AND NOT THE MAIN THREAD.  THIS IS THE LOAD-BEARING DECISION IN THE WHOLE
  * BROWSER DELIVERABLE, AND IT IS FORCED BY rq.js's PROVIDER CONTRACT. ***

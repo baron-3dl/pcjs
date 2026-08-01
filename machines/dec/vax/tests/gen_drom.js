@@ -1,13 +1,16 @@
 /**
  * @fileoverview Generates machines/dec/vax/modules/v2/drom.js from vendored Open SIMH source
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
  *
  * Portions adapted from the Open SIMH VAX simulator, Copyright © 1998-2019 Robert M Supnik,
- * used under the MIT license.  Robert M Supnik's name is not used to endorse or promote this work.
+ * used under the MIT license.  Robert M Supnik's name is not used to endorse or promote this
+ * work.
  *
  * WHY THIS EXISTS
  * ---------------
@@ -274,11 +277,19 @@ function emit(mnemonics, rows, vals)
     let L = [];
     L.push("/**");
     L.push(" * @fileoverview VAX decode ROM -- GENERATED, DO NOT EDIT BY HAND");
-    L.push(" * @author Jeff Parsons <Jeff@pcjs.org>");
-    L.push(" * @copyright © 2012-2026 Jeff Parsons");
+    //
+    // This header is EMITTED into the generated drom.js, so it carries the same corrected
+    // attribution as every hand-written file (rd pcjsvax-422).  If it drifts back to claiming
+    // Jeff Parsons as author, the next regeneration silently reintroduces the defect into a file
+    // nobody re-reads, because the first line tells them not to edit it by hand.
+    //
+    L.push(" * @author Chris Baron <baron@3dl.dev>");
+    L.push(" * @copyright © 2026 Chris Baron");
     L.push(" * @license MIT <https://www.pcjs.org/LICENSE.txt>");
     L.push(" *");
     L.push(" * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.");
+    L.push(" * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT");
+    L.push(" * license.");
     L.push(" *");
     L.push(" * Portions adapted from the Open SIMH VAX simulator, Copyright © 1998-2019 Robert M Supnik,");
     L.push(" * used under the MIT license.  Robert M Supnik's name is not used to endorse or promote this work.");

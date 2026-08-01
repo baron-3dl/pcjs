@@ -1,10 +1,12 @@
 /**
  * @fileoverview Implements the VAX ROM component (pcjsvax-f23)
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
  *
  * WHAT THIS IS.  The `<rom addr size file/>` element of a VAX machine XML, in the same shape as
  * machines/dec/pdp11/modules/v2/rom.js: a Component that loads a ROM resource named by `file=`,

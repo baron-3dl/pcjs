@@ -1,11 +1,18 @@
 /**
  * @fileoverview pcjsvax-319 -- drive THIS PORT's KA655 machine through an OpenVMS boot attempt from
- *               a real ODS-2 volume and report where its console stream leaves the oracle's
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
+ *
+ * Portions adapted from the Open SIMH VAX simulator, Copyright © 1998-2019 Robert M Supnik,
+ * used under the MIT license.  Robert M Supnik's name is not used to endorse or promote this
+ * work.
+ *
+ *               a real ODS-2 volume and report where its console stream leaves the oracle's
  *
  * WHAT THIS IS, AND WHAT IT IS NOT
  * --------------------------------

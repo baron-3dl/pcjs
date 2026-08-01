@@ -1,13 +1,24 @@
 /**
  * @fileoverview Implements the VAX Bus component
- * @author Jeff Parsons <Jeff@pcjs.org>
- * @copyright © 2012-2026 Jeff Parsons
+ * @author Chris Baron <baron@3dl.dev>
+ * @copyright © 2012-2026 Jeff Parsons, © 2026 Chris Baron
  * @license MIT <https://www.pcjs.org/LICENSE.txt>
  *
  * This file is part of PCjs, a computer emulation software project at <https://www.pcjs.org>.
+ * PCjs is Copyright © 2012-2026 Jeff Parsons, and this file is distributed under its MIT
+ * license.
+ *
+ * Portions adapted from PCjs, Copyright © 2012-2026 Jeff Parsons, used under the MIT
+ * license.
+ *
+ * Portions adapted from the Open SIMH VAX simulator, Copyright © 1998-2019 Robert M Supnik,
+ * used under the MIT license.  Robert M Supnik's name is not used to endorse or promote this
+ * work.
  *
  * Portions adapted from the JavaScript PDP 11/70 Emulator written by Paul Nankervis
  * <paulnank@hotmail.com> at <http://skn.noip.me/pdp11/pdp11.html> with permission, by way of
+ * PDPjs (machines/dec/pdp11/modules/v2/bus.js).
+ *
  * PDPjs (machines/dec/pdp11/modules/v2/bus.js).
  *
  * ============================================================================
