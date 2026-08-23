@@ -165,7 +165,7 @@ function controllerTick() {
 
     if (!sawUser && RE_USERNAME.test(text)) {
         sawUser = true;
-        phase("at login — type  SYSTEM  and press Return", "live");
+        phase("booted — OpenVMX/VAX at the login prompt", "live");
         stopController();                            /* stop pulsing; leave prompt live/interactive */
         return;
     }
