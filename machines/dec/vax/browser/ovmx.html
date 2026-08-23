@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<!--
+  ovmx.html -- SELF-DRIVING OVMX/VAX boot page for embedding as an iframe in a homepage demo.
+
+  Unlike vax.html (which needs an external CDP driver, or a human, to type the boot command and
+  pulse the console), THIS page drives its own console to the OpenVMX `Username:` prompt with NO
+  external input.  It reuses vax.html's exact machinery -- the same module Worker (vaxworker.js),
+  terminal (vaxterm.js) and image provider -- and adds a small in-page controller that:
+
+     1. boots the machine with autoboot suppressed (stops at the `>>>` console prompt),
+     2. types  B/R5:2 DUA0<CR>  once `>>>` appears,
+     3. once the VMS executive / OpenVMX startup is up, pulses a bare <CR> once per second, and
+     4. stops pulsing the instant `Username:` appears -- leaving the login prompt live and
+        interactive so a visitor can type SYSTEM and log in.
+
+  QUERY PARAMETERS
+    ?rom=URL     fetch the KA655 console ROM (ka655x.bin).            [required]
+    ?image=URL   back DKA0/DUA0 with a RANGED HTTP GET.  THE SERVER MUST HONOUR `Range` (S3 /
+                 CloudFront do; python3 -m http.server does NOT).  This is the shipping shape.
+    ?diskgz=URL  alternative: fetch a gzip-compressed disk with ONE plain GET (no Range needed),
+                 decompress in the browser, back DKA0 with it.  Use when the host cannot do Range.
+                 Provide exactly ONE of ?image= or ?diskgz=.
+    ?mem=32      RAM in MB (default 32).
+
+  DEPLOY:  self-contained -- same GitHub Pages / static host as vax.html.  Relative imports of
+  ./vaxterm.js and ./vaxworker.js are intact; no COI/cross-origin-isolation is required (the VAX
+  path uses a module Worker + FileReaderSync, so crossOriginIsolated=false is fine).
+
+  IFRAME SRC SHAPE:
+    machines/dec/vax/browser/ovmx.html?rom=<ROM_URL>&image=<DISK_URL>&mem=32
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenVMX on MicroVAX 3900 — PCjs</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; }
+  body { margin: 0; background: #04120a; color: #4ee07a;
+         font-family: "DejaVu Sans Mono", Menlo, Consolas, ui-monospace, monospace;
+         display: flex; flex-direction: column; overflow: hidden; }
+  #bar { flex: 0 0 auto; display: flex; align-items: center; gap: .6rem;
+         padding: .35rem .7rem; font-size: 12px; line-height: 1.2;
+         background: #06180d; border-bottom: 1px solid #0a3; }
+  #dot { flex: 0 0 auto; width: .7rem; height: .7rem; border-radius: 50%;
+         background: #d8a400; box-shadow: 0 0 6px #d8a400aa; }
+  #dot.live { background: #4ee07a; box-shadow: 0 0 6px #4ee07aaa; animation: pulse 1.4s infinite; }
+  #dot.err  { background: #d33; box-shadow: 0 0 6px #d33a; animation: none; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  #phase { flex: 1 1 auto; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #meta  { flex: 0 0 auto; opacity: .6; font-size: 11px; white-space: nowrap; }
+  #screen { flex: 1 1 auto; white-space: pre; overflow: auto; margin: 0;
+            padding: .5rem .7rem; font-size: 12.5px; line-height: 1.15;
+            background: #04120a; color: #4ee07a; outline: none; }
+  #screen:focus { box-shadow: inset 0 0 0 2px #4ee07a44; }
+  .err { color: #ff6b6b; font-weight: 600; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <span id="dot"></span>
+    <span id="phase">starting…</span>
+    <span id="meta"></span>
+  </div>
+  <pre id="screen" tabindex="0"></pre>
+
+<script type="module">
+import { VaxTerminal } from "./vaxterm.js";
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const romUrl   = params.get("rom");
+const imageUrl = params.get("image");
+const diskgzUrl= params.get("diskgz");
+const memMB    = parseInt(params.get("mem") || "32", 10) || 32;
+
+/* ---- console + render loop (identical machinery to vax.html) ---------------------------------- */
+let worker = null, started = false, running = false, sawUser = false;
+
+const term = new VaxTerminal($("screen"), (text) => {
+    /* keystrokes from a human visitor once the login prompt is live */
+    if (worker && started) worker.postMessage({cmd: "input", text});
+});
+(function frame() { term.render(); requestAnimationFrame(frame); })();
+
+/* ---- status banner ---------------------------------------------------------------------------- */
+let phaseText = "starting…";
+function phase(text, cls) {
+    phaseText = text;
+    $("phase").textContent = text;
+    $("phase").className = cls === "err" ? "err" : "";
+    let dot = $("dot");
+    dot.className = cls === "err" ? "err" : (cls === "live" ? "live" : "");
+}
+function meta(text) { $("meta").textContent = text; }
+
+/* ---- exposed hooks (kept identical to vax.html so tests/browserboot harnesses work) ------------ */
+window.vaxTerm = term;
+window.vaxType = (s) => { if (worker && started) worker.postMessage({cmd: "input", text: s}); };
+window.vaxStatus = () => phaseText;
+window.vaxError = null;
+window.ovmxReachedLogin = () => sawUser;
+
+/* ---- disk acquisition ------------------------------------------------------------------------- */
+/* image= is a ranged URL handed straight to the Worker (urlBacking); diskgz= is fetched and
+   decompressed here into a File (fileBacking), exactly as vax.html does. */
+async function fetchGzipDisk(url) {
+    let resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching ${url}`);
+    let stream = resp.body.pipeThrough(new DecompressionStream("gzip"));
+    let blob = await new Response(stream).blob();
+    let name = url.split("/").pop().replace(/\.gz$/i, "");
+    return new File([blob], name, {type: "application/octet-stream"});
+}
+
+async function acquire() {
+    if (!romUrl)  throw new Error("missing ?rom= (KA655 console ROM URL)");
+    if (!imageUrl && !diskgzUrl) throw new Error("provide ?image= or ?diskgz= (OVMX disk URL)");
+
+    phase("fetching console ROM…");
+    let romBytes = await fetch(romUrl).then((r) => {
+        if (!r.ok) throw new Error(`ROM fetch HTTP ${r.status}`);
+        return r.arrayBuffer();
+    });
+
+    let diskArg;
+    if (diskgzUrl) {
+        phase("fetching + decompressing OVMX disk…");
+        let f = await fetchGzipDisk(diskgzUrl);
+        diskArg = {file: f};
+    } else {
+        diskArg = {url: imageUrl};                 /* ranged GETs, pulled lazily by the Worker */
+    }
+    return {romBytes, diskArg};
+}
+
+/* ---- the self-driving controller -------------------------------------------------------------- */
+/*
+   Mirrors the proven external driver (bboot_ovmx.mjs) but runs IN the page reading term.lines:
+     - see `>>>`           -> type the boot command once
+     - see executive/OVMX  -> arm the 1 Hz <CR> pulse
+     - pulse `\r` at 1 Hz  -> until `Username:` appears, then stop.
+*/
+const RE_PROMPT   = />>>/;
+const RE_EXEC_UP  = /VMS executive attached|\/dev\/vms|%OVMX|OpenVMX|system disk DKA0: mounted|STARTUP|%RUN-S-PROC_ID/i;
+const RE_USERNAME = /Username:/;
+const BOOT_CMD    = "B/R5:2 DUA0\r";
+
+let bootSent = false, pulseArmed = false, ctrlTimer = null, tick = 0;
+
+function screenText() { return term.lines.join("\n"); }
+
+function controllerTick() {
+    if (!running) return;
+    tick++;
+
+    if (window.vaxError) {                          /* worker/machine faulted */
+        phase(`error: ${window.vaxError}`, "err");
+        stopController();
+        return;
+    }
+
+    let text = screenText();
+
+    if (!sawUser && RE_USERNAME.test(text)) {
+        sawUser = true;
+        phase("at login — type  SYSTEM  and press Return", "live");
+        stopController();                            /* stop pulsing; leave prompt live/interactive */
+        return;
+    }
+
+    if (!bootSent && RE_PROMPT.test(text)) {
+        bootSent = true;
+        phase("booting OVMX/VAX… ~4 min");
+        window.vaxType(BOOT_CMD);
+        return;                                      /* give the console a beat before pulsing */
+    }
+
+    if (bootSent && !pulseArmed && RE_EXEC_UP.test(text)) {
+        pulseArmed = true;
+        phase("OpenVMX starting up… ~4 min");
+    }
+
+    if (pulseArmed && !sawUser) {
+        window.vaxType("\r");                        /* 1 Hz nudge until the login prompt paints */
+    }
+}
+
+function stopController() {
+    if (ctrlTimer !== null) { clearInterval(ctrlTimer); ctrlTimer = null; }
+}
+
+function startController() {
+    stopController();                                /* idempotent: safe if the page re-runs */
+    bootSent = false; pulseArmed = false; sawUser = false; tick = 0;
+    ctrlTimer = setInterval(controllerTick, 1000);   /* 1 Hz -- detection + the CR pulse */
+}
+
+/* ---- boot ------------------------------------------------------------------------------------- */
+function boot({romBytes, diskArg}) {
+    if (started) return;
+    started = true; running = true;
+    term.clear();
+
+    worker = new Worker("./vaxworker.js", {type: "module"});
+    worker.onerror = (e) => {
+        window.vaxError = `${e.message} (${e.filename}:${e.lineno})`;
+        phase(`worker error: ${window.vaxError}`, "err");
+        running = false; stopController();
+    };
+    worker.onmessage = (e) => {
+        let m = e.data;
+        switch (m.type) {
+        case "out":
+            term.write(new Uint8Array(m.bytes));
+            break;
+        case "stat":
+            meta(`${(m.steps / 1e6).toFixed(0)}M instr · ${m.mips.toFixed(1)}M/s`);
+            break;
+        case "stopped":
+            window.vaxError = `HALTED: ${m.reason}`;
+            phase(`HALTED: ${m.reason}`, "err");
+            running = false; stopController();
+            break;
+        case "error":
+            window.vaxError = m.message;
+            phase(`ERROR: ${m.message}`, "err");
+            running = false; stopController();
+            break;
+        }
+    };
+
+    worker.postMessage({
+        cmd: "start",
+        rom: romBytes,
+        disk: diskArg,
+        memMB,
+        autoBoot: false                              /* WE drive the boot -- stop at >>> */
+    }, [romBytes]);
+
+    phase("booting OVMX/VAX… ~4 min");
+    startController();
+}
+
+/* auto-run on load */
+acquire()
+    .then(boot)
+    .catch((e) => { window.vaxError = String(e); phase(String(e), "err"); });
+</script>
+</body>
+</html>
