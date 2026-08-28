@@ -101,6 +101,7 @@ window.vaxType = (s) => { if (worker && started) worker.postMessage({cmd: "input
 window.vaxStatus = () => phaseText;
 window.vaxError = null;
 window.ovmxReachedLogin = () => sawUser;
+window.ovmxReachedDollar = () => sawDollar;
 
 /* ---- disk acquisition ------------------------------------------------------------------------- */
 /* image= is a ranged URL handed straight to the Worker (urlBacking); diskgz= is fetched and
@@ -147,7 +148,25 @@ const RE_EXEC_UP  = /VMS executive attached|\/dev\/vms|%OVMX|OpenVMX|system disk
 const RE_USERNAME = /Username:/;
 const BOOT_CMD    = "B/R5:2 DUA0\r";
 
+/* Login self-drive (opt-in via ?drive=login): after Username: paints, log in as
+   SYSTEM/MANAGER and stop at the DCL `$` prompt, turning the boot demo into a
+   genuine login demo. DEFAULT (no param) stops at Username: — the honest
+   boot-demo. Requires a disk whose content actually authenticates SYSTEM/MANAGER
+   to a persistent $ (>= V0.5-5, with the #779 VAX auth chain). The V0.5-2 demo
+   disk reaches Username: but cannot authenticate, so on it the login steps fire
+   and then hit a User-authorization failure — which is why this stays gated
+   until the drive-to-$ image is hosted. Console facts (ground-sourced from the
+   VAX lane's SIMH capture): creds SYSTEM/MANAGER; Password: is blind (no echo);
+   no CR-pulsing is needed after Username: — each prompt paints on its own; the
+   idle prompt is a bare "$ " at line start. */
+const WANT_LOGIN  = params.get("drive") === "login";
+const LOGIN_USER  = "SYSTEM\r";
+const LOGIN_PASS  = "MANAGER\r";
+const RE_PASSWORD = /Password:/;
+const RE_DOLLAR   = /\n\$ /;              /* "$ " at a line start; screenText joins lines on \n */
+
 let bootSent = false, pulseArmed = false, ctrlTimer = null, tick = 0;
+let sentUser = false, sentPass = false, sawDollar = false;
 
 function screenText() { return term.lines.join("\n"); }
 
@@ -165,8 +184,30 @@ function controllerTick() {
 
     if (!sawUser && RE_USERNAME.test(text)) {
         sawUser = true;
-        phase("booted — OpenVMX/VAX at the login prompt", "live");
-        stopController();                            /* stop pulsing; leave prompt live/interactive */
+        if (!WANT_LOGIN) {
+            phase("booted — OpenVMX/VAX at the login prompt", "live");
+            stopController();                        /* stop pulsing; leave prompt live/interactive */
+            return;
+        }
+        phase("logging in as SYSTEM…");
+        return;                                      /* give Username: a beat; type creds next tick */
+    }
+
+    /* login self-drive: Username: -> SYSTEM -> Password: -> MANAGER -> `$` */
+    if (WANT_LOGIN && sawUser && !sentUser) {
+        sentUser = true;
+        window.vaxType(LOGIN_USER);                  /* echoes on the Username: line */
+        return;
+    }
+    if (WANT_LOGIN && sentUser && !sentPass && RE_PASSWORD.test(text)) {
+        sentPass = true;
+        window.vaxType(LOGIN_PASS);                  /* blind: Password: does not echo */
+        return;
+    }
+    if (WANT_LOGIN && sentPass && !sawDollar && RE_DOLLAR.test(text)) {
+        sawDollar = true;
+        phase("logged in — OpenVMX/VAX at the DCL $ prompt", "live");
+        stopController();                            /* leave the $ live/interactive */
         return;
     }
 
@@ -194,6 +235,7 @@ function stopController() {
 function startController() {
     stopController();                                /* idempotent: safe if the page re-runs */
     bootSent = false; pulseArmed = false; sawUser = false; tick = 0;
+    sentUser = false; sentPass = false; sawDollar = false;
     ctrlTimer = setInterval(controllerTick, 1000);   /* 1 Hz -- detection + the CR pulse */
 }
 
