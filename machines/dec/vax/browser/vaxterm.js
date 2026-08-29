@@ -134,6 +134,7 @@ export class VaxTerminal
                 else if (p === "2") this.lines[this.row] = "";
             } else if (fin === "J" && (params === "2" || params === "3")) {
                 this.lines = [""]; this.row = 0; this.col = 0;
+                this.hideRange = null;                  /* a screen clear starts fresh -- a stale hide range would truncate the new screen */
             }
             /* Everything else is consumed and ignored -- see the file header, and pcjsvax-582. */
         }
@@ -179,7 +180,7 @@ export class VaxTerminal
         this.el.scrollTop = this.el.scrollHeight;
     }
 
-    clear() { this.lines = [""]; this.row = 0; this.col = 0; this.dirty = true; this.render(); }
+    clear() { this.lines = [""]; this.row = 0; this.col = 0; this.hideRange = null; this.dirty = true; this.render(); }
 
     onKeyDown(e)
     {

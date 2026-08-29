@@ -182,8 +182,11 @@ const RE_HIDE_START = /NetBSD/;                      /* first match: ">> NetBSD/
 const RE_REVEAL     = /^%OVMX-|OpenVMS-compatible/;  /* first OVMX/VMS line: "%OVMX-I-EXEC, ..." */
 let hideStartIdx = -1, revealIdx = -1, hideScanFrom = 0;
 function updateHideRange() {
-    if (revealIdx >= 0) return;                      /* both markers fixed -- nothing more to do */
     const L = term.lines;
+    if (L.length < hideScanFrom) {                   /* screen was cleared (ESC[2J) -- restart detection fresh */
+        hideStartIdx = -1; revealIdx = -1; hideScanFrom = 0; term.hideRange = null; term.dirty = true;
+    }
+    if (revealIdx >= 0) return;                      /* both markers fixed -- nothing more to do */
     for (let i = hideScanFrom; i < L.length; i++) {
         if (hideStartIdx < 0) { if (RE_HIDE_START.test(L[i])) hideStartIdx = i; }
         else if (RE_REVEAL.test(L[i])) { revealIdx = i; break; }
