@@ -50,6 +50,7 @@ export class VaxTerminal
         this.esc = null;                                    /* the CSI sequence being collected */
         this.dirty = false;
         this.bytesIn = 0;
+        this.hideRange = null;                              /* opt-in {start,end}: lines to NOT paint (see render) */
 
         el.tabIndex = 0;
         el.addEventListener("keydown", (e) => this.onKeyDown(e));
@@ -109,6 +110,10 @@ export class VaxTerminal
             let drop = this.lines.length - MAX_LINES;
             this.lines.splice(0, drop);
             this.row -= drop;
+            if (this.hideRange) {                       /* keep the hide block anchored across the trim */
+                this.hideRange.start = Math.max(0, this.hideRange.start - drop);
+                if (this.hideRange.end !== Infinity) this.hideRange.end = Math.max(0, this.hideRange.end - drop);
+            }
         }
     }
 
@@ -139,10 +144,31 @@ export class VaxTerminal
         if (!this.dirty) return;
         this.dirty = false;
         /* A block on the cursor's line, so the user can see the guest is waiting for them. */
-        let out = this.lines.slice();
-        let cur = out[this.row] || "";
-        out[this.row] = (cur.length < this.col ? cur + " ".repeat(this.col - cur.length) : cur.slice(0, this.col)) +
-            "█" + cur.slice(this.col + 1);
+        let out, curRow;
+        if (this.hideRange) {
+            /* pcjsvax demo (ovmx.html only): the NetBSD substrate boot -- kernel banner + device
+               probe -- is the "firmware POST" layer a faithful VMS console never shows.  hideRange
+               {start,end} drops that ONE contiguous block from what is PAINTED; this.lines stays
+               whole, so the self-drive controller (which reads term.lines) still sees the raw
+               stream and copy-from-screen never yields the hidden lines.  end===Infinity while the
+               reveal marker has not appeared yet -- show only the faithful KA655/VMB head. */
+            let s = this.hideRange.start, e = this.hideRange.end;
+            if (e === Infinity || e > this.lines.length) {
+                out = this.lines.slice(0, s);
+                curRow = -1;                                /* cursor is inside the hidden block */
+            } else {
+                out = this.lines.slice(0, s).concat(this.lines.slice(e));
+                curRow = this.row >= e ? s + (this.row - e) : (this.row < s ? this.row : -1);
+            }
+        } else {
+            out = this.lines.slice();
+            curRow = this.row;
+        }
+        if (curRow >= 0) {
+            let cur = out[curRow] || "";
+            out[curRow] = (cur.length < this.col ? cur + " ".repeat(this.col - cur.length) : cur.slice(0, this.col)) +
+                "█" + cur.slice(this.col + 1);
+        }
         /* pcjsvax-f23: browser/vax.html renders into a <pre>, but the PCjs machine XML's
            `<control type="textarea" binding="print"/>` renders into a <textarea>, whose displayed
            text is its VALUE and not its textContent once the browser has given it a value at all.

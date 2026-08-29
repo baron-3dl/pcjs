@@ -170,6 +170,33 @@ let sentUser = false, sentPass = false, sawDollar = false;
 
 function screenText() { return term.lines.join("\n"); }
 
+/* Substrate-hide (pcjsvax demo, presentation half (i) of vms-912e): a faithful VMS console shows
+   the VMS boot, not the NetBSD kernel banner + device probe underneath it. The NetBSD substrate
+   prints that unconditionally and the kernel CANNOT suppress its own boot (proven by the VAX lane
+   over 4 rail iterations), so the DEMO hides it here. We drop ONE contiguous block -- from the
+   first "NetBSD" line to the first OVMX/VMS line -- from what the terminal PAINTS, keeping the
+   faithful KA655 >>> / VMB head and revealing the clean OVMX boot onward. term.lines stays whole,
+   so the self-drive detection below and copy-from-screen are unaffected in the model; only the
+   rendered view hides the block (see VaxTerminal.render + hideRange). */
+const RE_HIDE_START = /NetBSD/;                      /* first match: ">> NetBSD/vax boot [1.12 ...]" */
+const RE_REVEAL     = /^%OVMX-|OpenVMS-compatible/;  /* first OVMX/VMS line: "%OVMX-I-EXEC, ..." */
+let hideStartIdx = -1, revealIdx = -1, hideScanFrom = 0;
+function updateHideRange() {
+    if (revealIdx >= 0) return;                      /* both markers fixed -- nothing more to do */
+    const L = term.lines;
+    for (let i = hideScanFrom; i < L.length; i++) {
+        if (hideStartIdx < 0) { if (RE_HIDE_START.test(L[i])) hideStartIdx = i; }
+        else if (RE_REVEAL.test(L[i])) { revealIdx = i; break; }
+    }
+    hideScanFrom = L.length;
+    if (hideStartIdx < 0) return;                    /* no substrate boot seen yet */
+    const end = revealIdx < 0 ? Infinity : revealIdx;
+    if (!term.hideRange || term.hideRange.start !== hideStartIdx || term.hideRange.end !== end) {
+        term.hideRange = { start: hideStartIdx, end };
+        term.dirty = true;                           /* force a repaint so the block hides/reveals now */
+    }
+}
+
 function controllerTick() {
     if (!running) return;
     tick++;
@@ -180,6 +207,7 @@ function controllerTick() {
         return;
     }
 
+    updateHideRange();
     let text = screenText();
 
     if (!sawUser && RE_USERNAME.test(text)) {
@@ -256,6 +284,7 @@ function boot({romBytes, diskArg}) {
         switch (m.type) {
         case "out":
             term.write(new Uint8Array(m.bytes));
+            updateHideRange();                       /* hide the NetBSD block as soon as it streams in */
             break;
         case "stat":
             meta(`${(m.steps / 1e6).toFixed(0)}M instr · ${m.mips.toFixed(1)}M/s`);
