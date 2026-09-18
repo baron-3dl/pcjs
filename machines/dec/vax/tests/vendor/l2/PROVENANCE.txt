@@ -1,0 +1,2 @@
+eee377337ec99970061136c8b7227aafb40ef593
+vms origin/main tools/cluster-web-demo/l2/{hub,wire}.mjs -- FROZEN contract v1; re-sync from origin/main. Do not edit.
