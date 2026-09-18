@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<!--
+  pcjsvax-636 -- the MicroVAX 3900 (KA655) as a browser-embeddable OVMX CLUSTER NODE.
+
+  This is the pcjs machine ENDPOINT for the frozen cluster-demo contract
+  (openvmx-site demo/cluster/PCJS-NODE-BRIDGE.md).  It is the pcjs analogue of the qemu-wasm Node A:
+  it boots the VAX with its DELQA attached (browser/vaxworker.js in cluster mode) and surfaces the
+  DELQA HubPort's two frame hooks to its PARENT window as the frozen protocol:
+
+     machine -> parent:  {t:'nic-tx',   frame:<ArrayBuffer>}   guest DELQA transmitted a frame
+     parent -> machine:  {t:'nic-rx',   frame:<ArrayBuffer>}   deliver one frame into the DELQA RX
+     machine -> parent:  {t:'nic-ready'}                       the HubPort is up
+
+  FRAME = a contract-v1 raw Ethernet frame (Uint8Array: dst/src/ethertype/payload, NO FCS).  Bytes are
+  forwarded VERBATIM both ways; a malformed frame is dropped in the worker's hub, never crashes the
+  guest (Node C is real OpenVMS).  The machine-side bridge is graded under Node by
+  tests/xqcluster.test.mjs -- this page is the browser carrier for it.
+
+  HOW THE DEMO PARENT USES IT
+    The cluster demo's node page (openvmx-site demo/cluster/node-pcjs.html, filled from
+    node-pcjs.template.html) embeds THIS page as a nested (cross-origin) iframe and bridges these
+    {t:'nic-*} messages to connectNicPipe / the parent L2 switch -- exactly as Node A is wired.  So
+    every node family (qemu-wasm, pcjs) presents the identical seam to attachSwitch.
+
+  QUERY PARAMETERS (all optional; same media conventions as browser/vax.html)
+    ?rom=URL        fetch the KA655 console ROM (ka655x.bin)
+    ?diskgz=URL     fetch a gzip-compressed ODS-2 system disk (the cluster-configured volume; the
+                    web-demo lane owns which volume -- this page just boots what it is handed)
+    ?image=URL      back DUA0 with a Range-capable HTTP GET instead (server MUST honour Range)
+    ?mac=52:54:00:00:00:0B   per-node station MAC (cluster identity)
+    ?mem=16         RAM in MB
+    ?autoboot=0     leave the machine at >>> instead of auto-booting
+
+  Served over any static host (ES modules + a module Worker need http(s), not file://).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OVMX cluster node — pcjs VAX (DELQA)</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: #140d00; color: #e8b100;
+               font: 13px "DejaVu Sans Mono", Menlo, Consolas, monospace; }
+  #bar { padding: 4px 8px; font-size: 12px; opacity: .85; border-bottom: 1px solid #e8b10033;
+         white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+  #screen { white-space: pre; overflow: auto; height: calc(100vh - 28px); margin: 0;
+            padding: .5rem .7rem; color: #ffb232; outline: none; }
+  .err { color: #ff6b6b; }
+</style>
+</head>
+<body>
+<div id="bar">pcjs cluster node — waiting for the DELQA HubPort (nic-ready)…</div>
+<pre id="screen" tabindex="0"></pre>
+
+<script type="module">
+import { VaxTerminal } from "./vaxterm.js";
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const MAC = params.get("mac") || "52:54:00:00:00:0B";   /* Node B default; Node C = ...0C */
+
+/* Introspection handle -- proves the wiring loaded and lets a harness/CDP driver observe the hooks
+   without a parent (see injectRx below).  The demo parent does NOT need this; it is for grading. */
+const node = window.__clusterNode = {
+    mac: MAC, kind: "pcjs", nicReady: false, nicTxCount: 0, nicRxCount: 0,
+    booted: false, lastTx: null, err: null,
+    /* Deliver a frame into the guest DELQA RX as if the parent switch had (Uint8Array). */
+    injectRx: (u8) => { const b = Uint8Array.from(u8); worker && worker.postMessage(
+        { t: "nic-rx", frame: b.buffer }, [b.buffer]); node.nicRxCount++; },
+};
+
+const term = new VaxTerminal($("screen"), (text) => {
+    if (worker && started) worker.postMessage({ cmd: "input", text });
+});
+(function frame() { term.render(); requestAnimationFrame(frame); })();
+$("screen").addEventListener("click", () => $("screen").focus());
+
+function bar(s, cls) { const b = $("bar"); b.textContent = s; b.className = cls || ""; }
+
+let worker = null, started = false;
+
+/* Boot media: fetch the ROM (required) and the disk, then start the worker in CLUSTER mode. */
+async function fetchArrayBuffer(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status} fetching ${url}`);
+    return r.arrayBuffer();
+}
+async function fetchGzipDisk(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status} fetching ${url}`);
+    const stream = r.body.pipeThrough(new DecompressionStream("gzip"));
+    const blob = await new Response(stream).blob();
+    const name = url.split("/").pop().replace(/\.gz$/i, "");
+    return new File([blob], name, { type: "application/octet-stream" });
+}
+
+/* The bridge (this page <-> parent).  Started as soon as the worker exists so a nic-ready that fires
+   before boot completes is not lost. */
+function startWorker(romBytes, diskFile) {
+    worker = new Worker("./vaxworker.js", { type: "module" });
+    started = true;
+
+    worker.onerror = (e) => { node.err = `${e.message} (${e.filename}:${e.lineno})`;
+        bar(`Worker error: ${node.err}`, "err"); };
+
+    worker.onmessage = (e) => {
+        const m = e.data;
+        /* ---- the frozen NIC contract: forward VERBATIM to the parent ---- */
+        if (m.t === "nic-ready") {
+            node.nicReady = true;
+            bar(`pcjs cluster node NIC ready (mac ${MAC}) — DELQA HubPort up`);
+            window.parent.postMessage({ t: "nic-ready" }, "*");
+            return;
+        }
+        if (m.t === "nic-tx") {
+            node.nicTxCount++; node.lastTx = new Uint8Array(m.frame.slice(0));
+            /* single recipient (the parent) -> zero-copy transfer */
+            window.parent.postMessage({ t: "nic-tx", frame: m.frame }, "*", [m.frame]);
+            return;
+        }
+        /* ---- machine control / console ---- */
+        switch (m.type) {
+        case "out": term.write(new Uint8Array(m.bytes)); node.booted = true; break;
+        case "info": bar(`DUA0 ${m.diskName || "(no disk)"} — ${m.devices.join(", ")} — mac ${MAC}`); break;
+        case "stopped": node.err = `HALTED: ${m.reason}`; bar(node.err, "err"); break;
+        case "error": node.err = m.message; bar(`ERROR: ${m.message}`, "err"); break;
+        }
+    };
+
+    /* Parent switch -> guest DELQA RX.  DROP anything that is not a v1 nic-rx from the parent. */
+    window.addEventListener("message", (e) => {
+        if (e.source !== window.parent) return;               /* only the embedding parent */
+        const m = e.data;
+        if (!m || m.t !== "nic-rx") return;
+        node.nicRxCount++;
+        worker.postMessage({ t: "nic-rx", frame: m.frame }, [m.frame]);   /* verbatim, transfer */
+    });
+
+    worker.postMessage({
+        cmd: "start",
+        rom: romBytes,
+        disk: diskFile ? { file: diskFile } : (params.get("image") ? { url: params.get("image") } : null),
+        memMB: parseInt(params.get("mem") || "16", 10),
+        autoBoot: params.get("autoboot") !== "0",
+        cluster: true,                                        /* <-- attach the DELQA HubPort */
+        mac: MAC,
+    }, [romBytes]);
+}
+
+(async function boot() {
+    try {
+        if (!params.get("rom")) {
+            bar("no ?rom= given — open with ?rom=URL&diskgz=URL to boot this cluster node", "err");
+            return;                                           /* still exposes __clusterNode for wiring tests */
+        }
+        bar(`fetching boot media for cluster node (mac ${MAC})…`);
+        const [romBytes, diskFile] = await Promise.all([
+            fetchArrayBuffer(params.get("rom")),
+            params.get("diskgz") ? fetchGzipDisk(params.get("diskgz")) : Promise.resolve(null),
+        ]);
+        startWorker(romBytes, diskFile);
+    } catch (e) { node.err = String(e); bar(`boot failed: ${e}`, "err"); }
+})();
+</script>
+</body>
+</html>
