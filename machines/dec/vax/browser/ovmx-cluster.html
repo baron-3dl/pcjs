@@ -10,6 +10,18 @@
      machine -> parent:  {t:'nic-tx',   frame:<ArrayBuffer>}   guest DELQA transmitted a frame
      parent -> machine:  {t:'nic-rx',   frame:<ArrayBuffer>}   deliver one frame into the DELQA RX
      machine -> parent:  {t:'nic-ready'}                       the HubPort is up
+     machine -> parent:  {t:'acp-ok', tell:<string>}           the guest console showed the GENUINE
+                                                               ODS-2 ACP mount of the system disk
+
+  REAL-ACP PRODUCT AUTHENTICITY (PCJS-NODE-BRIDGE.md §4).  The CN=N gate counts a node as clustered
+  only when it has BOTH a real 0x6007 at the hub AND acp-ok.  acp-ok fires ONCE, when this node's
+  console emits the executive's genuine Files-11 ODS-2 ACP mount of the system disk -- the pair
+     %OVMX-I-SYSDISK, mounting system disk <dev>:  ->  %OVMX-I-MOUNTED, system disk <dev>: mounted
+  and/or the executive's mount-unit line  "disk unit DUA0: -> ra0e".  On this pcjs VAX the system disk
+  is the ODS-2 volume on the boot disk's partition e (DUA0: -> ra0e), mounted over /dev/vms by the
+  executive ACP -- a tell a host-mode /vms passthrough facade cannot fabricate (vms-165 retired the
+  passthrough; the ACP refuses that masquerade, INV-6).  <dev> is DUA0: on this MSCP-backed VAX; the
+  matcher also accepts VDA0: (virtio-named guests) so the seam is uniform across node families.
 
   FRAME = a contract-v1 raw Ethernet frame (Uint8Array: dst/src/ethertype/payload, NO FCS).  Bytes are
   forwarded VERBATIM both ways; a malformed frame is dropped in the worker's hub, never crashes the
@@ -64,7 +76,7 @@ const MAC = params.get("mac") || "52:54:00:00:00:0B";   /* Node B default; Node 
    without a parent (see injectRx below).  The demo parent does NOT need this; it is for grading. */
 const node = window.__clusterNode = {
     mac: MAC, kind: "pcjs", nicReady: false, nicTxCount: 0, nicRxCount: 0,
-    booted: false, lastTx: null, err: null,
+    booted: false, lastTx: null, err: null, acpOk: false, acpTell: null,
     /* Deliver a frame into the guest DELQA RX as if the parent switch had (Uint8Array). */
     injectRx: (u8) => { const b = Uint8Array.from(u8); worker && worker.postMessage(
         { t: "nic-rx", frame: b.buffer }, [b.buffer]); node.nicRxCount++; },
@@ -77,6 +89,27 @@ const term = new VaxTerminal($("screen"), (text) => {
 $("screen").addEventListener("click", () => $("screen").focus());
 
 function bar(s, cls) { const b = $("bar"); b.textContent = s; b.className = cls || ""; }
+
+/* ---- real-ACP product-authenticity detector (PCJS-NODE-BRIDGE.md §4) ----
+   Watch the guest console stream for the executive's GENUINE ODS-2 ACP mount of the system disk and,
+   the first time it appears, post {t:'acp-ok'} to the parent.  We accumulate a rolling text window
+   (the tell can straddle "out" chunks) and match either the completed MOUNTED line or the executive's
+   mount-unit line -- both prove the ACP really mounted the ODS-2 volume, which a host-mode /vms
+   facade cannot emit.  Fires exactly once. */
+const acpDecoder = new TextDecoder("latin1");   /* console is 8-bit; latin1 never throws on any byte */
+let acpBuf = "";
+const ACP_TELL = /%OVMX-I-MOUNTED,\s*system disk\s*(?:DUA0|VDA0):|disk unit\s+(?:DUA0|VDA0):\s*->\s*ra0e/i;
+function acpScan(bytes) {
+    if (node.acpOk) return;
+    acpBuf += acpDecoder.decode(bytes, { stream: true });
+    if (acpBuf.length > 8192) acpBuf = acpBuf.slice(-8192);   /* bound the window */
+    const m = ACP_TELL.exec(acpBuf);
+    if (!m) return;
+    node.acpOk = true;
+    node.acpTell = m[0].trim();
+    bar(`pcjs cluster node — real ODS-2 ACP mount confirmed (${node.acpTell}) — mac ${MAC}`);
+    window.parent.postMessage({ t: "acp-ok", tell: node.acpTell }, "*");
+}
 
 let worker = null, started = false;
 
@@ -121,7 +154,7 @@ function startWorker(romBytes, diskFile) {
         }
         /* ---- machine control / console ---- */
         switch (m.type) {
-        case "out": term.write(new Uint8Array(m.bytes)); node.booted = true; break;
+        case "out": { const b = new Uint8Array(m.bytes); term.write(b); node.booted = true; acpScan(b); break; }
         case "info": bar(`DUA0 ${m.diskName || "(no disk)"} — ${m.devices.join(", ")} — mac ${MAC}`); break;
         case "stopped": node.err = `HALTED: ${m.reason}`; bar(node.err, "err"); break;
         case "error": node.err = m.message; bar(`ERROR: ${m.message}`, "err"); break;
