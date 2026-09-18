@@ -116,6 +116,45 @@ export const XQ_SAN_HW_SW = 2, XQ_SAN_ENABLE = 1;
 export const XQ_STARTUP_DELAY = 20;      /* instructions to delay before the receiver starts */
 export const XQ_QUE_MAX = 500;           /* read-queue capacity, in packets */
 
+/* --------------------------------------------------------------------------------------------- *
+ * §2 Buffer-descriptor bits and §4 status codes (pdp11_xq.h:364-401) -- transcribed verbatim.
+ * The normal-mode 6-word descriptor: [0] flag word, [1] bits+addr<21:16>, [2] addr<15:0>,
+ * [3] length (two's-complement WORDS), [4] status-1 (device writes), [5] status-2 (device writes).
+ * --------------------------------------------------------------------------------------------- */
+export const XQ_DSC_V = 0x8000,   /* Valid */
+             XQ_DSC_C = 0x4000,   /* Chain */
+             XQ_DSC_E = 0x2000,   /* End-of-Message (TX only) */
+             XQ_DSC_S = 0x1000,   /* Setup packet   (TX only) */
+             XQ_DSC_L = 0x0080,   /* Low-byte termination (TX) */
+             XQ_DSC_H = 0x0040;   /* High-byte start      (TX) */
+
+/* Receive status-word-1 codes (pdp11_xq.h:372-382). */
+export const XQ_RST_LASTNOT   = 0xC000,  /* used, not last segment */
+             XQ_RST_LASTERR   = 0x4000,  /* used, last segment, with errors */
+             XQ_RST_LASTNOERR = 0x0000,  /* used, last segment, no errors */
+             XQ_RST_RUNT      = 0x4800,
+             XQ_RST_ESETUP    = 0x2000,  /* setup/loopback packet */
+             XQ_RST_OVERFLOW  = 0x0001;  /* receiver overflowed, packet(s) lost */
+
+/* Transmit status-word codes (pdp11_xq.h:385-393). */
+export const XQ_XMT_LASTNOERR = 0x0000,
+             XQ_XMT_FAIL      = 0x0100;  /* heartbeat/loopback "fail" flag OR'd into TX status */
+
+/* Setup-packet length-encoded control bits (pdp11_xq.h:398-401). */
+export const XQ_SETUP_MC = 0x0001,   /* multicast */
+             XQ_SETUP_PM = 0x0002,   /* promiscuous */
+             XQ_SETUP_LD = 0x000C,   /* LED bits */
+             XQ_SETUP_ST = 0x0070;   /* sanity-timer bits */
+
+/** Ethernet frame geometry (sim_ether.h:163-168): the write buffer holds a full frame; oversize/
+    jumbo is out of scope (throw by name, never truncate a frame to a real peer). */
+export const ETH_MIN_PACKET = 60, ETH_MAX_PACKET = 1514, ETH_FRAME_SIZE = 1518;
+export const XQ_MAX_RCV_PACKET = 1600, XQ_LONG_PACKET = 0x0600;
+export const XQ_FILTER_MAX = 14;
+
+/** ETH_ITEM.type (sim_ether.h:219-221) -- how a queued RX item is classified for status build-out. */
+export const ETH_ITM_SETUP = 0, ETH_ITM_LOOPBACK = 1, ETH_ITM_NORMAL = 2;
+
 /**
  * Thrown BY NAME rather than answered, exactly as rq.js's RQUnimplemented: the frame-movement paths
  * (TX = pcjsvax-6b0, RX/setup = pcjsvax-a7f) are seams in this rung, and a differential that reached
@@ -167,10 +206,28 @@ export default class XQVAX {
         this.vec = 0;                                       /* dib->vec, the driver's VAR<IV> echo */
         this.irq = 0;
 
-        /* The BDL register latches and their working copies -- present so the 6b0/a7f seams have
-           somewhere to land; untouched by this rung except that a write to them is refused (wr()). */
+        /* The BDL register latches (rbdl/xbdl lo+hi), their 6-word descriptor scratch copies, and the
+           current descriptor base addresses -- pdp11_xq.h:276-304.  Working copies live on the device
+           and are NOT re-read per access (spec §2).  All allocated ONCE (no per-op allocation). */
         this.rbdl = [0, 0];
         this.xbdl = [0, 0];
+        this.rbdlBuf = new Uint16Array(6);      /* xq->var->rbdl_buf[6] */
+        this.xbdlBuf = new Uint16Array(6);      /* xq->var->xbdl_buf[6] */
+        this.rbdlBa = 0;                         /* xq->var->rbdl_ba */
+        this.xbdlBa = 0;                         /* xq->var->xbdl_ba */
+
+        /* Scratch byte buffers for the CQBIC DMA calls (buf is a Uint8Array in every direction, spec
+           §4).  12 bytes = one full 6-word descriptor fetch; 4 bytes = a status-word-pair write-back. */
+        this._dmaDesc = new Uint8Array(12);
+        this._dmaStat = new Uint8Array(4);
+        this._dmaChain = new Uint8Array(2);
+
+        /* The transmit gather buffer (xq->var->write_buffer): a full Ethernet frame assembled from
+           the scattered TX descriptor buffers.  Allocated once at ETH_FRAME_SIZE; a gather that would
+           exceed it is the jumbo/oversize path (out of scope) and throws BY NAME rather than truncate
+           a frame bound for a real peer. */
+        this.writeBuffer = new Uint8Array(ETH_FRAME_SIZE);
+        this.writeBufferLen = 0;
 
         /* The injected transport.  `etherface` is the C's `xq->var->etherface`: null when nothing is
            attached.  A LoopbackEthernetLink passed in `opts.ethlink` is a concrete backend; it is
@@ -178,8 +235,11 @@ export default class XQVAX {
         this.ethlink = opts.ethlink || null;
         this.etherface = null;                              /* set by attach() */
 
-        /* The receive FIFO the RX path (a7f) drains into guest memory.  Allocated once. */
-        this.readQ = [];
+        /* The receive FIFO (xq->var->ReadQ, an ETH_QUE) the RX path drains into guest memory.  A
+           circular queue of pre-allocated items, each carrying a full-frame byte buffer; modelled
+           term-for-term on sim_ether.c's ethq (head/tail/count/loss/high, lose-oldest on overflow).
+           Allocated ONCE here (no per-op allocation). */
+        this.readQ = this.ethqInit(XQ_QUE_MAX);
 
         /* The event queue -- one deadline per pseudo-unit, in cpu.nTotalCycles units, or null for
            "not active" (sim_is_active).  UNIT 0 = receive poll (xq_svc), 1 = sanity timer
@@ -189,7 +249,8 @@ export default class XQVAX {
         this.units = [
             { due: null, svc: (cpu) => this.svc(cpu) },
             { due: null, svc: (cpu) => this.tmrSvc(cpu) },
-            { due: null, svc: (cpu) => this.startSvc(cpu) }
+            { due: null, svc: (cpu) => this.startSvc(cpu) },
+            { due: null, svc: (cpu) => this.receiveSvc(cpu) }    /* unit+3: 400us loopback/setup read */
         ];
         this.evSeq = 0;
         this.cpu = null;
@@ -280,7 +341,8 @@ export default class XQVAX {
 
         this.clrInt();                                      /* clear interrupts unconditionally */
 
-        this.readQ.length = 0;                              /* ethq_init + ethq_clear */
+        this.ethqClear(this.readQ);                         /* ethq_init + ethq_clear */
+        this.writeBufferLen = 0;                            /* clear the TX gather buffer */
 
         if (this.etherface) {
             this.etherface.setFilter([this.mac], false, false);   /* restore ROM-mac filter */
@@ -309,7 +371,8 @@ export default class XQVAX {
         this.csrSetClr(setBits, (~setBits) & 0xFFFF);
         if (this.etherface) this.csrSetClr(XQ_CSR_OK, 0);
         this.clrInt();
-        this.readQ.length = 0;
+        this.ethqClear(this.readQ);
+        this.writeBufferLen = 0;
     }
 
     /**
@@ -698,26 +761,38 @@ export default class XQVAX {
         }
     }
 
-    /* ---- the service bodies (SEAMS) ---- */
+    /* ---- the service bodies ---- */
 
-    /** startSvc -- xq_startsvc/xq_start_receiver (pdp11_xq.c): with no etherface it returns
-        immediately (the C's first line).  The attached RX path is pcjsvax-a7f. */
+    /** startSvc -- xq_startsvc/xq_start_receiver (pdp11_xq.c:2818-2828,2691-...): with no etherface
+        it returns immediately (the C's first line).  With the in-process transport, inbound frames
+        are PUSHED into the ReadQ by the port callback (deliverReceive), so there is no poll to arm;
+        any already-queued frames are drained. */
     startSvc(cpu)
     {
         if (!this.etherface) return;
-        throw new XQUnimplemented("xq.js: attached receiver start is pcjsvax-a7f (RX path)");
+        if (this.readQ.count && (this.csr & XQ_CSR_RE) && !(this.csr & XQ_CSR_RL)) this.processRbdl();
     }
 
-    /** svc -- xq_svc, the receive poll.  Frame movement is pcjsvax-a7f; unattached it is a no-op. */
+    /** svc -- xq_svc (pdp11_xq.c:2744-2777), the receive poll.  If the receiver is enabled, drain any
+        queued packets into guest memory.  Inbound frames arrive synchronously via the port callback
+        (deliverReceive), so the eth_read pull loop is a no-op here; the drain-on-service is kept so the
+        differential still matches the C's ordering (spec §6.2). */
     svc(cpu)
     {
-        if (!this.etherface || this.readQ.length === 0) return;
-        throw new XQUnimplemented("xq.js: receive-poll frame movement is pcjsvax-a7f (RX path)");
+        if (!(this.csr & XQ_CSR_RE)) return;
+        if (this.readQ.count && !(this.csr & XQ_CSR_RL)) this.processRbdl();
+    }
+
+    /** receiveSvc -- xq_receivesvc (pdp11_xq.c:2834-2844), unit+3: the 400us-delayed read of a
+        loopback or setup packet the TX path enqueued.  Drains the ReadQ into the posted RX BDL. */
+    receiveSvc(cpu)
+    {
+        this.processRbdl();
     }
 
     /** tmrSvc -- xq_tmrsvc, the 250ms sanity/system-id timer.  Off by default; a real sanity timeout
         (xq_boot_host) is a device reset and MUST be modelled once sanity is enabled (a7f/later).  For
-        1a45 the sanity timer is off, so re-arm without effect. */
+        now the sanity timer is off, so re-arm without effect. */
     tmrSvc(cpu)
     {
         /* re-arm to keep the C's cadence; no countdown effect while sanity is disabled */
@@ -730,23 +805,477 @@ export default class XQVAX {
         this.units[2].due = null;
     }
 
-    /* ---- the frame dispatch SEAMS (6b0/a7f) -- throw by name, never silently no-op ---- */
+    /* --------------------------------------------------------------------------------------- *
+     * §4 The CQBIC DMA seam.  Every transfer goes THROUGH the existing cqbic scatter-gather map  *
+     * (mapReadB/W, mapWriteB/W) -- NO second copy of the Qbus map (spec §4, pcjsvax-e05 check 3). *
+     * A non-zero residual is an NXM fault (the whole reason the residual convention exists).      *
+     * `buf` is a Uint8Array in every direction; words are VAX little-endian (spec §4).           *
+     * --------------------------------------------------------------------------------------- */
 
-    /** dispatchRbdl -- xq_dispatch_rbdl: begin an RX descriptor walk.  pcjsvax-a7f. */
-    dispatchRbdl()
+    /** wordFromBytes/bytesFromWord -- VAX little-endian word <-> byte pair inside a Uint8Array. */
+    wordFromBytes(u8, j) { return (u8[j] | (u8[j + 1] << 8)) & 0xFFFF; }
+    bytesFromWord(u8, j, w) { u8[j] = w & 0xFF; u8[j + 1] = (w >>> 8) & 0xFF; }
+
+    /** map() -- the cqbic scatter-gather map; requires a cqbic with a bus.  A device built without a
+        DMA-capable cqbic cannot move frames -- that is a machine-wiring error, surfaced by name. */
+    map()
     {
-        throw new XQUnimplemented("xq.js: RX descriptor processing (xq_process_rbdl) is pcjsvax-a7f");
+        if (!this.cqbic || typeof this.cqbic.mapReadW !== "function") {
+            throw new XQUnimplemented("xq.js: DMA reached but this cqbic has no scatter-gather map");
+        }
+        return this.cqbic;
     }
 
-    /** dispatchXbdl -- xq_dispatch_xbdl: begin a TX descriptor walk.  pcjsvax-6b0. */
+    /**
+     * nxmError() -- xq_nxm_error (pdp11_xq.c:991-1004), DEQNA/DELQA-normal arm.  A DMA that returns a
+     * non-zero residual is a Non-Existent-Memory fault: set NI|XI|XL|RL in CSR (which also raises the
+     * interrupt through csr_set_clr) and abandon the transfer.  Returns false so callers can bail.
+     */
+    nxmError()
+    {
+        this.csrSetClr(XQ_CSR_NI | XQ_CSR_XI | XQ_CSR_XL | XQ_CSR_RL, 0);
+        return false;
+    }
+
+    /** resetSanTmr() -- xq_reset_santmr: reload the sanity-timer countdown.  Off by default (the guest
+        must enable HW sanity via a setup packet); a no-op until then. */
+    resetSanTmr()
+    {
+        if (this.sanity.enabled & XQ_SAN_ENABLE) this.sanity.timer = this.sanity.quarter_secs;
+    }
+
+    /* --------------------------------------------------------------------------------------- *
+     * ethq -- the ReadQ, a circular FIFO (sim_ether.c:673-777).  Pre-allocated items; lose-oldest   *
+     * on overflow with a loss counter; each item carries {type, len, used, msg}.                    *
+     * --------------------------------------------------------------------------------------- */
+
+    ethqInit(max)
+    {
+        let items = new Array(max);
+        for (let i = 0; i < max; i++) items[i] = { type: 0, len: 0, used: 0, msg: new Uint8Array(ETH_FRAME_SIZE) };
+        return { max, count: 0, head: 0, tail: 0, loss: 0, high: 0, items };
+    }
+
+    ethqClear(q)
+    {
+        for (let i = 0; i < q.max; i++) { q.items[i].len = 0; q.items[i].used = 0; q.items[i].type = 0; }
+        q.count = q.head = q.tail = 0; q.loss = 0;
+    }
+
+    /** ethqInsert(q, type, frameU8, len, used) -- ethq_insert_data (sim_ether.c:731-772).  Copies the
+        frame bytes into the (new) tail item; loses the oldest packet on overflow.  Jumbo frames that
+        would not fit a full-frame item are out of scope and throw by name (never truncate). */
+    ethqInsert(q, type, frameU8, len, used)
+    {
+        if (len > ETH_FRAME_SIZE) {
+            throw new XQUnimplemented("xq.js: jumbo/oversize RX enqueue (" + len + " bytes) is out of scope");
+        }
+        if (!q.count) { q.head = 0; q.tail = -1; }
+        if (++q.tail === q.max) q.tail = 0;
+        if (++q.count > q.max) { q.count = q.max; if (++q.head === q.max) q.head = 0; q.loss++; }
+        if (q.count > q.high) q.high = q.count;
+        let item = q.items[q.tail];
+        item.type = type; item.len = len; item.used = used | 0;
+        item.msg.set(frameU8.subarray(0, len));
+        return item;
+    }
+
+    /** ethqRemove(q) -- ethq_remove (sim_ether.c:717-729): drop the head item, advance. */
+    ethqRemove(q)
+    {
+        if (q.count) {
+            let item = q.items[q.head];
+            item.len = 0; item.used = 0; item.type = 0;
+            if (++q.head === q.max) q.head = 0;
+            q.count--;
+        }
+    }
+
+    /* --------------------------------------------------------------------------------------- *
+     * §4 TX -- xq_dispatch_xbdl / xq_process_xbdl (pdp11_xq.c:1698-1727, 1488-1616)             *
+     * Gather the frame out of VAX memory through the CQBIC map, transmit (or loop back), write   *
+     * TX status back, set CSR XI and raise the interrupt.                                        *
+     * --------------------------------------------------------------------------------------- */
+
+    /** dispatchXbdl -- xq_dispatch_xbdl (pdp11_xq.c:1698-1727): mark the TX list valid, clear the
+        descriptor scratch and the gather buffer, compute the first descriptor base, process. */
     dispatchXbdl()
     {
-        throw new XQUnimplemented("xq.js: TX descriptor processing (xq_process_xbdl) is pcjsvax-6b0");
+        this.csrSetClr(0, XQ_CSR_XL);                       /* mark transmit bdl valid */
+        for (let i = 0; i < 6; i++) this.xbdlBuf[i] = 0;
+        this.writeBufferLen = 0;
+        this.xbdlBa = (((this.xbdl[1] & 0x3F) << 16) | (this.xbdl[0] & ~1)) >>> 0;
+        this.processXbdl();
     }
 
-    /** deliverReceive -- the etherface's inbound callback; drains into readQ for xq_svc.  a7f. */
+    /**
+     * processXbdl() -- xq_process_xbdl (pdp11_xq.c:1488-1616).  Walk the transmit BDL, gathering each
+     * buffer's bytes into the write buffer through the CQBIC map; at end-of-message transmit (or, for
+     * loopback/setup, enqueue into the ReadQ) and write the TX status words back.  Ported term for
+     * term, including the two's-complement word length, the H/L byte trims, explicit + implicit chain,
+     * and the three EOM outcomes.
+     */
+    processXbdl()
+    {
+        const cq = this.map();
+        const desc = this._dmaDesc, stat = this._dmaStat;
+
+        this.writeBufferLen = 0;
+
+        for (;;) {
+            /* fetch the whole 6-word descriptor, then stamp word 0 = 0xFFFF "processed" back */
+            if (cq.mapReadW(this.xbdlBa, 12, desc)) return this.nxmError();
+            for (let i = 0; i < 6; i++) this.xbdlBuf[i] = this.wordFromBytes(desc, i * 2);
+            this.xbdlBuf[0] = 0xFFFF;
+            this.bytesFromWord(stat, 0, 0xFFFF);
+            if (cq.mapWriteW(this.xbdlBa, 2, stat)) return this.nxmError();
+
+            let bits = this.xbdlBuf[1];
+            let address = (((bits & 0x3F) << 16) | this.xbdlBuf[2]) >>> 0;
+
+            /* explicit chain buffer? */
+            if (bits & XQ_DSC_C) { this.xbdlBa = address; continue; }
+
+            /* invalid buffer? -> list empty, mark XL, stop */
+            if (~bits & XQ_DSC_V) { this.csrSetClr(XQ_CSR_XL, 0); return true; }
+
+            /* decode buffer length -- two's-complement in WORDS; H trims/advances, L trims */
+            let bLength = ((~this.xbdlBuf[3] + 1) & 0xFFFF) * 2;
+            if (bits & XQ_DSC_H) { bLength -= 1; address = (address + 1) >>> 0; }
+            if (bits & XQ_DSC_L) bLength -= 1;
+
+            /* gather this buffer's bytes into the write buffer (jumbo is out of scope) */
+            if (this.writeBufferLen + bLength > ETH_FRAME_SIZE) {
+                throw new XQUnimplemented("xq.js: TX gather exceeds a full frame (" +
+                    (this.writeBufferLen + bLength) + " bytes) -- jumbo/oversize TX is out of scope");
+            }
+            if (bLength > 0) {
+                let seg = this.writeBuffer.subarray(this.writeBufferLen, this.writeBufferLen + bLength);
+                if (cq.mapReadB(address, bLength, seg)) return this.nxmError();
+                this.writeBufferLen += bLength;
+            }
+
+            /* end of message? */
+            if (bits & XQ_DSC_E) {
+                let writeSuccess;
+                if (((~this.csr & XQ_CSR_IL) || (this.csr & XQ_CSR_EL)) || (bits & XQ_DSC_S)) {
+                    /* loopback or setup -- never touches the wire */
+                    if (bits & XQ_DSC_S) {                          /* setup packet */
+                        this.processSetup();
+                        this.ethqInsert(this.readQ, ETH_ITM_SETUP, this.writeBuffer, this.writeBufferLen, 0);
+                        writeSuccess = [0x200C, 0x0860];            /* DELQA setup TX status words */
+                    } else {                                        /* internal/external loopback */
+                        if (((~this.csr & XQ_CSR_RL) && (this.rbdlBuf[1] & XQ_DSC_V)) ||
+                            (this.csr & XQ_CSR_EL)) {
+                            this.ethqInsert(this.readQ, ETH_ITM_LOOPBACK, this.writeBuffer, this.writeBufferLen, 0);
+                        } /* else: no receive buffer -> drop the loopback packet */
+                        writeSuccess = [0x2000 | XQ_XMT_FAIL, 1];
+                    }
+                    this.bytesFromWord(stat, 0, writeSuccess[0]);
+                    this.bytesFromWord(stat, 2, writeSuccess[1]);
+                    if (cq.mapWriteW((this.xbdlBa + 8) >>> 0, 4, stat)) return this.nxmError();
+
+                    this.writeBufferLen = 0;
+                    this.resetSanTmr();
+                    this.csrSetClr(XQ_CSR_XI, 0);                   /* signal transmission complete */
+
+                    /* schedule the 400us "read" of the loopback/setup packet if a RX list is posted */
+                    if (~this.csr & XQ_CSR_RL) this.activate(3, 400);
+
+                } else {
+                    /* normal transmit -- hand the frame to the transport, then the write callback */
+                    let ok = false;
+                    if (this.etherface) {
+                        ok = this.etherface.send(this.writeBuffer.subarray(0, this.writeBufferLen));
+                    }
+                    if (!ok) this.writeCallback(1);                 /* not implemented/unattached -> fail */
+                    else this.writeCallback(0);
+                }
+            } else {
+                /* not end-of-message -- implicit chain: write {V|C, 1} status, advance to next descr */
+                this.bytesFromWord(stat, 0, XQ_DSC_V | XQ_DSC_C);
+                this.bytesFromWord(stat, 2, 1);
+                if (cq.mapWriteW((this.xbdlBa + 8) >>> 0, 4, stat)) return this.nxmError();
+            }
+
+            this.xbdlBa = (this.xbdlBa + 12) >>> 0;              /* next bdl (implicit chain) */
+        }
+    }
+
+    /**
+     * writeCallback(status) -- xq_write_callback (pdp11_xq.c:1009-1043).  Write the TX status words
+     * back (success {0, TDR} or failure {XQ_DSC_C, TDR}), set CSR XI (raise the TX interrupt), reset
+     * the sanity timer and clear the write buffer.  TDR = (100 + len*8) & 0x3FF.
+     */
+    writeCallback(status)
+    {
+        const cq = this.map(), stat = this._dmaStat;
+        const TDR = (100 + this.writeBufferLen * 8) & 0xFFFF;
+        if (status === 0) {
+            this.bytesFromWord(stat, 0, 0);
+            this.bytesFromWord(stat, 2, TDR & 0x03FF);
+        } else {
+            this.bytesFromWord(stat, 0, XQ_DSC_C);
+            this.bytesFromWord(stat, 2, TDR & 0x03FF);
+        }
+        if (cq.mapWriteW((this.xbdlBa + 8) >>> 0, 4, stat)) { this.nxmError(); return; }
+
+        this.csrSetClr(XQ_CSR_XI, 0);
+        this.resetSanTmr();
+        this.writeBufferLen = 0;
+    }
+
+    /* --------------------------------------------------------------------------------------- *
+     * §4 RX -- xq_dispatch_rbdl / xq_process_rbdl (pdp11_xq.c:1674-1696, 1101-1305)             *
+     * Filter + DMA an inbound frame into the guest receive BDL through the CQBIC map, write the  *
+     * status back, set CSR RI and raise the interrupt.                                           *
+     * --------------------------------------------------------------------------------------- */
+
+    /** dispatchRbdl -- xq_dispatch_rbdl (pdp11_xq.c:1674-1696): mark the RX list valid, compute the
+        first descriptor base, fetch its flag+bits words, and drain any already-queued packets. */
+    dispatchRbdl()
+    {
+        const cq = this.map(), desc = this._dmaDesc;
+        this.csrSetClr(0, XQ_CSR_RL);                       /* mark receive bdl valid */
+        this.rbdlBa = (((this.rbdl[1] & 0x3F) << 16) | (this.rbdl[0] & ~1)) >>> 0;
+        if (cq.mapReadW(this.rbdlBa, 4, desc)) return this.nxmError();
+        this.rbdlBuf[0] = this.wordFromBytes(desc, 0);
+        this.rbdlBuf[1] = this.wordFromBytes(desc, 2);
+        if (this.readQ.count) this.processRbdl();
+        return true;
+    }
+
+    /**
+     * processRbdl() -- xq_process_rbdl (pdp11_xq.c:1101-1305), DEQNA/DELQA-normal arm.  Walk the
+     * receive BDL, DMA'ing each queued packet into guest memory through the CQBIC map, building the
+     * per-type receive status words, splitting oversized packets across descriptors, and raising RI
+     * on each fully-delivered packet.  Ported term for term.
+     */
+    processRbdl()
+    {
+        const cq = this.map(), desc = this._dmaDesc, stat = this._dmaStat, chain = this._dmaChain;
+
+        if (this.csr & XQ_CSR_RL) return true;
+
+        let startRbdlBa = this.rbdlBa, dcount = 0;
+
+        for (;;) {
+            /* get receive bdl flags + descriptor bits */
+            if (cq.mapReadW(this.rbdlBa, 4, desc)) return this.nxmError();
+            this.rbdlBuf[0] = this.wordFromBytes(desc, 0);
+            this.rbdlBuf[1] = this.wordFromBytes(desc, 2);
+
+            /* stop if we've walked a full circular list back to the start (overrun guard) */
+            if (dcount && this.rbdlBa === startRbdlBa) break;
+            ++dcount;
+
+            /* set descriptor processed flag (word 0 = 0xFFFF) */
+            this.rbdlBuf[0] = 0xFFFF;
+            this.bytesFromWord(stat, 0, 0xFFFF);
+            if (cq.mapWriteW(this.rbdlBa, 2, stat)) return this.nxmError();
+
+            /* invalid buffer? -> mark RL, stop */
+            if (~this.rbdlBuf[1] & XQ_DSC_V) { this.csrSetClr(XQ_CSR_RL, 0); return true; }
+
+            /* explicit chain buffer? follow it */
+            if (this.rbdlBuf[1] & XQ_DSC_C) {
+                if (cq.mapReadW((this.rbdlBa + 4) >>> 0, 2, chain)) return this.nxmError();
+                this.rbdlBuf[2] = this.wordFromBytes(chain, 0);
+                this.rbdlBa = (((this.rbdlBuf[1] & 0x3F) << 16) | this.rbdlBuf[2]) >>> 0;
+                continue;
+            }
+
+            /* stop if nothing left in the read queue */
+            if (!this.readQ.count) break;
+
+            /* get address, length and status words (words 2..5) */
+            if (cq.mapReadW((this.rbdlBa + 4) >>> 0, 8, desc)) return this.nxmError();
+            for (let i = 2; i < 6; i++) this.rbdlBuf[i] = this.wordFromBytes(desc, (i - 2) * 2);
+
+            let address = (((this.rbdlBuf[1] & 0x3F) << 16) | this.rbdlBuf[2]) >>> 0;
+            let bLength = ((~this.rbdlBuf[3] + 1) & 0xFFFF) * 2;
+            if (this.rbdlBuf[1] & XQ_DSC_H) { bLength -= 1; address = (address + 1) >>> 0; }
+            if (this.rbdlBuf[1] & XQ_DSC_L) bLength -= 1;
+
+            let item = this.readQ.items[this.readQ.head];
+            let rbl = item.len;
+            let rbufOff = 0;
+
+            if (item.used) {
+                let used = item.used;
+                rbl -= used;
+                rbufOff = used;
+            } else {
+                /* runt padding: sim_ether never delivers short NORMAL packets, so only loopback/short
+                   setup packets get here; NORMAL runts are zero-padded up to the 60-byte minimum */
+                if (item.type === ETH_ITM_NORMAL && rbl < ETH_MIN_PACKET) {
+                    this.runtStats = (this.runtStats || 0) + 1;
+                    item.msg.fill(0, rbl, ETH_MIN_PACKET);
+                    item.len = ETH_MIN_PACKET;
+                    rbl = ETH_MIN_PACKET;
+                }
+                /* giant trim for non-loopback packets beyond the max receive size */
+                if (item.type !== ETH_ITM_LOOPBACK && rbl > ETH_FRAME_SIZE) {
+                    if (rbl > XQ_MAX_RCV_PACKET) { item.len = XQ_MAX_RCV_PACKET; rbl = XQ_MAX_RCV_PACKET; }
+                }
+            }
+
+            /* split across descriptors if the packet does not fit this buffer */
+            if (rbl > bLength) rbl = bLength;
+            item.used += rbl;
+
+            /* DMA the payload into guest memory */
+            if (rbl > 0) {
+                let seg = item.msg.subarray(rbufOff, rbufOff + rbl);
+                if (cq.mapWriteB(address, rbl, seg)) return this.nxmError();
+            }
+
+            /* build receive status word 1 by packet type (pdp11_xq.c:1238-1282) */
+            let st1 = 0;
+            switch (item.type) {
+            case ETH_ITM_SETUP:
+                this.setupStats = (this.setupStats || 0) + 1;
+                st1 = 0x2700;                               /* esetup + RBL<10:8> */
+                break;
+            case ETH_ITM_LOOPBACK:
+                this.loopStats = (this.loopStats || 0) + 1;
+                st1 = XQ_RST_LASTNOERR;
+                st1 |= (rbl & 0x0700);                      /* high bits of rbl */
+                if (this.csr & XQ_CSR_EL) st1 |= XQ_RST_ESETUP;
+                break;
+            case ETH_ITM_NORMAL:
+                rbl = (item.len - 60) & 0xFFFF;             /* keeps max packet size in 11 bits */
+                st1 = (rbl & 0x0700);
+                st1 |= 0x00f8;                              /* reserved bits set to 1 */
+                break;
+            }
+            if (item.used < item.len) st1 |= XQ_RST_LASTNOT;   /* not last segment */
+            this.rbdlBuf[4] = st1 & 0xFFFF;
+            this.rbdlBuf[5] = (((rbl & 0x00FF) << 8) | (rbl & 0x00FF)) & 0xFFFF;
+            if (this.readQ.loss) {
+                this.rbdlBuf[4] |= XQ_RST_OVERFLOW;
+                this.readQ.loss = 0;
+            }
+            /* LONG error bit (pdp11_xq.c:1278-1282) */
+            let normLen = (rbl + (item.type === ETH_ITM_NORMAL ? 60 : 0)) & 0xFFFF;
+            if (((~this.csr & XQ_CSR_EL) && normLen > ETH_MAX_PACKET) ||
+                ((this.csr & XQ_CSR_EL) && item.type === ETH_ITM_LOOPBACK && rbl >= XQ_LONG_PACKET)) {
+                this.rbdlBuf[4] |= XQ_RST_LASTERR;
+            }
+
+            /* write the receive status words back */
+            this.bytesFromWord(stat, 0, this.rbdlBuf[4]);
+            this.bytesFromWord(stat, 2, this.rbdlBuf[5]);
+            if (cq.mapWriteW((this.rbdlBa + 8) >>> 0, 4, stat)) return this.nxmError();
+
+            /* packet fully delivered? remove it and raise RI */
+            if (item.used >= item.len) {
+                this.ethqRemove(this.readQ);
+                this.csrSetClr(XQ_CSR_RI, 0);               /* signal reception complete */
+            }
+
+            this.rbdlBa = (this.rbdlBa + 12) >>> 0;         /* next bdl (implicit chain) */
+        }
+        return true;
+    }
+
+    /**
+     * processSetup() -- xq_process_setup (pdp11_xq.c:1363-1476).  The setup packet programs the MAC
+     * address filter.  Extract up to 14 filter MACs at the documented byte strides, decode the
+     * high-byte-count control word (All-Multicast / Promiscuous / LEDs / sanity-timer), and program
+     * the EthernetLink filter.  A "small" (<=128 byte) setup packet turns Promiscuous off (the VMS
+     * quirk).  MOP MEB processing (Read-Ethernet-Address) is handled for the DELQA.
+     */
+    processSetup()
+    {
+        const buf = this.writeBuffer, len = this.writeBufferLen;
+        /* extract filter addresses (14 slots) at the documented strides (pdp11_xq.c:1377-1387) */
+        let macs = [];
+        for (let i = 0; i < 14; i++) macs.push([0, 0, 0, 0, 0, 0]);
+        for (let i = 0; i < 7; i++) {
+            for (let j = 0; j < 6; j++) {
+                if ((i + 1) + (j * 8) >= len) continue;
+                macs[i][j] = buf[(i + 1) + (j * 8)];
+                if ((i + 0o101) + (j * 8) >= len) continue;
+                macs[i + 7][j] = buf[(i + 0o101) + (j * 8)];
+            }
+        }
+
+        this.setup.promiscuous = 0;
+        if (len > 128) {
+            this.setup.multicast = (len & XQ_SETUP_MC) !== 0 ? 1 : 0;
+            this.setup.promiscuous = (len & XQ_SETUP_PM) !== 0 ? 1 : 0;
+            let led = (len & XQ_SETUP_LD) >> 2;
+            if (led === 1) this.setup.l1 = 0;
+            else if (led === 2) this.setup.l2 = 0;
+            else if (led === 3) this.setup.l3 = 0;
+            let san = (len & XQ_SETUP_ST) >> 4;
+            const secs = [0.25, 1, 4, 16, 60, 240, 960, 3840][san];
+            this.sanity.quarter_secs = (secs * 4) | 0;
+        }
+
+        /* finalize sanity-timer state (pdp11_xq.c:1448-1455) */
+        if (this.sanity.enabled & XQ_SAN_HW_SW) {
+            if (this.csr & XQ_CSR_SE) this.sanity.enabled |= XQ_SAN_ENABLE;
+            else this.sanity.enabled &= ~XQ_SAN_ENABLE;
+        }
+        this.resetSanTmr();
+
+        /* build the non-any filter list and program the transport (eth_filter) */
+        let filters = [];
+        for (let i = 0; i < XQ_FILTER_MAX; i++) {
+            if (macs[i].some((b) => b !== 0)) filters.push(macs[i].slice());
+        }
+        this.setup.macs = macs;
+        if (this.etherface) {
+            this.etherface.setFilter(filters, !!this.setup.multicast, !!this.setup.promiscuous);
+        }
+
+        /* MOP: process MEBs if the first byte is set (Read-Ethernet-Address writes our MAC to memory) */
+        if (buf[0]) this.processMop(filters[0] || this.mac);
+        this.setup.valid = 1;
+    }
+
+    /**
+     * processMop(stationMac) -- xq_process_mop (pdp11_xq.c:1307-1361), the DELQA arm.  Walk the MEBs
+     * at offset 0o200 of the write buffer; the only functionally-implemented type is 1 (Read Ethernet
+     * Address), which DMAs the station MAC into the MEB-named guest address.  All other types are
+     * no-ops in the C.  DEQNA does not MOP.
+     */
+    processMop(stationMac)
+    {
+        if (this.mode === XQ_T_DEQNA) return;
+        const cq = this.map(), buf = this.writeBuffer;
+        let off = 0o200, limit = 0o400;
+        /* MEB layout: [0]=type, [1]=length, [2..4]=addr lo/mi/hi (pdp11_xq.h struct xq_meb) */
+        while (off + 5 <= limit && buf[off] !== 0) {
+            let type = buf[off];
+            let address = ((buf[off + 4] << 16) | (buf[off + 3] << 8) | buf[off + 2]) >>> 0;
+            if (type === 1) {                                    /* Read Ethernet Address */
+                let m = Uint8Array.from(stationMac.slice(0, 6));
+                if (cq.mapWriteB(address, 6, m)) { this.nxmError(); return; }
+            }
+            off += 8;                                            /* sizeof(struct xq_meb) */
+        }
+    }
+
+    /* --------------------------------------------------------------------------------------- *
+     * Inbound delivery -- the etherface's receive callback (ethlink._deliverReceive -> here)    *
+     * --------------------------------------------------------------------------------------- */
+
+    /**
+     * deliverReceive(frameU8) -- the device's receive handler (wired in attach()).  The EthernetLink
+     * has ALREADY applied the sim_ether accept/reject filter and MOP-loopback handling before calling
+     * this, so an accepted inbound frame is queued as a NORMAL packet (ethq_insert) and, if the
+     * receiver is enabled and a RX list is posted, drained into guest memory.  Never mutates or
+     * aliases the caller's buffer (the hub already handed us a private copy).
+     */
     deliverReceive(frameU8)
     {
-        throw new XQUnimplemented("xq.js: inbound frame delivery is pcjsvax-a7f (RX path)");
+        this.ethqInsert(this.readQ, ETH_ITM_NORMAL, frameU8, frameU8.length, 0);
+        if ((this.csr & XQ_CSR_RE) && !(this.csr & XQ_CSR_RL)) {
+            /* drain now if we have a posted list; otherwise it waits for the next dispatch/service */
+            this.processRbdl();
+        }
     }
 }
