@@ -1732,6 +1732,7 @@ const BODIES = {
          * tests/mscpinitdiff.js builds, so this is a no-op everywhere else.
          */
         if (cpu.qbus && cpu.qbus.drainOnHalt) cpu.qbus.drainOnHalt(cpu);
+        if (cpu.qbus2 && cpu.qbus2.drainOnHalt) cpu.qbus2.drainOnHalt(cpu);  /* pcjsvax-1a45: the DELQA's queue */
         throw new VAXStop(VAXStop.REASON.HALT);
     },
 

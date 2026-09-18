@@ -430,6 +430,16 @@ export default class CPUStateVAX extends Component {
         this.qbus = null;
 
         /*
+         * A SECOND, independent Qbus event-queue hook, added for pcjsvax-1a45 so the DELQA (xq.js)
+         * can carry its own service queue alongside the RQDX3's on `qbus` without either device
+         * having to combine ticks with the other (port spec docs/design/delqa-port.md §7,
+         * recommendation (b) -- explicit slot, no combined-tick coupling).  Ticked, considered by
+         * idle.js, and drained on HALT by exc.js exactly as `qbus` is; null in every machine that
+         * mounts only one Qbus event device, which is every machine but the two-controller one.
+         */
+        this.qbus2 = null;
+
+        /*
          * ---------------------------------------------------------------------------------
          * GUEST-IDLE DETECTION (pcjsvax-af8).  See modules/v2/idle.js for the mechanism, the
          * measurement that chose it, and why it is off by default.
@@ -1081,6 +1091,10 @@ export default class CPUStateVAX extends Component {
             /* pcjsvax-c2c: the Qbus device event queue (rq.js's RQ_QUEUE unit) -- a THIRD,
                independent per-instruction hook; see the `qbus` property's own doc comment. */
             if (this.qbus) this.qbus.tick(this);
+
+            /* pcjsvax-1a45: the SECOND Qbus event queue (xq.js's DELQA service units), ticked right
+               after the first; see the `qbus2` property's own doc comment. */
+            if (this.qbus2) this.qbus2.tick(this);
 
             /*
              * vax_cpu.c:729-730.  `sim_interval` is charged BEFORE the fetch, and `extra_bytes`

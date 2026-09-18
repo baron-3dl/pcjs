@@ -62,6 +62,7 @@ import { VAXStop, ROM_MAGIC_BYTE } from "../modules/v2/cpustate.js";
 import { IdleThrottle } from "../modules/v2/idle.js";
 import { makeRomMachine } from "../tests/rommachine.js";
 import RQVAX, { RQ_BASE, IOLN_RQ, RQDX3_CTYPE, U_RO } from "../modules/v2/rq.js";
+import XQVAX, { XQ_BASE, IOLN_XQ } from "../modules/v2/xq.js";
 import { USECS_PER_INSTR } from "../modules/v2/clk.js";
 
 /** console.js's CSR_DONE.  console.js does not export it; it is the architected bit at the
@@ -147,7 +148,20 @@ function makeQbus(provider, report)
                staring at that message needs to be told WHY, not left to guess. */
             readOnly: !!(rq.units[0].flags & U_RO) || typeof provider.write !== "function"
         };
-        return {windows: [{base: RQ_BASE, length: IOLN_RQ, dev: rq}], tickDev: rq};
+        /* pcjsvax-1a45: the DELQA rides the SAME Qbus alongside the RQDX3.  Its window joins the
+           addIoPage() list (they never overlap: RQ at 0x20001468, XQ at 0x20001920) and its service
+           queue rides cpu.qbus2 so the two controllers do not have to combine ticks.  The card is
+           present and decodes at reset but has NO network attached until a later rung binds an
+           EthernetLink -- which is exactly the state that gives OpenVMS a NIC to probe (pcjsvax-4f6)
+           without moving a frame yet. */
+        let xq = new XQVAX(cqbic, {});
+        report.xq = xq;
+        return {
+            windows: [{base: RQ_BASE, length: IOLN_RQ, dev: rq},
+                      {base: XQ_BASE, length: IOLN_XQ, dev: xq}],
+            tickDev: rq,
+            tickDev2: xq
+        };
     };
 }
 
