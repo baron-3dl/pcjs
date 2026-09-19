@@ -111,21 +111,66 @@ function bar(s, cls) { const b = $("bar"); b.textContent = s; b.className = cls 
        tell is: no facade can honestly emit it. Ground truth: booting the pinned Node-C
        volume in this machine, the ORIGINAL two alternatives never fired (real VMS's boot
        transcript has no "%OVMX-..." or "-> ra0e" line), so Node C needs its own tell.
+   rd vms-7ad (2026-09-19): the version banner alone fires at t~6s, BEFORE login -- far too
+   early to mean "ready", and the CN=N gate leans on acpOk as its authenticity half. So the
+   real-VMS alternative now ALSO requires Username: to have appeared (i.e. the console
+   actually reached an interactive gate, past the console-advance nudge below), not just the
+   banner text existing somewhere in the boot log. The OVMX alternatives are unchanged (their
+   ACP-mount tell already only fires well into boot, past any login gate).
    Fires exactly once. */
 const acpDecoder = new TextDecoder("latin1");   /* console is 8-bit; latin1 never throws on any byte */
 let acpBuf = "";
-const ACP_TELL = /%OVMX-I-MOUNTED,\s*system disk\s*(?:DUA0|VDA0):|disk unit\s+(?:DUA0|VDA0):\s*->\s*ra0e|VAX\/VMS\s+Version\s+V\d+\.\d+-\w+/i;
-function acpScan(bytes) {
+const ACP_TELL_OVMX = /%OVMX-I-MOUNTED,\s*system disk\s*(?:DUA0|VDA0):|disk unit\s+(?:DUA0|VDA0):\s*->\s*ra0e/i;
+const ACP_TELL_VMS_BANNER = /VAX\/VMS\s+Version\s+V\d+\.\d+-\w+/i;
+const ACP_TELL_VMS_READY = /Username:/i;
+function acpScan() {
     if (node.acpOk) return;
-    acpBuf += acpDecoder.decode(bytes, { stream: true });
-    if (acpBuf.length > 8192) acpBuf = acpBuf.slice(-8192);   /* bound the window */
-    const m = ACP_TELL.exec(acpBuf);
-    if (!m) return;
+    let tell = null;
+    const mOvmx = ACP_TELL_OVMX.exec(acpBuf);
+    if (mOvmx) tell = mOvmx[0].trim();
+    else if (ACP_TELL_VMS_BANNER.test(acpBuf) && ACP_TELL_VMS_READY.test(acpBuf)) tell = "VAX/VMS + Username: (past the login gate)";
+    if (!tell) return;
     node.acpOk = true;
-    node.acpTell = m[0].trim();
-    bar(`pcjs cluster node — real ODS-2 ACP mount confirmed (${node.acpTell}) — mac ${MAC}`);
+    node.acpTell = tell;
+    bar(`pcjs cluster node — real product confirmed (${node.acpTell}) — mac ${MAC}`);
     window.parent.postMessage({ t: "acp-ok", tell: node.acpTell }, "*");
 }
+
+/* ---- console-advance nudge (rd vms-7ad) ----
+   Real VAX/VMS (and OVMX, which faithfully emulates the same operator-console convention --
+   see openvmx-site boot/index.html's finishResume/OPA0 comment, vms-2213) blocks OPA0: at the
+   "press RETURN to log in" gate: LOGINOUT does not print Username: until an operator strikes
+   RETURN, and until that happens the guest sits silent -- so SCS/PEDRIVER, DELQA and everything
+   else downstream of a completed boot never gets scheduled. The single-node demo already solves
+   this (finishResume): wait for the gate marker AND a quiet console, then send exactly ONE
+   RETURN; re-nudge only after a much longer silence, as lost-keystroke insurance. Reused here
+   verbatim (same heuristic, same one-shot discipline) via THIS page's own existing input path
+   (worker.postMessage({cmd:'input',...}), the same call term's onInput callback makes for a
+   visitor's own keystrokes) -- no new injection mechanism.
+   GATE marker: "Welcome to VAX/VMS" is the line printed immediately before the blocked
+   Username: prompt on both OVMX and real VMS (ground-truthed 2026-09-19 against the pinned
+   Node-C volume). */
+const GATE_READY = /Welcome to VAX\/VMS/i;
+const GATE_SILENT_MS = 1500;     // console gone quiet == guest is genuinely blocked at the gate
+const GATE_RENUDGE_MS = 30000;   // lost-keystroke insurance only; well above LOGINOUT's wake latency
+let gateLastLen = 0, gateLastChange = 0, gateNudged = false, gateDone = false;
+function gateScan() {
+    if (gateDone) return;
+    if (ACP_TELL_VMS_READY.test(acpBuf)) { gateDone = true; return; }   // Username: reached -- done
+    const now = performance.now();
+    if (acpBuf.length !== gateLastLen) { gateLastLen = acpBuf.length; gateLastChange = now; }
+    const quiet = now - gateLastChange;
+    if (!gateNudged) {
+        if (GATE_READY.test(acpBuf) && quiet >= GATE_SILENT_MS) {
+            worker && worker.postMessage({ cmd: "input", text: "\r" });
+            gateNudged = true; gateLastChange = now;
+            bar(`pcjs cluster node — sent console-advance RETURN (login gate) — mac ${MAC}`);
+        }
+        return;
+    }
+    if (quiet >= GATE_RENUDGE_MS) { worker && worker.postMessage({ cmd: "input", text: "\r" }); gateLastChange = now; }
+}
+setInterval(gateScan, 500);
 
 let worker = null, started = false;
 
@@ -170,7 +215,15 @@ function startWorker(romBytes, diskFile) {
         }
         /* ---- machine control / console ---- */
         switch (m.type) {
-        case "out": { const b = new Uint8Array(m.bytes); term.write(b); node.booted = true; acpScan(b); break; }
+        case "out": {
+            const b = new Uint8Array(m.bytes); term.write(b); node.booted = true;
+            /* Append UNCONDITIONALLY (acpBuf also drives gateScan's quiet-detection below, so it
+               must keep growing even after acpOk latches and acpScan's own detection stops). */
+            acpBuf += acpDecoder.decode(b, { stream: true });
+            if (acpBuf.length > 8192) acpBuf = acpBuf.slice(-8192);   /* bound the window */
+            acpScan();
+            break;
+        }
         case "info": bar(`DUA0 ${m.diskName || "(no disk)"} — ${m.devices.join(", ")} — mac ${MAC}`); break;
         case "stopped": node.err = `HALTED: ${m.reason}`; bar(node.err, "err"); break;
         case "error": node.err = m.message; bar(`ERROR: ${m.message}`, "err"); break;
