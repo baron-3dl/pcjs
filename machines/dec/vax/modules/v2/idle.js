@@ -476,6 +476,7 @@ function idleSkip(cpu)
     if (cpu.clk)  consider(cpu.clk.instrsToEvent(), cpu.clk.idleAble);
     if (cpu.tmr)  consider(cpu.tmr.instrsToEvent(), cpu.tmr.idleAble);
     if (cpu.qbus) consider(cpu.qbus.instrsToEvent(cpu), cpu.qbus.idleAble);
+    if (cpu.qbus2) consider(cpu.qbus2.instrsToEvent(cpu), cpu.qbus2.idleAble);  /* pcjsvax-1a45: the DELQA's queue */
     if (!any || !able) return 0;
     let skip = p - 1;
     if (!(skip > 0)) return 0;

@@ -191,6 +191,9 @@ function makeRomMachine(romBytes, fOmitCdg = false, fOmitCqm = false, opts = {})
     let qbusWindows = (qbusExtra && qbusExtra.windows) || [];
     bus.addIoPage([{base: DBL_BASE, length: DBL_SIZE, dev: dbl}, ...qbusWindows]);
     if (qbusExtra && qbusExtra.tickDev) cpu.qbus = qbusExtra.tickDev;
+    /* pcjsvax-1a45: a second Qbus event-queue device (the DELQA) rides cpu.qbus2, so a two-controller
+       callback can return both windows AND both ticks without either device combining ticks. */
+    if (qbusExtra && qbusExtra.tickDev2) cpu.qbus2 = qbusExtra.tickDev2;
     let cdg = null;
     if (!fOmitCdg) { cdg = new CDGVAX(ka655); bus.addCdg(cdg); }
     cpu.setBus(bus);

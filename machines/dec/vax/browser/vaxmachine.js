@@ -62,6 +62,8 @@ import { VAXStop, ROM_MAGIC_BYTE } from "../modules/v2/cpustate.js";
 import { IdleThrottle } from "../modules/v2/idle.js";
 import { makeRomMachine } from "../tests/rommachine.js";
 import RQVAX, { RQ_BASE, IOLN_RQ, RQDX3_CTYPE, U_RO } from "../modules/v2/rq.js";
+import XQVAX, { XQ_BASE, IOLN_XQ } from "../modules/v2/xq.js";
+import HubPortEthernetLink from "../modules/v2/ethlink-hubport.js";
 import { USECS_PER_INSTR } from "../modules/v2/clk.js";
 
 /** console.js's CSR_DONE.  console.js does not export it; it is the architected bit at the
@@ -147,7 +149,20 @@ function makeQbus(provider, report)
                staring at that message needs to be told WHY, not left to guess. */
             readOnly: !!(rq.units[0].flags & U_RO) || typeof provider.write !== "function"
         };
-        return {windows: [{base: RQ_BASE, length: IOLN_RQ, dev: rq}], tickDev: rq};
+        /* pcjsvax-1a45: the DELQA rides the SAME Qbus alongside the RQDX3.  Its window joins the
+           addIoPage() list (they never overlap: RQ at 0x20001468, XQ at 0x20001920) and its service
+           queue rides cpu.qbus2 so the two controllers do not have to combine ticks.  The card is
+           present and decodes at reset but has NO network attached until a later rung binds an
+           EthernetLink -- which is exactly the state that gives OpenVMS a NIC to probe (pcjsvax-4f6)
+           without moving a frame yet. */
+        let xq = new XQVAX(cqbic, {});
+        report.xq = xq;
+        return {
+            windows: [{base: RQ_BASE, length: IOLN_RQ, dev: rq},
+                      {base: XQ_BASE, length: IOLN_XQ, dev: xq}],
+            tickDev: rq,
+            tickDev2: xq
+        };
     };
 }
 
@@ -206,6 +221,43 @@ export class VaxMachine
 
     /** The device roster rommachine.js derives from its own constructions. */
     get deviceNames() { return this.machine.devices.map((d) => d.name); }
+
+    /** The DELQA (XQVAX) instance makeQbus built, or null when the machine has no disk-backed Qbus. */
+    get xq() { return this.qreport.xq || null; }
+
+    /** The attached NIC transport (a HubPortEthernetLink), or null until attachNic() is called. */
+    get nic() { return this._nic || null; }
+
+    /**
+     * attachNic(hub, opts)  --  pcjsvax-636.
+     *
+     * Bind the DELQA to an injected L2 hub, making this machine a cluster node.  REUSES the proven,
+     * transport-agnostic HubPortEthernetLink (modules/v2/ethlink-hubport.js) verbatim: `hub` is the
+     * real in-process L2Hub (hub.mjs) in a test, or the postMessage shim
+     * (browser/nic-postmessage-hub.js) in a browser tab -- the DELQA cannot tell them apart, which is
+     * the whole point of the frozen contract-v1 hub-port API.
+     *
+     * The DELQA only exists when the machine was built with a disk (makeQbus runs), so this throws a
+     * clear error otherwise rather than silently attaching nothing.
+     *
+     * @param {{addPort:function(Object):Object}} hub
+     * @param {Object} [opts]
+     *   {string}         [name]   port name for diagnostics/UI (default "DELQA")
+     *   {Array<number>}  [mac]    optional 6-byte station MAC to program before attach (per-node
+     *                             identity); the guest reprograms its own filter once VMS runs, so
+     *                             this only governs the pre-boot receive filter.
+     * @returns {HubPortEthernetLink} the attached link
+     */
+    attachNic(hub, { name = "DELQA", mac = null } = {})
+    {
+        const xq = this.qreport.xq;
+        if (!xq) throw new Error("VaxMachine.attachNic: no DELQA present (a disk-backed Qbus is required)");
+        if (mac) xq.setMac(mac);
+        const link = new HubPortEthernetLink({ name }).connectHub(hub);
+        xq.attach(link);                                /* wires RX handler, attaches, programs filter */
+        this._nic = link;
+        return link;
+    }
 
     /** Console bytes the caller has not seen yet.  Consuming is what keeps the UI incremental. */
     drainOutput()

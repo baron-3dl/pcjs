@@ -40,6 +40,20 @@
 
 import { overlayImageProvider } from "./imageprovider.js";
 import { VaxMachine } from "./vaxmachine.js";
+import { createPostMessageHub } from "./nic-postmessage-hub.js";
+
+/**
+ * parseMac("52:54:00:00:00:0B") -> [0x52,0x54,0,0,0,0x0B], or null if it is not six hex octets.
+ * Per-node cluster identity arrives as a query-param string; the DELQA wants six bytes.
+ */
+function parseMac(s)
+{
+    if (typeof s !== "string") return null;
+    const parts = s.split(/[:-]/);
+    if (parts.length !== 6) return null;
+    const b = parts.map((p) => parseInt(p, 16));
+    return b.every((n) => n >= 0 && n <= 255) ? b : null;
+}
 
 /**
  * *** THE RUN-LOOP YIELD. ***
@@ -155,6 +169,11 @@ function urlBacking(url)
 let machine = null, disk = null, running = false, t0 = 0, lastStat = 0, lastSteps = 0;
 let idleWaitMs = 0, idleWaits = 0;
 
+/* pcjsvax-636: the cluster-node NIC bridge.  Set when `start` is given `cluster:true`; `nicOnMessage`
+   routes an inbound {t:'nic-rx'} into the DELQA RX.  The hub's `post` is self.postMessage, so guest
+   TX surfaces UP as {t:'nic-tx'} and the HubPort's readiness surfaces as {t:'nic-ready'}. */
+let nicOnMessage = null;
+
 /* The yield primitive.  A MessageChannel round trip is a macrotask with NO 4 ms clamp -- which
    `setTimeout(0)` acquires after five nested calls, and five nested calls is a quarter of a second
    into a two-minute boot.  Measured cost is under 0.1 ms per yield against a 16 ms slice. */
@@ -241,6 +260,10 @@ function pump()
 self.onmessage = function(e)
 {
     let msg = e.data;
+    /* pcjsvax-636: the contract's NIC messages ({t:'nic-rx'}) are a separate namespace from the
+       machine-control commands ({cmd:...}); dispatch them first.  A malformed/oversize frame is
+       dropped inside the hub (never crashes the guest -- a peer is real VMS). */
+    if (msg && msg.t === "nic-rx") { if (nicOnMessage) nicOnMessage(msg); return; }
     try {
         switch (msg.cmd) {
 
@@ -268,6 +291,15 @@ self.onmessage = function(e)
                   attach: machine.attachReport,
                   diskName: backing && backing.name,
                   filesystemBytes: disk && disk.filesystemBytes});
+            /* pcjsvax-636: in cluster-node mode, re-point the DELQA's HubPort at the parent page.
+               The DELQA is present at reset (pcjsvax-1a45), so the NIC comes up and {t:'nic-ready'}
+               fires here -- BEFORE the guest boots -- exactly as the node page needs (it gates the
+               pipe wiring on nic-ready).  Guest frames only flow once VMS drives the DELQA. */
+            if (msg.cluster && machine.xq) {
+                let hub = createPostMessageHub({ post: (m, tr) => self.postMessage(m, tr || []) });
+                nicOnMessage = hub.onMessage;
+                machine.attachNic(hub.hub, { name: "DELQA", mac: parseMac(msg.mac) || undefined });
+            }
             t0 = lastStat = Date.now(); lastSteps = 0;
             running = true;
             schedule();
