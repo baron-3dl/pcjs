@@ -23,11 +23,14 @@
   executive ACP -- a tell a host-mode /vms passthrough facade cannot fabricate (vms-165 retired the
   passthrough; the ACP refuses that masquerade, INV-6).  <dev> is DUA0: on this MSCP-backed VAX; the
   matcher also accepts VDA0: (virtio-named guests) so the seam is uniform across node families.
-  For real VMS (Node C): GROUND-TRUTHED 2026-09-19 against the pinned vms55-nodeC-cluster volume --
-  its actual boot transcript never emits either OVMX tell (no "%OVMX-..." message, no "-> ra0e" mount-
-  unit line at all), so Node C needed its own. The boot banner "VAX/VMS Version Vn.n-xxx" is that tell:
-  only genuine DEC/VSI OpenVMS prints it; OVMX never claims to BE VMS (that would itself violate the
-  authenticity rule this gate enforces), so the string is exactly as unforgeable as the ACP tell.
+  For real VMS (Node C): GROUND-TRUTHED 2026-09-19 against the pinned vms55-nodeC-cluster (V5.5)
+  volume -- its actual boot transcript never emits either OVMX tell (no "%OVMX-..." message, no
+  "-> ra0e" mount-unit line at all), so Node C needed its own. The boot banner "VAX/VMS Version
+  Vn.n-xxx" is that tell for V5.5; a real V7.3 volume (ground-truthed 2026-09-25) instead prints
+  "OpenVMS (TM) VAX Operating System, Version Vn.n" -- so the matcher accepts BOTH forms (rd
+  vms-5f6). Only genuine DEC/VSI OpenVMS prints either; OVMX never claims to BE VMS (that would
+  itself violate the authenticity rule this gate enforces), so both strings are exactly as
+  unforgeable as the ACP tell.
 
   FRAME = a contract-v1 raw Ethernet frame (Uint8Array: dst/src/ethertype/payload, NO FCS).  Bytes are
   forwarded VERBATIM both ways; a malformed frame is dropped in the worker's hub, never crashes the
@@ -104,13 +107,19 @@ function bar(s, cls) { const b = $("bar"); b.textContent = s; b.className = cls 
      - OVMX (Node B): the executive's GENUINE ODS-2 ACP mount of the system disk -- the
        completed MOUNTED line or the mount-unit line. A host-mode /vms passthrough facade
        cannot emit either.
-     - real VMS (Node C, ground-truthed 2026-09-19 against the pinned vms55-nodeC-cluster
-       volume): the boot banner "VAX/VMS Version Vn.n-xxx" that ONLY genuine DEC/VSI OpenVMS
-       prints. OVMX never prints this string (it identifies itself via %OVMX-I- messages,
-       never claims to BE VMS) -- so this is authenticity-safe for the SAME reason the ACP
-       tell is: no facade can honestly emit it. Ground truth: booting the pinned Node-C
-       volume in this machine, the ORIGINAL two alternatives never fired (real VMS's boot
-       transcript has no "%OVMX-..." or "-> ra0e" line), so Node C needs its own tell.
+     - real VMS (Node C): TWO ground-truthed banner forms, neither of which OVMX ever prints
+       (it identifies itself via %OVMX-I- messages, never claims to BE VMS) -- so both are
+       authenticity-safe for the same reason the ACP tell is: no facade can honestly emit
+       them.
+         - "VAX/VMS Version Vn.n-xxx" -- ground-truthed 2026-09-19 against the pinned
+           vms55-nodeC-cluster (V5.5) volume; booting it, the ORIGINAL two OVMX alternatives
+           never fired (real VMS's boot transcript has no "%OVMX-..." or "-> ra0e" line), so
+           Node C needed its own tell.
+         - "OpenVMS (TM) VAX Operating System, Version Vn.n" -- ground-truthed 2026-09-25
+           against the real V7.3 Node-C volume (tests/lab/captures/vms-1ac-cn3-achieved-
+           20260925/VAXC.console.log): V7.3 identifies itself as "OpenVMS", not "VAX/VMS", so
+           the V5.5-shaped regex alone never matched it and acp-ok never fired for a V7.3
+           Node C (rd vms-5f6).
    rd vms-7ad (2026-09-19): the version banner alone fires at t~6s, BEFORE login -- far too
    early to mean "ready", and the CN=N gate leans on acpOk as its authenticity half. So the
    real-VMS alternative now ALSO requires Username: to have appeared (i.e. the console
@@ -121,7 +130,7 @@ function bar(s, cls) { const b = $("bar"); b.textContent = s; b.className = cls 
 const acpDecoder = new TextDecoder("latin1");   /* console is 8-bit; latin1 never throws on any byte */
 let acpBuf = "";
 const ACP_TELL_OVMX = /%OVMX-I-MOUNTED,\s*system disk\s*(?:DUA0|VDA0):|disk unit\s+(?:DUA0|VDA0):\s*->\s*ra0e/i;
-const ACP_TELL_VMS_BANNER = /VAX\/VMS\s+Version\s+V\d+\.\d+-\w+/i;
+const ACP_TELL_VMS_BANNER = /VAX\/VMS\s+Version\s+V\d+\.\d+-\w+|OpenVMS\s+\(TM\)\s+VAX\s+(?:Operating\s+System,\s+)?Version\s+V\d+\.\d+/i;
 const ACP_TELL_VMS_READY = /Username:/i;
 function acpScan() {
     if (node.acpOk) return;
@@ -148,9 +157,29 @@ function acpScan() {
    (worker.postMessage({cmd:'input',...}), the same call term's onInput callback makes for a
    visitor's own keystrokes) -- no new injection mechanism.
    GATE marker: "Welcome to VAX/VMS" is the line printed immediately before the blocked
-   Username: prompt on both OVMX and real VMS (ground-truthed 2026-09-19 against the pinned
-   Node-C volume). */
-const GATE_READY = /Welcome to VAX\/VMS/i;
+   Username: prompt on a V5.5 real-VMS volume (ground-truthed 2026-09-19 against the pinned
+   V5.5 Node-C volume) -- but neither an OVMX/VAX guest (Node B) nor a real V7.3 volume (Node
+   C) ever prints that exact string, so the ORIGINAL marker alone matched only one of the
+   demo's three node kinds and the other two's nudge never fired (rd vms-5f6):
+     - OVMX/VAX (Node B) identifies as "Welcome to the OpenVMX ... Operating System", never
+       "VAX/VMS" -- its console stalled forever at "%RUN-S-PROC_ID, identification of created
+       process is <pid>" and Username: was never reached.
+     - real V7.3 (Node C) identifies as "Welcome to OpenVMS (TM) VAX Operating System,
+       Version V7.3", never "VAX/VMS" either.
+   Fixed with two more alternatives:
+     - the OVMX gate marker openvmx-site's own demo/cluster/node.html already uses
+       (LOGIN_READY = /%RUN-S-PROC_ID|JOB_CONTROL/) -- ground-truthed 2026-09-25 against
+       tests/lab/captures/vms-e18e-cn3-browser-20260925/: %RUN-S-PROC_ID appears immediately
+       before the OVMX welcome banner and Username:, so it is safe as a gate marker for Node B
+       the same way "Welcome to VAX/VMS" is for V5.5.
+     - "Welcome to OpenVMS" -- the V7.3-correct string, ground-truthed 2026-09-25 against the
+       real V7.3 volume (tests/lab/captures/vms-1ac-cn3-achieved-20260925/VAXC.console.log and
+       vms-e18e-cn3-browser-20260925/cn3-pass-CAB/VAXC.console.log), printed immediately before
+       V7.3's own blocked Username: prompt, same convention as V5.5's "Welcome to VAX/VMS".
+   PROVEN: with the OVMX alternative applied, Node B reached Username:, logged in
+   SYSTEM/MANAGER and printed a three-member SHOW CLUSTER on the very next run. All three node
+   kinds now have a marker that is actually theirs. */
+const GATE_READY = /Welcome to VAX\/VMS|Welcome to OpenVMS|%RUN-S-PROC_ID|JOB_CONTROL/i;
 const GATE_SILENT_MS = 1500;     // console gone quiet == guest is genuinely blocked at the gate
 const GATE_RENUDGE_MS = 30000;   // lost-keystroke insurance only; well above LOGINOUT's wake latency
 let gateLastLen = 0, gateLastChange = 0, gateNudged = false, gateDone = false;
