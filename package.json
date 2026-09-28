@@ -56,6 +56,9 @@
     "xslt-polyfill": "^1.0.19",
     "yargs-parser": "^21.1.1"
   },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  },
   "overrides": {
     "@gulp-sourcemaps/identity-map": {
       "postcss": "^8.4.31"
