@@ -89,12 +89,32 @@ const node = window.__clusterNode = {
     /* Deliver a frame into the guest DELQA RX as if the parent switch had (Uint8Array). */
     injectRx: (u8) => { const b = Uint8Array.from(u8); worker && worker.postMessage(
         { t: "nic-rx", frame: b.buffer }, [b.buffer]); node.nicRxCount++; },
+    /* TEST-ONLY (rd vms-0bc): feed console bytes through the exact path the real Worker's "out"
+       message drives below (term.write) without a live CPU boot -- lets
+       test-offscreen-repaint.mjs prove the terminal repaints while the panel sits offscreen,
+       without downloading a ROM/disk or running the emulator. */
+    injectOut: (bytes) => { const b = Uint8Array.from(bytes); term.write(b); node.booted = true; },
 };
 
 const term = new VaxTerminal($("screen"), (text) => {
     if (worker && started) worker.postMessage({ cmd: "input", text });
 });
-(function frame() { term.render(); requestAnimationFrame(frame); })();
+/* rd vms-0bc: repaint on a timer, not requestAnimationFrame. This page is embedded as a
+   cross-origin iframe (openvmx-site's cluster demo) and Chromium throttles rAF callbacks in an
+   offscreen cross-origin iframe -- measured live: frozen at 211 chars of POST for 180s while the
+   real VAX was genuinely booting and clustering underneath; a bare scrollIntoView() (no click,
+   no keystroke) caught the panel up to 6864 chars ten seconds later. term.write() (below, in the
+   Worker's "out" handler) already runs synchronously as bytes arrive and just appends to
+   term.lines -- it was only the DOM paint (term.render(), which is what a visitor actually sees)
+   that depended on the rAF tick. A plain interval is not subject to that offscreen-iframe rAF
+   throttle (only background-TAB timers are clamped, and this tab stays foregrounded the whole
+   time -- only the iframe scrolls out of view), so it keeps painting whatever the guest has
+   already produced regardless of scroll position. This does not touch emulation timing: the
+   VaxMachine runs entirely inside its own Worker (vaxworker.js), decoupled from this loop --
+   RENDER_INTERVAL_MS only governs how often the already-finished console state is copied into
+   the DOM, a cosmetic paint cadence the guest has no notion of. */
+const RENDER_INTERVAL_MS = 100;
+setInterval(() => term.render(), RENDER_INTERVAL_MS);
 $("screen").addEventListener("click", () => $("screen").focus());
 
 function bar(s, cls) { const b = $("bar"); b.textContent = s; b.className = cls || ""; }
