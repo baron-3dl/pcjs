@@ -18,7 +18,9 @@
   could not emit.  For OVMX (Node B): the executive's genuine Files-11 ODS-2 ACP mount of the system
   disk -- the pair
      %OVMX-I-SYSDISK, mounting system disk <dev>:  ->  %OVMX-I-MOUNTED, system disk <dev>: mounted
-  and/or the executive's mount-unit line  "disk unit DUA0: -> ra0e".  On this pcjs VAX the system disk
+  and/or the executive's mount-unit line  "disk unit DUA0: -> ra0e" (a kernel printf that, since rd
+  vms-553's OVMX_QUIET kernel, is in the guest's dmesg rather than on its console -- the %OVMX-I-MOUNTED
+  half is what fires on a current disk).  On this pcjs VAX the system disk
   is the ODS-2 volume on the boot disk's partition e (DUA0: -> ra0e), mounted over /dev/vms by the
   executive ACP -- a tell a host-mode /vms passthrough facade cannot fabricate (vms-165 retired the
   passthrough; the ACP refuses that masquerade, INV-6).  <dev> is DUA0: on this MSCP-backed VAX; the
@@ -94,6 +96,9 @@ const node = window.__clusterNode = {
        test-offscreen-repaint.mjs prove the terminal repaints while the panel sits offscreen,
        without downloading a ROM/disk or running the emulator. */
     injectOut: (bytes) => { const b = Uint8Array.from(bytes); term.write(b); node.booted = true; },
+    /* The RAW console as the guest wrote it (term.lines, not the DOM) -- read by
+       test-console-raw-quiet.mjs (rd vms-553) to assert no NetBSD substrate output reaches it. */
+    consoleText: () => term.lines.join("\n"),
 };
 
 const term = new VaxTerminal($("screen"), (text) => {
