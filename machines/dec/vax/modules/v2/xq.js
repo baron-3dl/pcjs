@@ -939,9 +939,14 @@ export default class XQVAX {
             /* invalid buffer? -> list empty, mark XL, stop */
             if (~bits & XQ_DSC_V) { this.csrSetClr(XQ_CSR_XL, 0); return true; }
 
-            /* decode buffer length -- two's-complement in WORDS; H trims/advances, L trims */
+            /* decode buffer length -- two's-complement in WORDS; H trims/advances, L trims.
+               The DELQA moves WORDS over the Qbus, so the descriptor addresses the word that holds
+               the buffer's first byte and H selects its high byte: the start is (address & ~1) + 1.
+               A driver may (and NetBSD's if_qe.c does) write the buffer's own ODD byte address; the
+               SIMH arm this was ported from adds 1 to that as well and reads one byte past the start,
+               deleting the segment's first byte and shifting the rest of the frame left by one. */
             let bLength = ((~this.xbdlBuf[3] + 1) & 0xFFFF) * 2;
-            if (bits & XQ_DSC_H) { bLength -= 1; address = (address + 1) >>> 0; }
+            if (bits & XQ_DSC_H) { bLength -= 1; address = ((address & ~1) + 1) >>> 0; }
             if (bits & XQ_DSC_L) bLength -= 1;
 
             /* gather this buffer's bytes into the write buffer (jumbo is out of scope) */
@@ -1094,7 +1099,8 @@ export default class XQVAX {
 
             let address = (((this.rbdlBuf[1] & 0x3F) << 16) | this.rbdlBuf[2]) >>> 0;
             let bLength = ((~this.rbdlBuf[3] + 1) & 0xFFFF) * 2;
-            if (this.rbdlBuf[1] & XQ_DSC_H) { bLength -= 1; address = (address + 1) >>> 0; }
+            /* H: the high byte of the addressed WORD (see processXbdl) -- never address + 1 past an odd one */
+            if (this.rbdlBuf[1] & XQ_DSC_H) { bLength -= 1; address = ((address & ~1) + 1) >>> 0; }
             if (this.rbdlBuf[1] & XQ_DSC_L) bLength -= 1;
 
             let item = this.readQ.items[this.readQ.head];
