@@ -20,7 +20,9 @@
  *
  * That is the corruption the 3-node browser cluster demo captured from its real VAX/VMS node: a
  * 484-byte clusterwide logical-name database push left the VAX with one byte deleted at database
- * offset 61 and everything after it shifted (openvmx-site run 38577678113).
+ * offset 61 and everything after it shifted (openvmx-site run 38577678113).  VMS V7.3 sends that
+ * frame as two buffers, the second starting at frame offset 145 on an ODD byte address with H set;
+ * the first case below is that transmit, descriptor word for descriptor word.
  *
  * The frames below are built as multi-buffer chains -- header, then segments that start on odd and
  * even bytes, with and without L -- and every one must arrive on the hub byte-for-byte.
@@ -149,6 +151,12 @@ function firstDiff(a, b)
 console.log("DELQA TX gather: segments starting on odd bytes (H) arrive byte-exact\n");
 
 const CASES = [
+    /* VERBATIM the transmit VMS V7.3's own driver posted for the clusterwide logical-name database
+       push that broke the demo (captured headless, pcjs KA655 + an OVMX peer): a 1496-byte frame in
+       two buffers, {V|L, 0x59970, -73 words} = 145 bytes, then {V|E|H, 0x5A455, -676 words} = 1351
+       bytes from an ODD address.  descFor() produces exactly those descriptor words. */
+    { name: "VMS V7.3 DB push: 145-byte buffer (L), then 1351 bytes from an odd address (H)",
+      len: 1496, cuts: [145], odd: [false, true] },
     /* the demo's shape: a 568-byte SCS frame whose last segment starts on an odd byte at frame
        offset 145 (database offset 61) */
     { name: "568-byte frame, header + data, last segment starts odd at offset 145",
