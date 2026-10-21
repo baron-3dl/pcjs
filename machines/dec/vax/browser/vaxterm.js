@@ -24,12 +24,24 @@
  * session running EDT or SET TERM/INQUIRE will not paint correctly until it exists, and that is
  * stated rather than discovered.
  *
+ * DEVICE ATTRIBUTES: LOGINOUT sends `ESC[c` and `ESC Z` to learn the terminal type; the widget
+ * answers as a VT100 (DA_RESPONSE below) through onInput -- the same callback keystrokes use -- so
+ * the guest's SHOW TERMINAL / SET TERMINAL/INQUIRE see a DEC_CRT instead of Unknown.
+ *
  * INPUT is the other half of console.js's seam.  Keystrokes become bytes and are posted to the
  * Worker, which hands them to VaxMachine.type() -> injectChar().  DELETE (0x7F), not BACKSPACE
  * (0x08), is what a VMS terminal driver treats as rubout, so that is what the Backspace key sends.
  */
 
 const ESC = 0x1B;
+
+/** What this terminal answers to Device Attributes (DA1 `ESC[c`/`ESC[0c`) and DECID (`ESC Z`):
+    "VT100 with no options" -- DEC VT100 Programmer Reference, DA response `ESC [ ? 1 ; 0 c`.
+    That is what this widget honestly is: an ANSI CRT (it honours the CSI grammar, EL and ED) with
+    no Advanced Video Option (no SGR attributes), no printer port, no VT220 8-bit/DRCS/national
+    sets.  VMS reads it as a DEC_CRT + ANSI_CRT VT100, so SHOW TERMINAL no longer says Unknown.
+    It deliberately does NOT claim VT220 (`?62;...c`).  DA2 and DSR are not answered. */
+export const DA_RESPONSE = "\x1B[?1;0c";
 
 /** Scrollback cap.  A full VMS boot is ~600 lines; 5,000 keeps a long session cheap to re-render. */
 const MAX_LINES = 5000;
@@ -116,6 +128,7 @@ export class VaxTerminal
         0x40-0x7E and ends it.  A non-CSI escape (`ESC(B`, `ESC=`) is ended by its own next byte. */
     escByte(b)
     {
+        if (this.esc === "" && b === 0x5A) { this.esc = null; this.onInput(DA_RESPONSE); return; }  /* DECID */
         if (this.esc === "" && b !== 0x5B) { this.esc = null; return; }  /* not CSI: consume one */
         this.esc += String.fromCharCode(b);
         if (b >= 0x40 && b <= 0x7E && this.esc.length > 1) {
@@ -127,6 +140,8 @@ export class VaxTerminal
                 if (p === "0") this.lines[this.row] = this.lines[this.row].slice(0, this.col);
                 else if (p === "1") this.lines[this.row] = " ".repeat(this.col) + this.lines[this.row].slice(this.col);
                 else if (p === "2") this.lines[this.row] = "";
+            } else if (fin === "c" && (params === "" || params === "0")) {
+                this.onInput(DA_RESPONSE);                  /* DA1: reply down the keystroke path */
             } else if (fin === "J" && (params === "2" || params === "3")) {
                 this.lines = [""]; this.row = 0; this.col = 0;
             }
