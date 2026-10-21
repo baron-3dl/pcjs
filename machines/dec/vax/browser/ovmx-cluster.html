@@ -15,8 +15,10 @@
 
   REAL-PRODUCT AUTHENTICITY (PCJS-NODE-BRIDGE.md §4).  The CN=N gate counts a node as clustered
   only when it has BOTH a real 0x6007 at the hub AND acp-ok.  acp-ok fires ONCE, on a tell a facade
-  could not emit.  For OVMX (Node B): the executive's genuine Files-11 ODS-2 ACP mount of the system
-  disk -- the pair
+  could not emit.  For OVMX (Node B), since rd vms-158d: "%STDRV-I-STARTUP, OpenVMX startup begun
+  at" -- PID 1 prints it only once the executive's genuine Files-11 ODS-2 ACP mounted the system disk
+  and found an installed system on it, and it is VMS's own console line.  Images before vms-158d
+  showed the mount itself on the console -- the pair
      %OVMX-I-SYSDISK, mounting system disk <dev>:  ->  %OVMX-I-MOUNTED, system disk <dev>: mounted
   and/or the executive's mount-unit line  "disk unit DUA0: -> ra0e" (a kernel printf that, since rd
   vms-553's OVMX_QUIET kernel, is in the guest's dmesg rather than on its console -- the %OVMX-I-MOUNTED
@@ -159,9 +161,8 @@ function bar(s, cls) { const b = $("bar"); b.textContent = s; b.className = cls 
    COULD NOT emit, post {t:'acp-ok'} to the parent.  We accumulate a rolling text window
    (a tell can straddle "out" chunks). Three alternatives, covering both node families
    this page boots:
-     - OVMX (Node B): the executive's GENUINE ODS-2 ACP mount of the system disk -- the
-       completed MOUNTED line or the mount-unit line. A host-mode /vms passthrough facade
-       cannot emit either.
+     - OVMX (Node B): the boot reaching STDRV off the executive's GENUINE ODS-2 ACP mount of
+       the system disk (rd vms-158d; older images: the MOUNTED line or the mount-unit line).
      - real VMS (Node C): TWO ground-truthed banner forms, neither of which OVMX ever prints
        (it identifies itself via %OVMX-I- messages, never claims to BE VMS) -- so both are
        authenticity-safe for the same reason the ACP tell is: no facade can honestly emit
@@ -184,7 +185,12 @@ function bar(s, cls) { const b = $("bar"); b.textContent = s; b.className = cls 
    Fires exactly once. */
 const acpDecoder = new TextDecoder("latin1");   /* console is 8-bit; latin1 never throws on any byte */
 let acpBuf = "";
-const ACP_TELL_OVMX = /%OVMX-I-MOUNTED,\s*system disk\s*(?:DUA0|VDA0):|disk unit\s+(?:DUA0|VDA0):\s*->\s*ra0e/i;
+/* rd vms-158d: "%STDRV-I-STARTUP, OpenVMX startup begun at" is printed by OVMX's PID 1 only after
+   the executive's Files-11 ACP mounted the ODS-2 system disk and found an installed system on it
+   (no other path since vms-165 retired the host-mode /vms passthrough), and VMS itself prints STDRV
+   there -- so the tell is VMS's own line. The older %OVMX-I-MOUNTED / "-> ra0e" forms are kept
+   while a pre-vms-158d image is deployed; from vms-158d those are OPERATOR.LOG records. */
+const ACP_TELL_OVMX = /%STDRV-I-STARTUP,\s*OpenVMX startup begun at|%OVMX-I-MOUNTED,\s*system disk\s*(?:DUA0|VDA0):|disk unit\s+(?:DUA0|VDA0):\s*->\s*ra0e/i;
 const ACP_TELL_VMS_BANNER = /VAX\/VMS\s+Version\s+V\d+\.\d+-\w+|OpenVMS\s+\(TM\)\s+VAX\s+(?:Operating\s+System,\s+)?Version\s+V\d+\.\d+/i;
 const ACP_TELL_VMS_READY = /Username:/i;
 function acpScan() {
