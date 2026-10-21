@@ -63,18 +63,27 @@
 <title>OVMX cluster node — pcjs VAX (DELQA)</title>
 <style>
   :root { color-scheme: dark; }
-  html, body { height: 100%; margin: 0; background: #140d00; color: #e8b100;
+  html, body { height: 100%; margin: 0; overflow: hidden; background: #140d00; color: #e8b100;
                font: 13px "DejaVu Sans Mono", Menlo, Consolas, monospace; }
-  #bar { padding: 4px 8px; font-size: 12px; opacity: .85; border-bottom: 1px solid #e8b10033;
-         white-space: pre; overflow: hidden; text-overflow: ellipsis; }
-  #screen { white-space: pre; overflow: auto; height: calc(100vh - 28px); margin: 0;
-            padding: .5rem .7rem; color: #ffb232; outline: none; }
+  body { display: flex; align-items: center; justify-content: center; position: relative; }
+  /* The console is an 80x24 VT screen.  fit() (below) sets --fs/--lh so that exactly 80 columns x
+     24 rows fill the window (cell height = 2 x cell width, a 5:3 grid).  The <pre> holds the whole
+     scrollback in its text (consoleText()/textContent consumers read it all) but is clipped to the
+     last 24 rows -- render() keeps it scrolled to the end -- so it never shows a scroll bar. */
+  #screen { white-space: pre; overflow: hidden; margin: 0; padding: 0; flex: none;
+            font-size: var(--fs, 13px); line-height: var(--lh, 1.2); width: calc(var(--cols) * var(--cw, .602) * var(--fs, 13px));
+            height: calc(24 * var(--lh, 1.2)); color: #ffb232; outline: none; }
+  /* status line: an overlay while the machine is starting (the screen is still empty) and on error;
+     once the guest console is live the screen owns the whole panel. */
+  #bar { position: absolute; top: 0; left: 0; right: 0; z-index: 1; padding: 2px 6px; font-size: 11px; opacity: .85;
+         background: #140d00; white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+  body.booted #bar:not(.err) { display: none; }
   .err { color: #ff6b6b; }
 </style>
 </head>
 <body>
 <div id="bar">pcjs cluster node — waiting for the DELQA HubPort (nic-ready)…</div>
-<pre id="screen" tabindex="0"></pre>
+<pre id="screen" tabindex="0" style="--cols:80"></pre>
 
 <script type="module">
 import { VaxTerminal } from "./vaxterm.js";
@@ -119,7 +128,28 @@ const term = new VaxTerminal($("screen"), (text) => {
    RENDER_INTERVAL_MS only governs how often the already-finished console state is copied into
    the DOM, a cosmetic paint cadence the guest has no notion of. */
 const RENDER_INTERVAL_MS = 100;
-setInterval(() => term.render(), RENDER_INTERVAL_MS);
+setInterval(() => { term.render(); document.body.classList.toggle("booted", node.booted); }, RENDER_INTERVAL_MS);
+
+/* Fit the 80x24 grid to the window: measure this font's cell width (cw, in em), then pick the font
+   size at which 80 columns span the width or 24 rows (each 2 cells tall) span the height, whichever
+   binds first.  Re-run on resize.  The result is exposed on __clusterNode.fit for the panel-fit test. */
+function fit() {
+    const root = document.documentElement, scr = $("screen");
+    const probe = document.createElement("span");
+    probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre;font:100px " + getComputedStyle(scr).fontFamily;
+    probe.textContent = "M".repeat(80); document.body.appendChild(probe);
+    const cw = probe.getBoundingClientRect().width / 80 / 100; probe.remove();
+    if (!cw || !innerWidth || !innerHeight) return;
+    const fs = Math.min(innerWidth / (80 * cw), innerHeight / (24 * 2 * cw));
+    root.style.setProperty("--cw", cw);
+    root.style.setProperty("--fs", fs + "px");
+    root.style.setProperty("--lh", (2 * cw * fs) + "px");
+    node.fit = { cw, fs };
+    scr.scrollTop = scr.scrollHeight;
+}
+fit();
+addEventListener("resize", fit);
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(fit);
 $("screen").addEventListener("click", () => $("screen").focus());
 
 function bar(s, cls) { const b = $("bar"); b.textContent = s; b.className = cls || ""; }
