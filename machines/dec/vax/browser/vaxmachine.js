@@ -90,6 +90,23 @@ const IDLE_POLL = 64;
 const IDLE_YIELD_USECS = 40000;
 
 /**
+ * THE CONSOLE LINE'S CHARACTER TIME, IN GUEST MICROSECONDS (rd vms-2a97).  SIMH's TTI is not a
+ * mailbox a host can stuff whenever it likes: tti_svc() is a POLL, and after the guest reads RXDB
+ * (rxdb_rd) the next poll is scheduled `tti_unit.wait` later -- TMLN_SPD_9600_BPS, 1041 usec per
+ * character (sim_tmxr.h) -- so typed input reaches the guest at most one character per 9600-baud
+ * character time OF GUEST TIME, however fast anyone types.  pumpInput() used to inject the next
+ * queued character the moment the guest had taken the last one, at whatever granularity the host
+ * happened to call it: once per 20,000-instruction batch on a fast machine, every few dozen
+ * instructions on a slow one (a slice also ends the moment the guest idles).  MEASURED on the KA655
+ * console ROM: called every <= 60 instructions, "B DUA0<CR>" typed at >>> echoes but never boots
+ * (the RETURN is lost while the ROM is still echoing); the public cluster demo's CPU-throttled
+ * visitor gate lost the leading "B" the same way (run 41420968234, ">>> DUA0 / ?22 ILL CMD").  The
+ * line's own speed, counted on the guest clock, makes delivery independent of how fast the host is.
+ */
+const CHAR_USECS = 1041;
+const CHAR_CYCLES = CHAR_USECS / USECS_PER_INSTR;
+
+/**
  * THE AUTO-BOOT SCRIPT.  tests/vmsbootprobe.js's INPUT_RULES, unchanged in mechanism and in intent:
  * boot DUA0, answer the date prompt, and -- once startup has finished and gone quiet -- press
  * RETURN so LOGINOUT paints the login prompt.
@@ -200,6 +217,8 @@ export class VaxMachine
         this.holdQuiet = 0;
         this.lastOutLen = 0;
         this.lastOutStep = 0;
+        this.rxNextAt = 0;                                  /* guest cycle before which the line delivers nothing */
+        this.rxOwed = false;                                /* a delivered character the guest has not read yet */
         this.marks = [];
         /* pcjsvax-af8: idling ON unless the caller says otherwise.  This is the tab's machine, and
            a tab that pins a core at a login prompt is the defect the item exists to close.  The
@@ -368,9 +387,16 @@ export class VaxMachine
             if (now - this.lastOutStep >= this.holdQuiet) this.holdQuiet = 0;
             else return;
         }
-        while (this.pending.length && !(dev.rxcs & CSR_DONE)) {
+        /* One character per line character time, counted from when the guest READ the previous
+           one (rxdb_rd's `sim_activate_after_abs (&tti_unit, tti_unit.wait)`) -- or, for the first
+           character of a burst, from when it was queued: a key cannot arrive in less than one
+           character time after it is pressed.  See CHAR_USECS. */
+        if (this.rxOwed && !(dev.rxcs & CSR_DONE)) { this.rxOwed = false; this.rxNextAt = now + CHAR_CYCLES; }
+        if (!this.pending.length) this.rxNextAt = Math.max(this.rxNextAt, now + CHAR_CYCLES);
+        else if (!this.rxOwed && now >= this.rxNextAt && !(dev.rxcs & CSR_DONE)) {
             dev.injectChar(this.pending.charCodeAt(0) & 0xFF);
             this.pending = this.pending.slice(1);
+            this.rxOwed = true;
         }
         /* *** RETIRE THE HOLD WITH THE STRING IT BELONGED TO. ***  `holdQuiet` is a property of the
            RULE that queued these characters, not a mode of the machine, and nothing used to clear
