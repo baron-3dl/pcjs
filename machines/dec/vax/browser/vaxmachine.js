@@ -65,6 +65,7 @@ import RQVAX, { RQ_BASE, IOLN_RQ, RQDX3_CTYPE, U_RO } from "../modules/v2/rq.js"
 import XQVAX, { XQ_BASE, IOLN_XQ } from "../modules/v2/xq.js";
 import HubPortEthernetLink from "../modules/v2/ethlink-hubport.js";
 import { USECS_PER_INSTR } from "../modules/v2/clk.js";
+import { DA_RESPONSE } from "./vaxterm.js";
 
 /** console.js's CSR_DONE.  console.js does not export it; it is the architected bit at the
     architected offset every VAX CSR-shaped device shares, and it is read ONLY to answer "has the
@@ -105,6 +106,31 @@ const IDLE_YIELD_USECS = 40000;
  */
 const CHAR_USECS = 1041;
 const CHAR_CYCLES = CHAR_USECS / USECS_PER_INSTR;
+
+/**
+ * THE TERMINAL ON THE LINE ANSWERS THE GUEST'S QUERIES HERE, IN GUEST TIME (rd vms-bb0).
+ *
+ * The KA655 console ROM opens with `ESC [ c` (DA1) and then WAITS for the terminal's reply -- for a
+ * bounded stretch of its own time (MEASURED: it is still waiting 1,000,000 instructions after the
+ * query and has given up by 2,000,000), after which it runs its self-test countdown.  A real VT
+ * answers in eight character times.  The reply used to come from browser/vaxterm.js on the main
+ * thread: guest output had to reach the page (one slice, one postMessage), be painted, and the
+ * answer had to come back as a keystroke -- a round trip measured in HOST time, which is guest time
+ * only while the host is fast.  On the CPU-throttled visitor gate, with three nodes loading at once,
+ * it came back after the ROM had stopped waiting.  The ROM then read `ESC [ ? 1 ; 0 c` as type-ahead
+ * in the middle of its self-test, and the next thing typed after it was swallowed: the auto-boot's
+ * "B" of "B DUA0" (openvmx-site run 41965964541, ">>> DUA0 / ?22 ILL CMD").  MEASURED with no host in
+ * the loop at all: the same reply typed 2,000,000-2,800,000 instructions after the query loses the
+ * "B" (the emulator is deterministic: tried at 2.0M, 2.5M and 2.8M); typed at 0 to 1,500,000 after,
+ * or at 3,200,000 or later, it does not.
+ *
+ * So the query is recognised in the console output stream as the guest writes it, and the reply is
+ * queued on the line at once, delivered at the line's own character rate ahead of anything typed --
+ * which is what the terminal at the end of a real console line does, however slow the machine
+ * hosting the emulator is.  The widget still PARSES these sequences (so they paint nothing) but no
+ * longer answers them, so the guest never sees two replies.  The grammar is vaxterm.js's escByte()
+ * exactly: DECID is `ESC Z`, DA1 is a CSI whose final byte is `c` with no parameter or `0`.
+ */
 
 /**
  * THE AUTO-BOOT SCRIPT.  tests/vmsbootprobe.js's INPUT_RULES, unchanged in mechanism and in intent:
@@ -219,6 +245,10 @@ export class VaxMachine
         this.lastOutStep = 0;
         this.rxNextAt = 0;                                  /* guest cycle before which the line delivers nothing */
         this.rxOwed = false;                                /* a delivered character the guest has not read yet */
+        this.daResponse = DA_RESPONSE;                      /* what the line's terminal answers to DA1/DECID; null: nothing */
+        this.answer = "";                                   /* the terminal's replies still owed down the line */
+        this.queryScanned = 0;                              /* how much of consoleDev.output the query scan has seen */
+        this.queryEsc = null;                               /* the escape sequence being collected, as vaxterm.js's `esc` */
         this.marks = [];
         /* pcjsvax-af8: idling ON unless the caller says otherwise.  This is the tab's machine, and
            a tab that pins a core at a login prompt is the defect the item exists to close.  The
@@ -357,6 +387,32 @@ export class VaxMachine
     }
 
     /**
+     * scanQueries(dev)
+     *
+     * Queue the terminal's reply to every DA1/DECID the guest has written since the last call.
+     * See the TERMINAL ON THE LINE note at the top of this file.
+     */
+    scanQueries(dev)
+    {
+        let out = dev.output;
+        for (let k = this.queryScanned; k < out.length; k++) {
+            let b = out[k] & 0xFF;
+            if (this.queryEsc === null) { if (b === 0x1B) this.queryEsc = ""; continue; }
+            if (this.queryEsc === "" && b === 0x5A) { this.queryEsc = null; this.reply(); continue; }   /* DECID */
+            if (this.queryEsc === "" && b !== 0x5B) { this.queryEsc = null; continue; }               /* not CSI */
+            this.queryEsc += String.fromCharCode(b);
+            if (b >= 0x40 && b <= 0x7E && this.queryEsc.length > 1) {
+                let seq = this.queryEsc, params = seq.slice(1, -1);
+                this.queryEsc = null;
+                if (seq[seq.length - 1] === "c" && (params === "" || params === "0")) this.reply();   /* DA1 */
+            }
+        }
+        this.queryScanned = out.length;
+    }
+
+    reply() { if (this.daResponse) this.answer += this.daResponse; }
+
+    /**
      * pumpInput()
      *
      * Called once per slice, never per instruction: injectChar() plus a substring search on every
@@ -383,7 +439,10 @@ export class VaxMachine
         let now = this.cpu.nTotalCycles;
         if (dev.output.length !== this.lastOutLen) { this.lastOutLen = dev.output.length; this.lastOutStep = now; }
 
-        if (this.pending.length && this.holdQuiet > 0) {
+        this.scanQueries(dev);
+        /* A hold belongs to the auto-boot string it was queued with (see below); the terminal's
+           own replies are not part of that string and never wait it out. */
+        if (!this.answer.length && this.pending.length && this.holdQuiet > 0) {
             if (now - this.lastOutStep >= this.holdQuiet) this.holdQuiet = 0;
             else return;
         }
@@ -392,10 +451,15 @@ export class VaxMachine
            character of a burst, from when it was queued: a key cannot arrive in less than one
            character time after it is pressed.  See CHAR_USECS. */
         if (this.rxOwed && !(dev.rxcs & CSR_DONE)) { this.rxOwed = false; this.rxNextAt = now + CHAR_CYCLES; }
-        if (!this.pending.length) this.rxNextAt = Math.max(this.rxNextAt, now + CHAR_CYCLES);
+        if (!this.answer.length && !this.pending.length) this.rxNextAt = Math.max(this.rxNextAt, now + CHAR_CYCLES);
         else if (!this.rxOwed && now >= this.rxNextAt && !(dev.rxcs & CSR_DONE)) {
-            dev.injectChar(this.pending.charCodeAt(0) & 0xFF);
-            this.pending = this.pending.slice(1);
+            if (this.answer.length) {
+                dev.injectChar(this.answer.charCodeAt(0) & 0xFF);
+                this.answer = this.answer.slice(1);
+            } else {
+                dev.injectChar(this.pending.charCodeAt(0) & 0xFF);
+                this.pending = this.pending.slice(1);
+            }
             this.rxOwed = true;
         }
         /* *** RETIRE THE HOLD WITH THE STRING IT BELONGED TO. ***  `holdQuiet` is a property of the

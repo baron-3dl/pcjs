@@ -1,12 +1,17 @@
 // test-device-attributes.mjs -- rd vms-e097: the pcjs console must answer VT Device Attributes.
 // LOGINOUT sends ESC[c (DA1) and ESC Z (DECID); a silent console left the guest's SHOW TERMINAL at
-// "Device_Type: Unknown".  The widget is a VT100-class ANSI CRT (no AVO), so it answers
-// ESC [ ? 1 ; 0 c ("VT100, no options") -- not a VT220 string -- through the keystroke path
-// (onInput -> worker {cmd:"input"} -> guest console RX).
+// "Device_Type: Unknown".  The terminal is a VT100-class ANSI CRT (no AVO), so it answers
+// ESC [ ? 1 ; 0 c ("VT100, no options") -- not a VT220 string.
 //
-// Part 1 (pure): VaxTerminal unit behaviour.  Part 2 (browser): ovmx-cluster.html with a recording
-// fake Worker; bytes fed through __clusterNode.injectOut; asserts the exact worker "input" message,
+// rd vms-bb0: the ANSWER moved from the widget (main thread, host time) to browser/vaxmachine.js
+// (the Worker, guest time), because a reply that crossed to the page and back reached the KA655
+// ROM after it had stopped waiting and swallowed the auto-boot's "B".  So this file now grades:
+// Part 1 (pure): VaxMachine answers DA1/DECID on the console line, exactly once each, and nothing
+// else; the widget parses the same sequences, paints nothing for them, and does NOT answer them
+// (two replies would be two terminals).  Part 2 (browser): ovmx-cluster.html with a recording fake
+// Worker; bytes fed through __clusterNode.injectOut; asserts the page posts NO "input" for a query,
 // for both node MACs (B and C), and that the screen text/consoleText are unchanged by the query.
+// tests/consolequery.test.mjs grades the timing (the reply reaches the ROM inside its window).
 //
 // Run: node machines/dec/vax/browser/test-device-attributes.mjs
 import { createServer } from 'node:http';
@@ -14,6 +19,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { VaxTerminal, DA_RESPONSE } from './vaxterm.js';
+import { VaxMachine } from './vaxmachine.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 let fails = 0;
@@ -29,13 +35,37 @@ function unit(input) {
   t.write(enc(input)); t.dirty = true; t.render();
   return { sent, t, text: el.textContent };
 }
+// The line's terminal, in the Worker: what VaxMachine queues for the guest after it writes `s`.
+const rom = new Uint8Array(await readFile(join(here, 'ka655x.bin')));
+function lineReply(s) {
+  const log = console.log; console.log = () => {};             // rommachine.js's "Bus: Added ..." chatter
+  const m = new VaxMachine({ romBytes: rom, disk: null, autoBoot: false });
+  console.log = log;
+  m.consoleDev.output.length = 0;                               // only what this check writes
+  m.consoleDev.output.push(...enc(s));
+  m.scanQueries(m.consoleDev);
+  return m.answer;
+}
 for (const [name, seq] of [['ESC[c', '\x1B[c'], ['ESC[0c', '\x1B[0c'], ['ESC Z', '\x1BZ']]) {
+  check(`${name} -> exactly one DA reply on the line`, lineReply('ab' + seq + 'cd') === EXPECT);
   const r = unit('ab' + seq + 'cd');
-  check(`${name} -> exactly one DA reply`, r.sent.length === 1 && r.sent[0] === EXPECT);
+  check(`${name} -> the widget does not answer too`, r.sent.length === 0);
   check(`${name} leaves no text artefacts`, r.t.lines[0] === 'abcd');
 }
-for (const [name, seq] of [['DA2 ESC[>c', '\x1B[>c'], ['ESC[?c', '\x1B[?c'], ['ESC[1c', '\x1B[1c'], ['ESC[5n', '\x1B[5n'], ['ESC[6n', '\x1B[6n'], ['ESC[K', '\x1B[K']])
-  check(`${name} is not answered as DA1`, unit(seq).sent.length === 0);
+for (const [name, seq] of [['DA2 ESC[>c', '\x1B[>c'], ['ESC[?c', '\x1B[?c'], ['ESC[1c', '\x1B[1c'], ['ESC[5n', '\x1B[5n'], ['ESC[6n', '\x1B[6n'], ['ESC[K', '\x1B[K']]) {
+  check(`${name} is not answered as DA1`, lineReply(seq) === '');
+  check(`${name} is not answered by the widget`, unit(seq).sent.length === 0);
+}
+check('a query split across two output scans is answered once', (() => {
+  const log = console.log; console.log = () => {};
+  const m = new VaxMachine({ romBytes: rom, disk: null, autoBoot: false });
+  console.log = log;
+  m.consoleDev.output.length = 0;
+  m.consoleDev.output.push(0x1B); m.scanQueries(m.consoleDev);
+  m.consoleDev.output.push(0x5B); m.scanQueries(m.consoleDev);
+  m.consoleDev.output.push(0x63); m.scanQueries(m.consoleDev);
+  return m.answer === EXPECT;
+})());
 
 // ---- browser part ----
 let chromium;
@@ -65,8 +95,7 @@ for (const [label, mac] of [['Node B', '52:54:00:00:00:0B'], ['Node C', '52:54:0
     window.__clusterNode.injectOut(e('\x1BZ'));
   });
   const inputs = await page.evaluate(() => window.__posts.filter((m) => m.cmd === 'input').map((m) => m.text));
-  check(`${label}: worker got exactly [DA1 reply, DECID reply]`,
-    inputs.length === 2 && inputs[0] === EXPECT && inputs[1] === EXPECT);
+  check(`${label}: the page sends no reply of its own (the Worker's machine answers)`, inputs.length === 0);
   await page.waitForTimeout(200);
   const screen = await page.evaluate(() => document.getElementById('screen').textContent);
   const ct = await page.evaluate(() => window.__clusterNode.consoleText());
