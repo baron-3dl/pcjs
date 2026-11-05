@@ -24,9 +24,13 @@
  * session running EDT or SET TERM/INQUIRE will not paint correctly until it exists, and that is
  * stated rather than discovered.
  *
- * DEVICE ATTRIBUTES: LOGINOUT sends `ESC[c` and `ESC Z` to learn the terminal type; the widget
- * answers as a VT100 (DA_RESPONSE below) through onInput -- the same callback keystrokes use -- so
- * the guest's SHOW TERMINAL / SET TERMINAL/INQUIRE see a DEC_CRT instead of Unknown.
+ * DEVICE ATTRIBUTES: the KA655 ROM and LOGINOUT send `ESC[c` and `ESC Z` to learn the terminal type;
+ * the terminal answers as a VT100 (DA_RESPONSE below), so the guest's SHOW TERMINAL / SET
+ * TERMINAL/INQUIRE see a DEC_CRT instead of Unknown.  The ANSWER is sent by browser/vaxmachine.js
+ * (scanQueries), in the Worker, on the guest's clock -- not from here: a reply that has to cross to
+ * the main thread and back arrives in HOST time, and on a slow or CPU-throttled host it reached the
+ * KA655 ROM after the ROM had stopped waiting for it and swallowed the next typed character (rd
+ * vms-bb0).  This widget still parses the sequences, so they paint nothing.
  *
  * INPUT is the other half of console.js's seam.  Keystrokes become bytes and are posted to the
  * Worker, which hands them to VaxMachine.type() -> injectChar().  DELETE (0x7F), not BACKSPACE
@@ -128,7 +132,7 @@ export class VaxTerminal
         0x40-0x7E and ends it.  A non-CSI escape (`ESC(B`, `ESC=`) is ended by its own next byte. */
     escByte(b)
     {
-        if (this.esc === "" && b === 0x5A) { this.esc = null; this.onInput(DA_RESPONSE); return; }  /* DECID */
+        if (this.esc === "" && b === 0x5A) { this.esc = null; return; }  /* DECID: answered by vaxmachine.js */
         if (this.esc === "" && b !== 0x5B) { this.esc = null; return; }  /* not CSI: consume one */
         this.esc += String.fromCharCode(b);
         if (b >= 0x40 && b <= 0x7E && this.esc.length > 1) {
@@ -140,8 +144,6 @@ export class VaxTerminal
                 if (p === "0") this.lines[this.row] = this.lines[this.row].slice(0, this.col);
                 else if (p === "1") this.lines[this.row] = " ".repeat(this.col) + this.lines[this.row].slice(this.col);
                 else if (p === "2") this.lines[this.row] = "";
-            } else if (fin === "c" && (params === "" || params === "0")) {
-                this.onInput(DA_RESPONSE);                  /* DA1: reply down the keystroke path */
             } else if (fin === "J" && (params === "2" || params === "3")) {
                 this.lines = [""]; this.row = 0; this.col = 0;
             }
